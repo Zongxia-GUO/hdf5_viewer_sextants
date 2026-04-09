@@ -31,7 +31,7 @@ from src.logging_config import logging_config
 # significant speedup without GPU dependency.
 pg.setConfigOptions(
     antialias=False,          # Disable anti-aliasing for speed
-    imageAxisOrder='row-major',  # Avoid unnecessary transpose
+    imageAxisOrder='row-major',  # Avoid unnecessary transposes
 )
 
 if sys.platform == "win32":
