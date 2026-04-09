@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(echo:*)",
+      "WebFetch(domain:proceedings.scipy.org)",
+      "WebFetch(domain:groups.google.com)",
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "Bash(/c/Users/guozo/AppData/Local/Microsoft/WindowsApps/python:*)",
+      "Bash(py -c:*)",
+      "Bash(where:*)",
+      "Bash(dir:*)",
+      "Bash(py -3 -c:*)",
+      "Bash(py -u -:*)"
+    ]
+  }
+}
