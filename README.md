@@ -61,7 +61,7 @@ receives datasets, and where to put the math) is documented in
 
 ### Windows
 Pre-built executables / installers for this SEXTANTS edition are published on this
-repository's [Releases](https://github.com/guozongxia0106-dot/hdf5_viewer_sextants/releases)
+repository's [Releases](https://github.com/Zongxia-GUO/hdf5_viewer_sextants/releases)
 page (when available). You can also build your own from source — see *Build an executable* below.
 
 The original general-purpose viewer (without the SEXTANTS analysis tools) has its own builds on

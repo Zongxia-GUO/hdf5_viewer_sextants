@@ -43,5 +43,5 @@ Soleil SEXTANTS beamline.
 GNU General Public License v3. Based on the original
 [HDF5 Viewer](https://github.com/loenard97/hdf5-viewer) by Dennis Lönard.
 
-[Unreleased]: https://github.com/guozongxia0106-dot/hdf5_viewer_sextants/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/guozongxia0106-dot/hdf5_viewer_sextants/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Zongxia-GUO/hdf5_viewer_sextants/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Zongxia-GUO/hdf5_viewer_sextants/releases/tag/v0.1.0
