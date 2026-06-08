@@ -34,12 +34,20 @@ and CDI phase retrieval), scattering-data calibration, and multi-dataset compari
 ### Analysis tools (`Tools` menu)
  - **Data Calculator** — interactive arithmetic/FFT on datasets
  - **Data Comparison** — overlay and compare multiple datasets
- - **Q Calibration** — X → q conversion for scattering-data analysis
+ - **Scattering Pattern Analyze** — q-calibration and scattering-data analysis
+   (X → q conversion) with an FTH-style image layout
  - **FTH Reconstruction** — Fourier-Transform Holography / HERALDO reconstruction
    (CL/CR alignment, beamstop, differential & Gaussian line filters)
  - **CDI Reconstruction** — coherent diffraction imaging phase retrieval
    (ER / HIO / RAAR with optional shrinkwrap; embeds the FTH alignment and filter steps so the
    FTH support can seed the CDI initial guess)
+ - **Time Resolved XRMS** — unified X-ray resonant magnetic scattering analysis, with:
+   - *Image & Region* — load a frame stack (+ optional reference image with a per-frame
+     sum/difference), navigate 3-D frames, pick a rectangle / circle / disk-arc region,
+     apply incidence-angle correction, and view live I(r) / I(θ) / I(t) profiles
+   - *Curve Fitting* — fit the active profile with a shared model library and polynomial
+     background subtraction
+   - *Frame Analysis* — fit the chosen model on every frame to track parameters over time
 
 The numerical cores of the reconstruction tools live in [src/recon/](src/recon/), independent of
 the GUI, and are covered by unit tests in [tests/](tests/).

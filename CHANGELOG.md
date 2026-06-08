@@ -27,10 +27,13 @@ Soleil SEXTANTS beamline.
 - **Analysis tools** (Tools menu):
   - Data Calculator — interactive arithmetic / FFT on datasets.
   - Data Comparison — overlay and compare multiple datasets.
-  - Q Calibration — X → q conversion for scattering-data analysis.
+  - Scattering Pattern Analyze — q-calibration / scattering analysis (X → q conversion).
   - FTH Reconstruction — Fourier-Transform Holography / HERALDO (CL/CR alignment,
     beamstop, differential & Gaussian line filters).
   - CDI Reconstruction — phase retrieval (ER / HIO / RAAR, optional shrinkwrap).
+  - Time Resolved XRMS — unified X-ray resonant magnetic scattering analysis:
+    region selection with incidence-angle correction, live I(r) / I(θ) / I(t) profiles,
+    curve fitting with background subtraction, and frame-by-frame parameter tracking.
 - GUI-independent numerical cores in `src/recon/`, covered by a 98-test suite.
 - Unified packaging via `build.py` (onedir / onefile / Windows installer).
 - Continuous integration workflow, `CONTRIBUTING.md`, and `docs/CREATING_TOOLS.md`.
