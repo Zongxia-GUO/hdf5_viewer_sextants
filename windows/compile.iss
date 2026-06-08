@@ -2,9 +2,13 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "HDF5 Viewer"
-#define MyAppVersion "0.2.0"
-#define MyAppPublisher "Dennis Lönard"
-#define MyAppExeName "main.exe"
+; Version comes from src/version.py via build.py (ISCC /DMyAppVersion=...).
+; This fallback is only used when compiling the .iss directly.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
+#define MyAppPublisher "Dennis Lï¿½nard"
+#define MyAppExeName "HDF5-Viewer.exe"
 #define MyAppAssocName "HDF5 File"
 #define MyAppAssocExt ".h5"
 #define MyAppAssocKey StringChange(MyAppAssocName, " ", "") + MyAppAssocExt
@@ -27,7 +31,9 @@ LicenseFile=..\LICENSE
 ; Remove the following line to run in administrative install mode (install for all users.)
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+OutputDir=..\dist
 OutputBaseFilename=HDF5Viewer_Windows_Installer
+SetupIconFile=..\src\img\sextants.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -39,8 +45,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\dist\main\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\main\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\HDF5-Viewer\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\HDF5-Viewer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Registry]

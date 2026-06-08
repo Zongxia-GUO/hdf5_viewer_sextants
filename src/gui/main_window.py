@@ -22,6 +22,7 @@ import sys
 import json
 import time
 import re
+import csv
 from collections import OrderedDict, deque
 from typing import Any, Generator
 
@@ -49,20 +50,20 @@ from PyQt6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QIcon,
-    QKeySequence,
     QPixmap,
-    QShortcut,
     QStandardItem,
     QStandardItemModel,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
+    QCheckBox,
     QComboBox,
-    QCompleter,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -72,21 +73,24 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QInputDialog,
     QPushButton,
-    QTextBrowser,
+    QStackedWidget,
     QTreeView,
-    QStyle,
     QVBoxLayout,
     QWidget,
 )
 
 from src.gui.about_page import AboutPage
-from src.gui.dataset_path_combo import DatasetPathCombo
 from src.gui.table_model import CopyableTableView, DataTable, TableModel
 from src.img.img_path import img_path
 from src.lib_h5.data_exporter import DataExporter
 from src.lib_h5.dataset_types import H5DatasetType
 from src.lib_h5.file_size import file_size_to_str
-from src.lib_h5.file_validator import get_file_filter_string, has_hdf5_extension, is_hdf5_file
+from src.lib_h5.file_validator import (
+    get_file_filter_string,
+    has_supported_extension,
+    is_hdf5_file,
+    is_supported_data_file,
+)
 
 FTH_MIN_SECOND_DIM = 100  # FTH candidate requires shape[1] > 100
 
@@ -99,49 +103,63 @@ class HDF5TreeView(QTreeView):
         super().__init__(parent)
         self.main_window = None  # Will be set by MainWindow
 
-    def startDrag(self, supportedActions):
-        """Override to send full dataset path when dragging."""
-        # Get current index
-        index = self.currentIndex()
-        if not index.isValid():
-            return
+    @staticmethod
+    def _path_for_index(index0):
+        """Build the drag token for a column-0 index, or None if not draggable.
 
-        # Get the main window reference to access the path building logic
-        if self.main_window is None:
-            return
-
-        # Always use column 0 item for path roles.
-        index0 = index.sibling(index.row(), 0)
+        Datasets → "<file>::<dataset>"; a top-level file → its bare absolute path
+        (the drop target's address field then names the dataset).
+        """
         node_type = index0.data(_ROLE_NODE_TYPE)
-        # Only datasets are draggable; never pass file/group to Qt default drag.
-        if node_type != "dataset":
-            return
+        if node_type not in ("dataset", "file"):
+            return None
 
-        # Build full path
         parents_list = [index0.data()]
         temp_index = index0
         while temp_index.parent().isValid():
             temp_index = temp_index.parent()
             if temp_index.data():
                 parents_list.append(temp_index.data())
-
         parents_list.reverse()
 
-        # Check if this is a dataset (not a file or group)
+        if node_type == "file":
+            return parents_list[0]
         if len(parents_list) <= 1:
+            return None
+        return f"{parents_list[0]}::{'/'.join(parents_list[1:])}"
+
+    def startDrag(self, supportedActions):
+        """Send the selected dataset/file path(s); multi-selection drags as lines."""
+        if self.main_window is None:
             return
 
-        # Format: /full/path/to/filename.ext::path/to/dataset
-        filename = parents_list[0]   # full absolute path (stored in root item)
-        dataset_path = "/".join(parents_list[1:])
-        full_path = f"{filename}::{dataset_path}"
+        # Collect every selected column-0 row (de-duplicated, order preserved) so
+        # selecting several files and dragging them in adds them all.
+        seen = set()
+        tokens = []
+        for idx in self.selectedIndexes():
+            if idx.column() != 0:
+                continue
+            index0 = idx.sibling(idx.row(), 0)
+            token = self._path_for_index(index0)
+            if token and token not in seen:
+                seen.add(token)
+                tokens.append(token)
+        if not tokens:
+            # Fall back to the focused row (e.g. dragging without a selection).
+            cur = self.currentIndex()
+            if cur.isValid():
+                token = self._path_for_index(cur.sibling(cur.row(), 0))
+                if token:
+                    tokens.append(token)
+        if not tokens:
+            return
 
-        # Create drag with full path
         from PyQt6.QtCore import QMimeData
         from PyQt6.QtGui import QDrag
 
         mime_data = QMimeData()
-        mime_data.setText(full_path)
+        mime_data.setText("\n".join(tokens))
 
         drag = QDrag(self)
         drag.setMimeData(mime_data)
@@ -151,7 +169,7 @@ class HDF5TreeView(QTreeView):
         pm.fill(Qt.GlobalColor.transparent)
         drag.setPixmap(pm)
         drag.exec(supportedActions)
-        logging.info(f"Dragging full path: {full_path}")
+        logging.info("Dragging %d path(s)", len(tokens))
 
 
 # h5py chunk cache for network access (128 MB keeps recently read chunks in RAM)
@@ -165,6 +183,62 @@ _DATASET_CACHE_SIZE = 5
 _ROLE_H5_PATH = int(Qt.ItemDataRole.UserRole) + 1
 _ROLE_NODE_TYPE = int(Qt.ItemDataRole.UserRole) + 2
 _ROLE_CHILDREN_LOADED = int(Qt.ItemDataRole.UserRole) + 3
+
+_REGULAR_DATASET_PATH = "/data"
+
+
+def _rgb_to_gray(arr: np.ndarray) -> np.ndarray:
+    """Convert RGB/RGBA arrays to a 2D luminance image for scientific display."""
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        rgb = arr[..., :3].astype(np.float64, copy=False)
+        return 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    return arr
+
+
+def load_regular_data_file(file_path: str | pathlib.Path) -> np.ndarray:
+    """Load supported non-HDF image/text files as a NumPy array."""
+    path = pathlib.Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix in {".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg"}:
+        from PIL import Image, ImageSequence
+
+        with Image.open(path) as img:
+            frames = [_rgb_to_gray(np.asarray(frame)) for frame in ImageSequence.Iterator(img)]
+        if not frames:
+            raise ValueError(f"No image frames found in {path}")
+        if len(frames) == 1:
+            return np.asarray(frames[0])
+        first_shape = frames[0].shape
+        if any(frame.shape != first_shape for frame in frames):
+            raise ValueError("Multi-page image has frames with different shapes.")
+        return np.stack(frames, axis=0)
+
+    if suffix in {".csv", ".txt"}:
+        delimiter = "," if suffix == ".csv" else None
+        try:
+            data = np.genfromtxt(path, delimiter=delimiter, comments=None)
+            if np.asarray(data).size > 0:
+                return np.asarray(data)
+        except Exception:
+            if suffix == ".txt":
+                try:
+                    data = np.genfromtxt(path, delimiter=",", comments=None)
+                    if np.asarray(data).size > 0:
+                        return np.asarray(data)
+                except Exception:
+                    pass
+        return np.genfromtxt(path, delimiter=delimiter, dtype=str, comments=None)
+
+    raise ValueError(f"Unsupported non-HDF file type: {suffix}")
+
+
+def _regular_file_kind(file_path: str | pathlib.Path) -> str:
+    suffix = pathlib.Path(file_path).suffix.lower()
+    if suffix in {".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg"}:
+        return "Image File"
+    if suffix in {".csv", ".txt"}:
+        return "Text/CSV File"
+    return "Data File"
 
 
 class DataLoadWorker(QThread):
@@ -189,6 +263,17 @@ class DataLoadWorker(QThread):
     def run(self):
         from src.lib_h5.dataset_types import H5DatasetType
         try:
+            if not is_hdf5_file(self._file_path):
+                data = load_regular_data_file(self._file_path)
+                if self._cancelled:
+                    return
+                dtype = (H5DatasetType.from_string(self._plot_type)
+                         if self._plot_type and self._plot_type != "Auto"
+                         else H5DatasetType.from_numpy_array(np.asarray(data)))
+                type_str = dtype.name if dtype != H5DatasetType.String else "String"
+                self.data_ready.emit(data, type_str, str(self._file_path), self._obj_path)
+                return
+
             with h5py.File(self._file_path, "r", rdcc_nbytes=_H5PY_CHUNK_CACHE) as f:
                 if self._cancelled:
                     return
@@ -255,7 +340,7 @@ class _FolderScanWorker(QThread):
             disk: set = {
                 str(p)
                 for p in self._folder.iterdir()
-                if p.is_file() and has_hdf5_extension(p)
+                if p.is_file() and has_supported_extension(p)
             }
         except OSError:
             disk = set()
@@ -301,6 +386,15 @@ class _DatasetIndexWarmWorker(QThread):
         """Scan one file once and produce both 1D and FTH-2D key lists."""
         keys_1d: list[str] = []
         keys_2d_fth: list[str] = []
+
+        if not is_hdf5_file(path_str):
+            arr = np.asarray(load_regular_data_file(path_str))
+            full_key = f"{path_str}::data"
+            if arr.ndim >= 1:
+                keys_1d.append(full_key)
+            if arr.ndim >= 2 and int(arr.shape[1]) > FTH_MIN_SECOND_DIM:
+                keys_2d_fth.append(full_key)
+            return keys_1d, keys_2d_fth
 
         def _in_fast_scope(ds_name: str) -> bool:
             if index_scope != "fast":
@@ -377,6 +471,381 @@ class _DatasetIndexWarmWorker(QThread):
         self.done.emit(next_cache, self._index_scope, self._fast_group_paths)
 
 
+class BatchExportDialog(QDialog):
+    """Settings dialog for single-file and batch dataset export."""
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        default_dir: pathlib.Path,
+        scan_numbers: list[str],
+        dataset_path: str,
+        sample_data: np.ndarray,
+        data_kind: str,
+        preview_x_loader,
+        preview_curve_loader=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Batch Export Settings")
+        self.setWindowIcon(QIcon(str(pathlib.Path(img_path(), "sextants.ico"))))
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(1100, 680)
+        self._sample_data = np.asarray(sample_data)
+        self._data_kind = data_kind
+        self._preview_x_loader = preview_x_loader
+        self._preview_curve_loader = preview_curve_loader
+
+        root_layout = QVBoxLayout(self)
+        if data_kind == "curve":
+            self._init_curve_export_ui(root_layout, default_dir, scan_numbers, dataset_path)
+            return
+        if data_kind == "image":
+            self._init_image_export_ui(root_layout, default_dir, scan_numbers, dataset_path)
+            return
+
+        body_layout = QHBoxLayout()
+        root_layout.addLayout(body_layout, stretch=1)
+        left_panel = QWidget()
+        left_panel.setMaximumWidth(420)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 8, 0)
+        body_layout.addWidget(left_panel)
+
+        out_group = QGroupBox("Output")
+        out_form = QFormLayout(out_group)
+        out_row = QHBoxLayout()
+        self.le_output_dir = QLineEdit(str(default_dir))
+        btn_choose_dir = QPushButton("...")
+        btn_choose_dir.setFixedWidth(32)
+        btn_choose_dir.clicked.connect(self._choose_output_dir)
+        out_row.addWidget(self.le_output_dir, stretch=1)
+        out_row.addWidget(btn_choose_dir)
+        out_form.addRow("Folder:", out_row)
+        out_form.addRow("Dataset:", QLabel(dataset_path))
+        out_form.addRow("Scans:", QLabel(", ".join(scan_numbers[:8]) + (" ..." if len(scan_numbers) > 8 else "")))
+        out_form.addRow("Detected:", QLabel("1D / small table" if data_kind == "curve" else "2D image"))
+        left_layout.addWidget(out_group)
+
+        self.x_group = QGroupBox("1D / Small Table Export")
+        x_form = QFormLayout(self.x_group)
+        self.cb_x_mode = QComboBox()
+        self.cb_x_mode.addItems([
+            "Index",
+            "Each file uses own X dataset",
+            "Use one shared X dataset",
+        ])
+        x_form.addRow("X values:", self.cb_x_mode)
+        self.le_x_path = QLineEdit()
+        self.le_x_path.setPlaceholderText("Optional X dataset path")
+        x_form.addRow("X path:", self.le_x_path)
+        self.le_shared_x_scan = QLineEdit(scan_numbers[0] if scan_numbers else "")
+        self.le_shared_x_scan.setPlaceholderText("Scan number used for shared X")
+        x_form.addRow("Shared scan:", self.le_shared_x_scan)
+        self.cb_x_mode.currentTextChanged.connect(self._refresh_curve_preview)
+        self.le_x_path.textChanged.connect(self._refresh_curve_preview)
+        self.le_shared_x_scan.textChanged.connect(self._refresh_curve_preview)
+        left_layout.addWidget(self.x_group)
+
+        self.img_group = QGroupBox("2D Image Export")
+        img_form = QFormLayout(self.img_group)
+        self.cb_colormap = QComboBox()
+        self.cb_colormap.addItems([
+            "viridis",
+            "inferno",
+            "cividis",
+            "turbo",
+            "CET-L9",
+            "CET-L1",
+            "CET-L4",
+            "CET-R4",
+            "CET-D1",
+            "CET-D9",
+        ])
+        img_form.addRow("Colormap:", self.cb_colormap)
+        self.cb_contrast = QComboBox()
+        self.cb_contrast.addItems(["Auto histogram", "Full range"])
+        img_form.addRow("Contrast:", self.cb_contrast)
+        self.chk_save_tiff = QCheckBox("Also save TIFF")
+        img_form.addRow("", self.chk_save_tiff)
+        self.cb_colormap.currentTextChanged.connect(self._refresh_image_preview)
+        self.cb_contrast.currentTextChanged.connect(self._refresh_image_preview)
+        left_layout.addWidget(self.img_group)
+        left_layout.addStretch()
+
+        self.preview_stack = QStackedWidget()
+        body_layout.addWidget(self.preview_stack, stretch=1)
+
+        self.preview_table = CopyableTableView()
+        self.preview_stack.addWidget(self.preview_table)
+
+        from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+        self.preview_image = ImageView2DEnhanced(self)
+        self.preview_image.btn_copy_image.hide()
+        self.preview_image.btn_save_image.hide()
+        self.preview_image.btn_q_calibration.setText("Angle")
+        self.preview_image.btn_q_calibration.setFixedWidth(46)
+        self.preview_image.btn_q_calibration.setToolTip("Apply incidence angle correction to preview")
+        try:
+            self.preview_image.btn_q_calibration.clicked.disconnect()
+        except TypeError:
+            pass
+        self.preview_image.btn_q_calibration.clicked.connect(self._apply_preview_angle_correction)
+        self.preview_stack.addWidget(self.preview_image)
+
+        self.x_group.setVisible(data_kind == "curve")
+        self.img_group.setVisible(data_kind == "image")
+        self.preview_stack.setCurrentWidget(self.preview_table if data_kind == "curve" else self.preview_image)
+        if data_kind == "curve":
+            self._refresh_curve_preview()
+        else:
+            self._refresh_image_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root_layout.addWidget(buttons)
+
+    def _init_image_export_ui(
+        self,
+        root_layout: QVBoxLayout,
+        default_dir: pathlib.Path,
+        scan_numbers: list[str],
+        dataset_path: str,
+    ) -> None:
+        """Build the 2D export dialog: image preview above, export controls below."""
+        from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+
+        self.preview_image = ImageView2DEnhanced(self)
+        self.preview_image.btn_copy_image.hide()
+        self.preview_image.btn_save_image.hide()
+        self.preview_image.btn_roi_line.hide()
+        self.preview_image.btn_roi_rect.hide()
+        self.preview_image.btn_ruler.hide()
+        if hasattr(self.preview_image, "label_roi"):
+            self.preview_image.label_roi.hide()
+        self.preview_image.btn_q_calibration.setText("Angle")
+        self.preview_image.btn_q_calibration.setFixedWidth(46)
+        self.preview_image.btn_q_calibration.setToolTip("Apply incidence angle correction to preview")
+        try:
+            self.preview_image.btn_q_calibration.clicked.disconnect()
+        except TypeError:
+            pass
+        self.preview_image.btn_q_calibration.clicked.connect(self._apply_preview_angle_correction)
+        root_layout.addWidget(self.preview_image, stretch=1)
+
+        bottom = QGroupBox("Export")
+        bottom_layout = QHBoxLayout(bottom)
+        self.le_output_dir = QLineEdit(str(default_dir))
+        btn_choose_dir = QPushButton("...")
+        btn_choose_dir.setFixedWidth(32)
+        btn_choose_dir.clicked.connect(self._choose_output_dir)
+        bottom_layout.addWidget(QLabel("Folder:"))
+        bottom_layout.addWidget(self.le_output_dir, stretch=1)
+        bottom_layout.addWidget(btn_choose_dir)
+        bottom_layout.addWidget(QLabel("Range:"))
+        bottom_layout.addWidget(QLabel(", ".join(scan_numbers[:8]) + (" ..." if len(scan_numbers) > 8 else "")))
+        self.chk_save_tiff = QCheckBox("Save TIFF")
+        bottom_layout.addWidget(self.chk_save_tiff)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        bottom_layout.addWidget(buttons)
+        bottom.setToolTip(f"Dataset: {dataset_path}")
+        root_layout.addWidget(bottom)
+
+        # These controls are not used by image export but keep settings() simple.
+        self.cb_x_mode = QComboBox()
+        self.cb_x_mode.addItem("Index")
+        self.le_x_path = QLineEdit()
+        self.le_shared_x_scan = QLineEdit()
+
+        self._refresh_image_preview()
+
+    def _init_curve_export_ui(
+        self,
+        root_layout: QVBoxLayout,
+        default_dir: pathlib.Path,
+        scan_numbers: list[str],
+        dataset_path: str,
+    ) -> None:
+        """Build the 1D export dialog: CSV preview above, export controls below."""
+        self.preview_table = CopyableTableView()
+        root_layout.addWidget(self.preview_table, stretch=1)
+
+        bottom = QGroupBox("Export")
+        bottom_layout = QVBoxLayout(bottom)
+
+        row_output = QHBoxLayout()
+        self.le_output_dir = QLineEdit(str(default_dir))
+        btn_choose_dir = QPushButton("...")
+        btn_choose_dir.setFixedWidth(32)
+        btn_choose_dir.clicked.connect(self._choose_output_dir)
+        row_output.addWidget(QLabel("Folder:"))
+        row_output.addWidget(self.le_output_dir, stretch=1)
+        row_output.addWidget(btn_choose_dir)
+        row_output.addWidget(QLabel("Range:"))
+        row_output.addWidget(QLabel(", ".join(scan_numbers[:8]) + (" ..." if len(scan_numbers) > 8 else "")))
+        bottom_layout.addLayout(row_output)
+
+        row_x = QHBoxLayout()
+        self.chk_export_x = QCheckBox("Export X")
+        self.chk_export_x.setChecked(True)
+        self.le_x_path = QLineEdit()
+        self.le_x_path.setPlaceholderText("Drag or type X dataset path")
+        self.le_x_path.setAcceptDrops(True)
+        self.le_x_path.dragEnterEvent = self._x_path_drag_enter
+        self.le_x_path.dropEvent = self._x_path_drop
+        self.chk_share_x = QCheckBox("Share X")
+        self.le_shared_x_scan = QLineEdit(scan_numbers[0] if scan_numbers else "")
+        self.le_shared_x_scan.setPlaceholderText("Shared scan")
+        row_x.addWidget(self.chk_export_x)
+        row_x.addWidget(self.le_x_path, stretch=1)
+        row_x.addWidget(self.chk_share_x)
+        row_x.addWidget(self.le_shared_x_scan)
+        bottom_layout.addLayout(row_x)
+
+        row_buttons = QHBoxLayout()
+        self.cb_curve_output_mode = QComboBox()
+        self.cb_curve_output_mode.addItems(["Single files", "Combined file"])
+        row_buttons.addWidget(QLabel("Output:"))
+        row_buttons.addWidget(self.cb_curve_output_mode)
+        row_buttons.addWidget(QLabel(f"Dataset: {dataset_path}"))
+        row_buttons.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        row_buttons.addWidget(buttons)
+        bottom_layout.addLayout(row_buttons)
+        root_layout.addWidget(bottom)
+
+        # These controls are not used by curve export but keep settings() simple.
+        self.chk_save_tiff = QCheckBox()
+        self.cb_x_mode = QComboBox()
+        self.cb_x_mode.addItem("Index")
+        self.cb_colormap = QComboBox()
+        self.cb_colormap.addItem("viridis")
+        self.cb_contrast = QComboBox()
+        self.cb_contrast.addItem("Auto histogram")
+
+        self.chk_export_x.stateChanged.connect(self._refresh_curve_preview)
+        self.chk_share_x.stateChanged.connect(self._refresh_curve_preview)
+        self.cb_curve_output_mode.currentTextChanged.connect(self._refresh_curve_preview)
+        self.le_x_path.textChanged.connect(self._refresh_curve_preview)
+        self.le_shared_x_scan.textChanged.connect(self._refresh_curve_preview)
+        self._refresh_curve_preview()
+
+    def _x_path_drag_enter(self, event: QDragEnterEvent | None) -> None:
+        if event is not None and event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def _x_path_drop(self, event: QDropEvent | None) -> None:
+        if event is None or not event.mimeData().hasText():
+            return
+        text = event.mimeData().text().strip()
+        if "::" in text:
+            _file_path, text = text.split("::", 1)
+        self.le_x_path.setText(text.strip("/"))
+        event.acceptProposedAction()
+
+    def _choose_output_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select Export Folder", self.le_output_dir.text())
+        if folder:
+            self.le_output_dir.setText(folder)
+
+    def settings(self) -> dict[str, Any]:
+        return {
+            "output_dir": pathlib.Path(self.le_output_dir.text().strip() or pathlib.Path.home()),
+            "export_x": self.chk_export_x.isChecked() if self._data_kind == "curve" else False,
+            "share_x": self.chk_share_x.isChecked() if self._data_kind == "curve" else False,
+            "curve_output_mode": self.cb_curve_output_mode.currentText() if self._data_kind == "curve" else "Single files",
+            "x_mode": self.cb_x_mode.currentText(),
+            "x_path": self.le_x_path.text().strip().strip("/"),
+            "shared_x_scan": self.le_shared_x_scan.text().strip(),
+            "colormap": self.preview_image.combo_colormap.currentText() if self._data_kind == "image" else self.cb_colormap.currentText(),
+            "invert": self.preview_image.chk_invert.isChecked() if self._data_kind == "image" else False,
+            "scale": self.preview_image.combo_scale.currentText() if self._data_kind == "image" else "Linear",
+            "levels": self.preview_image.histogram.getLevels() if self._data_kind == "image" else None,
+            "incidence": getattr(self.preview_image, "_q_calibration", None) if self._data_kind == "image" else None,
+            "contrast": "Preview levels" if self._data_kind == "image" else self.cb_contrast.currentText(),
+            "save_tiff": self.chk_save_tiff.isChecked(),
+        }
+
+    @staticmethod
+    def _curve_columns(data: np.ndarray) -> np.ndarray:
+        arr = np.asarray(data).squeeze()
+        if arr.ndim == 1:
+            return arr.reshape(-1, 1)
+        if arr.ndim == 2:
+            return arr
+        return arr.reshape(arr.shape[0], -1)
+
+    def _refresh_curve_preview(self) -> None:
+        if self._data_kind != "curve":
+            return
+        try:
+            if callable(self._preview_curve_loader):
+                preview, headers = self._preview_curve_loader(self.settings())
+                self.preview_table.setModel(DataTable(preview, column_names=headers))
+                return
+
+            y_columns = self._curve_columns(self._sample_data)
+            x_data = self._preview_x_loader(self.settings(), y_columns.shape[0])
+            n = min(200, y_columns.shape[0])
+            if x_data is None:
+                preview = y_columns[:n]
+                headers = [f"Y_{i + 1}" for i in range(y_columns.shape[1])]
+            else:
+                preview = np.column_stack([x_data[:n], y_columns[:n]])
+                headers = ["X"] + [f"Y_{i + 1}" for i in range(y_columns.shape[1])]
+            self.preview_table.setModel(DataTable(preview, column_names=headers))
+        except Exception as exc:
+            self.preview_table.setModel(TableModel(header=["Error"]))
+            logging.warning("Failed to refresh batch export table preview: %s", exc)
+
+    def _preview_image_frame(self) -> np.ndarray:
+        arr = np.asarray(self._sample_data)
+        if arr.ndim >= 3 and arr.shape[0] == 1:
+            arr = np.squeeze(arr, axis=0)
+        elif arr.ndim >= 3:
+            arr = np.asarray(arr[0])
+        return np.squeeze(arr)
+
+    def _refresh_image_preview(self) -> None:
+        if self._data_kind != "image":
+            return
+        try:
+            frame = self._preview_image_frame()
+            self.preview_image.set_data(frame)
+            self.preview_image._auto_contrast()
+        except Exception as exc:
+            logging.warning("Failed to refresh batch export image preview: %s", exc)
+
+    def _apply_preview_angle_correction(self) -> None:
+        angle, ok = QInputDialog.getDouble(
+            self,
+            "Angle Correction",
+            "Incidence angle (degrees):",
+            15.0,
+            0.01,
+            179.99,
+            2,
+        )
+        if not ok:
+            return
+        axis, ok = QInputDialog.getItem(
+            self,
+            "Angle Correction",
+            "Stretch axis:",
+            ["X", "Y"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        self.preview_image.apply_incidence_display_correction(angle, axis)
+
+
 class MainWindow(QMainWindow):
     """Start Main Window of the GUI."""
     dataset_index_changed = pyqtSignal()
@@ -434,6 +903,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("HDF5 Viewer")
         self.resize(settings.value("main_window/size", defaultValue=QSize(1400, 700)))
         self.move(settings.value("main_window/position", defaultValue=QPoint(300, 150)))
+        self._ensure_on_screen()
         self.setWindowIcon(self._icon_from_name("sextants.ico"))
 
         # Layout Right Side
@@ -515,7 +985,7 @@ class MainWindow(QMainWindow):
         self.le_scan_range.setPlaceholderText("0080-0085")
         self.le_scan_range.setMaximumWidth(100)
         self.le_scan_range.setToolTip("Scan number range (e.g., 0080-0085) or list (0080,0085,0027)")
-        self.le_scan_range.returnPressed.connect(self._batch_browse_files)
+        self.le_scan_range.returnPressed.connect(self._handle_batch_export)
 
         # Create drag-drop enabled path input
         self.le_batch_path = QLineEdit()
@@ -527,14 +997,14 @@ class MainWindow(QMainWindow):
         self.le_batch_path.dragEnterEvent = self._batch_path_drag_enter
         self.le_batch_path.dropEvent = self._batch_path_drop
         self.le_batch_path.textEdited.connect(self._sync_batch_path_template_from_visible_text)
-        self.le_batch_path.returnPressed.connect(self._batch_browse_files)
+        self.le_batch_path.returnPressed.connect(self._handle_batch_export)
         self.le_batch_path.setToolTip("Drag a dataset from the tree or type the path manually")
 
-        # Browse button
-        self.btn_batch_browse = QPushButton("Browse")
+        # Export button
+        self.btn_batch_browse = QPushButton("Export")
         self.btn_batch_browse.setMaximumWidth(80)
-        self.btn_batch_browse.clicked.connect(self._batch_browse_files)
-        self.btn_batch_browse.setToolTip("Browse matching files in tree view")
+        self.btn_batch_browse.clicked.connect(self._handle_batch_export)
+        self.btn_batch_browse.setToolTip("Export this dataset from the selected scan range")
 
         # Batch add button with menu
         self.btn_batch_add = QPushButton("Add to")
@@ -684,7 +1154,7 @@ class MainWindow(QMainWindow):
 
             mbr_tools.addSeparator()
 
-            act_q_cal = QAction("&Q Calibration...", self)
+            act_q_cal = QAction("&Scattering Pattern Analyze...", self)
             act_q_cal.setShortcut("Ctrl+Shift+Q")
             act_q_cal.triggered.connect(self._handle_action_q_calibration)
             mbr_tools.addAction(act_q_cal)
@@ -693,6 +1163,18 @@ class MainWindow(QMainWindow):
             act_fth.setShortcut("Ctrl+Shift+F")
             act_fth.triggered.connect(self._handle_action_fth)
             mbr_tools.addAction(act_fth)
+
+            act_cdi = QAction("&CDI Reconstruction...", self)
+            act_cdi.setShortcut("Ctrl+Shift+D")
+            act_cdi.triggered.connect(self._handle_action_cdi)
+            mbr_tools.addAction(act_cdi)
+
+            mbr_tools.addSeparator()
+
+            act_xrms = QAction("&Time Resolved XRMS...", self)
+            act_xrms.setShortcut("Ctrl+Shift+X")
+            act_xrms.triggered.connect(self._handle_action_xrms_analyze)
+            mbr_tools.addAction(act_xrms)
 
         # Setting Menu
         if (mbr_setting := menu_bar.addMenu("&Setting")) is not None:
@@ -760,12 +1242,31 @@ class MainWindow(QMainWindow):
             self._open_file(pathlib.Path(sys.argv[1]))
 
         # Restore previous session *after* the window is visible so startup is instant.
-        # Monitored-folder files are NOT saved in last_opened_files (see closeEvent);
-        # they are reloaded by _restore_session via the async folder scan.
-        _files   = settings.value("settings/last_opened_files", ())
-        _monitor = settings.value("settings/monitor_folder", "")
-        if _files or _monitor:
-            QTimer.singleShot(0, lambda: self._restore_session(_files, _monitor))
+        _files = settings.value("settings/last_opened_files", ())
+        if _files:
+            QTimer.singleShot(0, lambda: self._restore_session(_files, ""))
+
+        # Pre-import the heavy reconstruction/tool modules while the app is idle so
+        # the first click on a tool doesn't pay the ~150 ms import cost. This only
+        # imports modules (no widgets are created), so it is safe on the GUI thread.
+        QTimer.singleShot(1500, self._prewarm_tool_modules)
+
+    def _prewarm_tool_modules(self) -> None:
+        """Import heavy tool modules ahead of first use to speed up opening them."""
+        modules = (
+            "src.gui.fth_reconstruction_tool",
+            "src.gui.cdi_reconstruction_tool",
+            "src.gui.data_calculator_enhanced",
+            "src.gui.data_comparison",
+            "src.gui.q_calibration_tool",
+            "src.gui.xrms_analyze_tool",
+        )
+        import importlib
+        for name in modules:
+            try:
+                importlib.import_module(name)
+            except Exception as exc:  # never let prewarming break the app
+                logging.debug("Tool module prewarm failed for %s: %s", name, exc)
 
     def _set_status_text(self, text: str = "") -> None:
         """Show status text in the top-right menu bar corner."""
@@ -894,6 +1395,27 @@ class MainWindow(QMainWindow):
                 break
             cache.pop(fp, None)
             self._dataset_index_last_used.pop(fp, None)
+
+    def _ensure_on_screen(self) -> None:
+        """Keep a restored window geometry visible.
+
+        A saved position from a since-disconnected monitor can land the window
+        off every screen; if so, re-centre it on the primary screen.
+        """
+        from PyQt6.QtGui import QGuiApplication
+        frame = self.frameGeometry()
+        for screen in QGuiApplication.screens():
+            overlap = screen.availableGeometry().intersected(frame)
+            if overlap.width() >= 100 and overlap.height() >= 30:
+                return  # enough of the window is on a real screen
+        primary = QGuiApplication.primaryScreen()
+        if primary is not None:
+            avail = primary.availableGeometry()
+            x = avail.x() + max(0, (avail.width() - self.width()) // 2)
+            y = avail.y() + max(0, (avail.height() - self.height()) // 2)
+            self.move(x, y)
+        else:
+            self.move(300, 150)
 
     @staticmethod
     def _disk_index_cache_path() -> pathlib.Path:
@@ -1272,49 +1794,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "q_cal_tool") and self.q_cal_tool is not None and self.q_cal_tool.isVisible():
             self.q_cal_tool.set_opened_files(self.opened_files)
             self.q_cal_tool.refresh_dataset_keys(keys_2d_fth)
+        if hasattr(self, "cdi_tool") and self.cdi_tool is not None and self.cdi_tool.isVisible():
+            keys_2d = self._peek_dataset_full_keys(min_ndim=2)
+            self.cdi_tool.update_opened_files(self.opened_files, keys_2d)
 
     def _restore_session(self, files, monitor_folder_str: str) -> None:
         """Restore the previous session after the main window is visible.
 
         Called via QTimer.singleShot(0) so the window appears instantly on
         startup regardless of how many files need to be reloaded.
-
-        Strategy:
-        - If a monitor folder was active, re-activate it; the async scan will
-          re-open all files in the folder without blocking the UI.
-        - Individual files that are NOT inside the monitored folder are opened
-          one-by-one with processEvents() between each so the UI stays live.
+        Monitor folder is never auto-restored; user must re-enable it manually.
         """
-        # Restore monitor folder
-        if monitor_folder_str:
-            monitor_path = pathlib.Path(monitor_folder_str)
-            if monitor_path.exists():
-                self._monitor_folder = monitor_path
-                self._monitor_known  = set()
-                self._act_monitor.setChecked(True)
-                self.btn_collapse_all.setToolTip(
-                    f"Monitoring: {self._monitor_folder.name}\n"
-                    "Click to scan for new files + collapse tree"
-                )
-                self.btn_collapse_all.setStyleSheet(
-                    "QPushButton { background-color: #9AEBA3; color: white; font-weight: bold; }"
-                )
-                self._refresh_monitor_folder()   # async - uses background thread
-
-        # Restore individually opened files
-        # Skip any file that lives inside the monitored folder - it will be
-        # handled by the folder scan above.
-        monitor_prefix = (
-            str(self._monitor_folder) + os.sep if self._monitor_folder else None
-        )
-        restore_files = []
-        for file in files:
-            fstr = str(file)
-            if monitor_prefix and fstr.startswith(monitor_prefix):
-                continue
-            restore_files.append(fstr)
-        if restore_files:
-            self._start_open_queue(restore_files, mode="restore", mark_known=False)
+        if files:
+            self._start_open_queue(list(files), mode="restore", mark_known=False)
 
     def _icon_from_name(self, icon_name: str) -> QIcon:
         """Load icon safely; return empty icon when file is missing."""
@@ -1332,6 +1824,10 @@ class MainWindow(QMainWindow):
 
         :param str file_path: File Path
         """
+        if not is_supported_data_file(file_path):
+            logging.warning("Skipped unsupported file: '%s'", file_path)
+            return
+
         logging.info(f"Open file '{file_path}'")
         # Lazy strategy: do not recurse file contents on add/open.
         parent_name = QStandardItem(str(file_path))
@@ -1348,6 +1844,20 @@ class MainWindow(QMainWindow):
         parent_shape.setEditable(False)
 
         self.tree_model_file.appendRow([parent_name, parent_text, parent_shape])
+        if not is_hdf5_file(file_path):
+            parent_text.setText(_regular_file_kind(file_path))
+            parent_name.setData(True, _ROLE_CHILDREN_LOADED)
+            child_name = QStandardItem("data")
+            child_name.setEditable(False)
+            child_name.setData(_REGULAR_DATASET_PATH, _ROLE_H5_PATH)
+            child_name.setData("dataset", _ROLE_NODE_TYPE)
+            child_type = QStandardItem(pathlib.Path(file_path).suffix.lower().lstrip(".").upper())
+            child_type.setEditable(False)
+            child_type.setIcon(self._icon_from_name("dataset.svg"))
+            child_shape = QStandardItem("-")
+            child_shape.setEditable(False)
+            parent_name.appendRow([child_name, child_type, child_shape])
+            return
         self._append_lazy_placeholder(parent_name)
 
     def _append_lazy_placeholder(self, parent_item: QStandardItem) -> None:
@@ -1550,9 +2060,12 @@ class MainWindow(QMainWindow):
         captured_path = file_path
         captured_obj = obj_path
 
-        def slice_loader(idx: int) -> np.ndarray:
+        def slice_loader(axis: int, idx: int) -> np.ndarray:
             with h5py.File(captured_path, "r", rdcc_nbytes=_H5PY_CHUNK_CACHE) as f:
-                return np.array(f[captured_obj][idx])
+                ds = f[captured_obj]
+                selection = [slice(None)] * len(ds.shape)
+                selection[int(axis)] = int(idx)
+                return np.array(ds[tuple(selection)])
 
         from src.gui.unified_data_viewer import UnifiedDataViewer
         from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
@@ -1570,7 +2083,7 @@ class MainWindow(QMainWindow):
             lambda: self._handle_q_request_from_viewer(viewer.source_dataset_key)
         )
         image_view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        image_view.set_data_lazy(first_slice, shape[0], slice_loader)
+        image_view.set_data_lazy(first_slice, shape[0], slice_loader, full_shape=tuple(shape))
         viewer.layout.addWidget(image_view)
         viewer.current_widget = image_view
 
@@ -1650,12 +2163,11 @@ class MainWindow(QMainWindow):
                 file_path = file.removeprefix("file:")
             files.append(file_path.strip())
 
-        # Accept if at least one file appears to be HDF5
-        # Quick check: if any file is actually HDF5, accept the drag
+        # Accept if at least one file is supported.
         has_valid_file = False
         for file_path in files:
             if file_path and pathlib.Path(file_path).exists():
-                if is_hdf5_file(file_path):
+                if is_supported_data_file(file_path):
                     has_valid_file = True
                     break
 
@@ -1677,11 +2189,10 @@ class MainWindow(QMainWindow):
                 file = file.removeprefix("file:")
             file_path = pathlib.Path(file.strip())
 
-            # Only open if it's a valid HDF5 file
-            if file_path.exists() and is_hdf5_file(file_path):
+            if file_path.exists() and is_supported_data_file(file_path):
                 self._open_file(file_path)
             else:
-                logging.warning(f"Skipped non-HDF5 file: '{file_path}'")
+                logging.warning(f"Skipped unsupported file: '{file_path}'")
         event.acceptProposedAction()
 
     # ----- Slots ----- #
@@ -1713,6 +2224,15 @@ class MainWindow(QMainWindow):
             self.table_model_dataset.resetData()
             self.table_model_dataset.appendRow(["Name", parents_list[0]])
             self.table_model_dataset.appendRow(["File Size", file_size_to_str(parents_list[0])])
+            return
+
+        if not is_hdf5_file(parents_list[0]):
+            self.table_model_dataset.resetData()
+            self.table_model_dataset.appendRow(["Name", pathlib.Path(parents_list[0]).name])
+            self.table_model_dataset.appendRow(["File", parents_list[0]])
+            self.table_model_dataset.appendRow(["Type", _regular_file_kind(parents_list[0])])
+            self.table_model_dataset.appendRow(["Data", "loaded from file"])
+            self._request_plot_data(self.cb_plot_type.currentText())
             return
 
         try:
@@ -2018,50 +2538,568 @@ class MainWindow(QMainWindow):
         Supports:
         - Range: "0080-0085" -> ["0080", "0081", "0082", "0083", "0084", "0085"]
         - List: "0080,0085,0027" -> ["0080", "0085", "0027"]
+        - Mixed ranges/list: "0001,0003,0005-0007" -> ["0001", "0003", "0005", "0006", "0007"]
 
         :param range_text: Scan range text
         :return: List of scan number strings
         """
-        scan_numbers = []
+        scan_numbers: list[str] = []
+        seen: set[str] = set()
 
         try:
-            if "-" in range_text:
-                # Range format: 0080-0085
-                parts = range_text.split("-")
-                if len(parts) != 2:
-                    return []
+            normalized = str(range_text or "").replace("，", ",").strip()
+            if not normalized:
+                return []
 
-                start_str = parts[0].strip()
-                end_str = parts[1].strip()
+            for token in [p.strip() for p in normalized.split(",") if p.strip()]:
+                if "-" in token:
+                    parts = [p.strip() for p in token.split("-")]
+                    if len(parts) != 2 or not parts[0] or not parts[1]:
+                        return []
+                    start_str, end_str = parts
+                    width = max(len(start_str), len(end_str))
+                    start = int(start_str)
+                    end = int(end_str)
+                    if start > end:
+                        return []
+                    expanded = (str(num).zfill(width) for num in range(start, end + 1))
+                else:
+                    expanded = (token,)
 
-                # Determine padding width
-                width = len(start_str)
-
-                start = int(start_str)
-                end = int(end_str)
-
-                if start > end:
-                    return []
-
-                for num in range(start, end + 1):
-                    scan_numbers.append(str(num).zfill(width))
-
-            elif "," in range_text:
-                # List format: 0080,0085,0027
-                parts = range_text.split(",")
-                for part in parts:
-                    scan_num = part.strip()
-                    if scan_num:
+                for scan_num in expanded:
+                    if scan_num and scan_num not in seen:
                         scan_numbers.append(scan_num)
-            else:
-                # Single scan number
-                scan_numbers.append(range_text.strip())
+                        seen.add(scan_num)
 
         except ValueError as e:
             logging.error(f"Failed to parse scan range '{range_text}': {e}")
             return []
 
         return scan_numbers
+
+    def _matching_files_for_scans(self, file_prefix: str, scan_numbers: list[str]) -> list[tuple[pathlib.Path, str]]:
+        """Return opened files matching the prefix and requested scan numbers."""
+        matching_files: list[tuple[pathlib.Path, str]] = []
+        for file_path in self.opened_files:
+            filename = file_path.stem
+            if not filename.startswith(file_prefix):
+                continue
+            suffix = filename[len(file_prefix):]
+            for scan_num in scan_numbers:
+                if suffix.startswith(scan_num):
+                    matching_files.append((file_path, scan_num))
+                    break
+        return matching_files
+
+    @staticmethod
+    def _adjust_batch_path_for_scan(batch_path: str, scan_num: str) -> str:
+        """Replace the first scan-looking number in a dataset path."""
+        adjusted_path = str(batch_path).strip().strip("/")
+        matches = re.findall(r"\d{4}", adjusted_path)
+        if matches:
+            adjusted_path = adjusted_path.replace(matches[0], scan_num, 1)
+        return adjusted_path
+
+    @staticmethod
+    def _safe_export_name(file_path: pathlib.Path, dataset_path: str, suffix: str = "") -> str:
+        """Build a filesystem-safe export stem."""
+        ds = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(dataset_path).strip("/"))
+        ds = ds.strip("_") or "dataset"
+        suffix = f"_{suffix}" if suffix else ""
+        return f"{file_path.stem}_{ds}{suffix}"
+
+    def _handle_batch_export(self) -> None:
+        """Open export settings and export one or more matched datasets."""
+        file_prefix = self.le_file_prefix.text().strip()
+        if not file_prefix:
+            QMessageBox.warning(self, "No File Prefix", "Please enter file name prefix (e.g., scanx_ or scan_)")
+            return
+
+        scan_range_text = self.le_scan_range.text().strip()
+        if not scan_range_text:
+            QMessageBox.warning(self, "No Scan Range", "Please enter a scan number range (e.g., 0080-0085)")
+            return
+
+        batch_path = self._batch_path_for_operations()
+        if not batch_path:
+            QMessageBox.warning(self, "No Path", "Please drag or type a dataset path before exporting.")
+            return
+
+        scan_numbers = self._parse_scan_range(scan_range_text)
+        if not scan_numbers:
+            QMessageBox.warning(
+                self,
+                "Invalid Range",
+                "Invalid scan range format.\nUse:\n- Range: 0080-0085\n- List: 0080,0085,0027",
+            )
+            return
+
+        matching_files = self._matching_files_for_scans(file_prefix, scan_numbers)
+        if not matching_files:
+            QMessageBox.warning(
+                self,
+                "No Matches",
+                f"No open files found matching:\nPrefix: {file_prefix}\nScan numbers: {', '.join(scan_numbers)}",
+            )
+            return
+
+        settings = QSettings()
+        last_dir = pathlib.Path(str(settings.value("paths/last_export_directory", pathlib.Path.home())))
+        sample_file, sample_scan = matching_files[0]
+        sample_path = self._adjust_batch_path_for_scan(batch_path, sample_scan)
+        try:
+            with h5py.File(sample_file, "r") as f:
+                if sample_path not in f:
+                    raise KeyError(f"Dataset path not found: {sample_path}")
+                sample_data = np.asarray(f[sample_path][()])
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Preview Failed",
+                f"Cannot read preview dataset:\n{sample_file.name}::{sample_path}\n\n{exc}",
+            )
+            return
+
+        data_kind = "curve" if self._is_curve_export_data(sample_data) else "image"
+
+        def _preview_x_loader(export_settings: dict[str, Any], expected_len: int) -> np.ndarray | None:
+            return self._read_batch_x_data(
+                export_settings=export_settings,
+                current_file=sample_file,
+                current_scan=sample_scan,
+                matching_files=matching_files,
+                expected_len=expected_len,
+            )
+
+        def _preview_curve_loader(export_settings: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+            return self._build_curve_preview_table(matching_files, batch_path, export_settings)
+
+        dialog = BatchExportDialog(
+            None,
+            default_dir=last_dir if last_dir.exists() else pathlib.Path.home(),
+            scan_numbers=scan_numbers,
+            dataset_path=batch_path,
+            sample_data=sample_data,
+            data_kind=data_kind,
+            preview_x_loader=_preview_x_loader,
+            preview_curve_loader=_preview_curve_loader if data_kind == "curve" else None,
+        )
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setModal(False)
+        dialog.accepted.connect(
+            lambda d=dialog, mf=matching_files, bp=batch_path, dk=data_kind, s=settings: self._finish_batch_export(
+                d,
+                mf,
+                bp,
+                dk,
+                s,
+            )
+        )
+        dialog.rejected.connect(dialog.deleteLater)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._batch_export_dialog = dialog
+
+    def _finish_batch_export(
+        self,
+        dialog: BatchExportDialog,
+        matching_files: list[tuple[pathlib.Path, str]],
+        batch_path: str,
+        data_kind: str,
+        settings: QSettings,
+    ) -> None:
+        """Run export after the non-modal settings dialog is accepted."""
+
+        export_settings = dialog.settings()
+        output_dir = pathlib.Path(export_settings["output_dir"])
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export Failed", f"Cannot create export folder:\n{output_dir}\n\n{exc}")
+            return
+        settings.setValue("paths/last_export_directory", str(output_dir))
+        dialog.deleteLater()
+
+        ok_count = 0
+        fail_details: list[str] = []
+        if data_kind == "curve" and str(export_settings.get("curve_output_mode")) == "Combined file":
+            ok_count, fail_details = self._export_curve_combined_table(
+                matching_files,
+                batch_path,
+                export_settings,
+            )
+            msg = f"Exported {ok_count} dataset(s) to:\n{output_dir}"
+            if fail_details:
+                msg += f"\n\nFailed: {len(fail_details)}\n" + "\n".join(fail_details[:5])
+                QMessageBox.warning(self, "Batch Export Complete", msg)
+            else:
+                QMessageBox.information(self, "Batch Export Complete", msg)
+            return
+
+        for file_path, scan_num in matching_files:
+            ds_path = self._adjust_batch_path_for_scan(batch_path, scan_num)
+            try:
+                with h5py.File(file_path, "r") as f:
+                    if ds_path not in f:
+                        raise KeyError(f"Dataset path not found: {ds_path}")
+                    data = np.asarray(f[ds_path][()])
+
+                if self._is_curve_export_data(data):
+                    self._export_curve_dataset(file_path, scan_num, ds_path, data, export_settings, matching_files)
+                elif data.ndim >= 2:
+                    self._export_image_dataset(file_path, ds_path, data, export_settings)
+                else:
+                    raise ValueError(f"Unsupported dataset shape: {data.shape}")
+                ok_count += 1
+            except Exception as exc:
+                msg = f"{file_path.name}::{ds_path}: {exc}"
+                logging.error("Batch export failed for %s", msg)
+                fail_details.append(msg)
+
+        msg = f"Exported {ok_count} dataset(s) to:\n{output_dir}"
+        if fail_details:
+            msg += f"\n\nFailed: {len(fail_details)}\n" + "\n".join(fail_details[:5])
+            QMessageBox.warning(self, "Batch Export Complete", msg)
+        else:
+            QMessageBox.information(self, "Batch Export Complete", msg)
+
+    @staticmethod
+    def _is_curve_export_data(data: np.ndarray) -> bool:
+        """Return true for 1D data or 2D data with up to 10 columns."""
+        arr = np.asarray(data)
+        if arr.ndim == 1:
+            return True
+        return arr.ndim == 2 and arr.shape[1] <= 10
+
+    @staticmethod
+    def _curve_export_columns(data: np.ndarray) -> np.ndarray:
+        """Normalize curve export data to rows x columns."""
+        arr = np.asarray(data).squeeze()
+        if arr.ndim == 1:
+            return arr.reshape(-1, 1)
+        if arr.ndim == 2 and arr.shape[1] <= 10:
+            return arr
+        raise ValueError(f"Not a curve/table export shape: {arr.shape}")
+
+    def _build_curve_preview_table(
+        self,
+        matching_files: list[tuple[pathlib.Path, str]],
+        batch_path: str,
+        export_settings: dict[str, Any],
+    ) -> tuple[np.ndarray, list[str]]:
+        """Build the 1D preview table from the same settings used for export."""
+        if not matching_files:
+            return np.empty((0, 0)), []
+
+        combined = str(export_settings.get("curve_output_mode")) == "Combined file"
+        files_for_preview = matching_files[: min(5, len(matching_files))] if combined else matching_files[:1]
+        series: list[tuple[pathlib.Path, np.ndarray, np.ndarray | None]] = []
+
+        for file_path, scan_num in files_for_preview:
+            ds_path = self._adjust_batch_path_for_scan(batch_path, scan_num)
+            with h5py.File(file_path, "r") as f:
+                if ds_path not in f:
+                    raise KeyError(f"Dataset path not found: {file_path.name}::{ds_path}")
+                y_columns = self._curve_export_columns(np.asarray(f[ds_path][()]))
+            x_data = self._read_batch_x_data(
+                export_settings=export_settings,
+                current_file=file_path,
+                current_scan=scan_num,
+                matching_files=matching_files,
+                expected_len=y_columns.shape[0],
+            )
+            series.append((file_path, y_columns, x_data))
+
+        if not combined:
+            file_path, y_columns, x_data = series[0]
+            n = min(200, y_columns.shape[0])
+            if x_data is None:
+                return y_columns[:n], [f"Y_{i + 1}" for i in range(y_columns.shape[1])]
+            return (
+                np.column_stack([x_data[:n], y_columns[:n]]),
+                ["X"] + [f"Y_{i + 1}" for i in range(y_columns.shape[1])],
+            )
+
+        max_len = min(200, max(y.shape[0] for _fp, y, _x in series))
+        headers: list[str] = []
+        columns: list[np.ndarray] = []
+        shared_x_written = False
+        for file_path, y_columns, x_data in series:
+            label = file_path.stem
+            if x_data is not None:
+                if bool(export_settings.get("share_x", False)):
+                    if not shared_x_written:
+                        col = np.full(max_len, np.nan, dtype=float)
+                        col[: min(max_len, len(x_data))] = x_data[:max_len]
+                        columns.append(col)
+                        headers.append("X")
+                        shared_x_written = True
+                else:
+                    col = np.full(max_len, np.nan, dtype=float)
+                    col[: min(max_len, len(x_data))] = x_data[:max_len]
+                    columns.append(col)
+                    headers.append(f"{label}_X")
+            for col_idx in range(y_columns.shape[1]):
+                col = np.full(max_len, np.nan, dtype=float)
+                n = min(max_len, y_columns.shape[0])
+                col[:n] = y_columns[:n, col_idx]
+                columns.append(col)
+                headers.append(f"{label}_Y_{col_idx + 1}")
+
+        return np.column_stack(columns) if columns else np.empty((0, 0)), headers
+
+    def _read_batch_x_data(
+        self,
+        *,
+        export_settings: dict[str, Any],
+        current_file: pathlib.Path,
+        current_scan: str,
+        matching_files: list[tuple[pathlib.Path, str]],
+        expected_len: int,
+    ) -> np.ndarray | None:
+        """Read optional X data according to the batch export settings."""
+        if not bool(export_settings.get("export_x", False)):
+            return None
+        x_path_template = str(export_settings.get("x_path", "")).strip().strip("/")
+        if not x_path_template:
+            return None
+
+        if bool(export_settings.get("share_x", False)):
+            shared_scan = str(export_settings.get("shared_x_scan", "")).strip() or current_scan
+            x_scan = shared_scan
+            x_file = next((fp for fp, sn in matching_files if sn == shared_scan), None)
+            if x_file is None:
+                raise ValueError(f"Shared X scan '{shared_scan}' is not opened")
+        else:
+            x_file = current_file
+            x_scan = current_scan
+
+        x_path = self._adjust_batch_path_for_scan(x_path_template, x_scan)
+        with h5py.File(x_file, "r") as f:
+            if x_path not in f:
+                raise KeyError(f"X dataset path not found: {x_file.name}::{x_path}")
+            x_data = np.asarray(f[x_path][()]).squeeze()
+        if x_data.ndim != 1:
+            raise ValueError(f"X dataset must be 1D, got shape {x_data.shape}")
+        if len(x_data) != expected_len:
+            raise ValueError(f"X length {len(x_data)} does not match data length {expected_len}")
+        return x_data
+
+    def _export_curve_dataset(
+        self,
+        file_path: pathlib.Path,
+        scan_num: str,
+        dataset_path: str,
+        data: np.ndarray,
+        export_settings: dict[str, Any],
+        matching_files: list[tuple[pathlib.Path, str]],
+    ) -> None:
+        """Export 1D or small-column 2D data as CSV."""
+        arr = np.asarray(data).squeeze()
+        if arr.ndim == 1:
+            y_columns = arr.reshape(-1, 1)
+        elif arr.ndim == 2 and arr.shape[1] <= 10:
+            y_columns = arr
+        else:
+            raise ValueError(f"Not a curve/table export shape: {arr.shape}")
+
+        x_data = self._read_batch_x_data(
+            export_settings=export_settings,
+            current_file=file_path,
+            current_scan=scan_num,
+            matching_files=matching_files,
+            expected_len=y_columns.shape[0],
+        )
+
+        output_dir = pathlib.Path(export_settings["output_dir"])
+        out_path = output_dir / f"{self._safe_export_name(file_path, dataset_path)}.csv"
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            header = (["X"] if x_data is not None else []) + [f"Y_{i + 1}" for i in range(y_columns.shape[1])]
+            writer.writerow(header)
+            for row_idx in range(y_columns.shape[0]):
+                row = []
+                if x_data is not None:
+                    row.append(DataExporter._format_csv_value(x_data[row_idx]))
+                row.extend(DataExporter._format_csv_value(v) for v in y_columns[row_idx])
+                writer.writerow(row)
+
+    def _export_curve_combined_table(
+        self,
+        matching_files: list[tuple[pathlib.Path, str]],
+        batch_path: str,
+        export_settings: dict[str, Any],
+    ) -> tuple[int, list[str]]:
+        """Export all curve datasets into one wide CSV table."""
+        output_dir = pathlib.Path(export_settings["output_dir"])
+        first_file, first_scan = matching_files[0]
+        out_path = output_dir / f"{self._safe_export_name(first_file, batch_path, 'batch')}.csv"
+        series: list[tuple[pathlib.Path, str, str, np.ndarray, np.ndarray | None]] = []
+        fail_details: list[str] = []
+
+        for file_path, scan_num in matching_files:
+            ds_path = self._adjust_batch_path_for_scan(batch_path, scan_num)
+            try:
+                with h5py.File(file_path, "r") as f:
+                    if ds_path not in f:
+                        raise KeyError(f"Dataset path not found: {ds_path}")
+                    arr = np.asarray(f[ds_path][()]).squeeze()
+                if arr.ndim == 1:
+                    y_columns = arr.reshape(-1, 1)
+                elif arr.ndim == 2 and arr.shape[1] <= 10:
+                    y_columns = arr
+                else:
+                    raise ValueError(f"Not a curve/table export shape: {arr.shape}")
+                x_data = self._read_batch_x_data(
+                    export_settings=export_settings,
+                    current_file=file_path,
+                    current_scan=scan_num,
+                    matching_files=matching_files,
+                    expected_len=y_columns.shape[0],
+                )
+                series.append((file_path, scan_num, ds_path, y_columns, x_data))
+            except Exception as exc:
+                fail_details.append(f"{file_path.name}::{ds_path}: {exc}")
+
+        if not series:
+            return 0, fail_details
+
+        max_len = max(y.shape[0] for *_prefix, y, _x in series)
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            header: list[str] = []
+            shared_x_written = False
+            for file_path, scan_num, _ds_path, y_columns, x_data in series:
+                label = file_path.stem
+                if x_data is not None:
+                    if bool(export_settings.get("share_x", False)):
+                        if not shared_x_written:
+                            header.append("X")
+                            shared_x_written = True
+                    else:
+                        header.append(f"{label}_X")
+                for col_idx in range(y_columns.shape[1]):
+                    header.append(f"{label}_Y_{col_idx + 1}")
+            writer.writerow(header)
+
+            for row_idx in range(max_len):
+                row: list[str] = []
+                shared_x_written = False
+                for _file_path, _scan_num, _ds_path, y_columns, x_data in series:
+                    if x_data is not None:
+                        if bool(export_settings.get("share_x", False)):
+                            if not shared_x_written:
+                                row.append(DataExporter._format_csv_value(x_data[row_idx]) if row_idx < len(x_data) else "")
+                                shared_x_written = True
+                        else:
+                            row.append(DataExporter._format_csv_value(x_data[row_idx]) if row_idx < len(x_data) else "")
+                    for col_idx in range(y_columns.shape[1]):
+                        if row_idx < y_columns.shape[0]:
+                            row.append(DataExporter._format_csv_value(y_columns[row_idx, col_idx]))
+                        else:
+                            row.append("")
+                writer.writerow(row)
+
+        return len(series), fail_details
+
+    @staticmethod
+    def _resolve_batch_colormap(name: str) -> pg.ColorMap | None:
+        try:
+            return pg.colormap.get(name)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _render_batch_colormapped_rgb(data: np.ndarray, export_settings: dict[str, Any]) -> np.ndarray:
+        """Render 2D data as RGB using pyqtgraph colormaps."""
+        from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+
+        display_data = np.asarray(data, dtype=np.float64)
+        display_data = np.nan_to_num(display_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+        scale_mode = str(export_settings.get("scale", "Linear"))
+        if scale_mode == "Log":
+            positive_mask = display_data > 0
+            min_positive = float(np.min(display_data[positive_mask])) if np.any(positive_mask) else 1e-10
+            display_data = np.log10(np.where(positive_mask, display_data, min_positive))
+        elif scale_mode == "SymLog":
+            display_data = np.sign(display_data) * np.log10(1 + np.abs(display_data))
+        elif scale_mode == "Square root":
+            display_data = np.sqrt(np.clip(display_data, 0, None))
+
+        saved_levels = export_settings.get("levels")
+        if saved_levels is not None:
+            levels = (float(saved_levels[0]), float(saved_levels[1]))
+        elif "Auto" in str(export_settings.get("contrast", "")):
+            levels = ImageView2DEnhanced._robust_auto_levels(display_data)
+        else:
+            levels = (float(display_data.min()), float(display_data.max())) if display_data.size else (0.0, 1.0)
+        level_min, level_max = levels if levels is not None else (0.0, 1.0)
+        if not np.isfinite(level_min) or not np.isfinite(level_max) or level_max <= level_min:
+            level_min, level_max = 0.0, 1.0
+
+        normalized = np.clip((display_data - level_min) / (level_max - level_min), 0.0, 1.0)
+        cmap = MainWindow._resolve_batch_colormap(str(export_settings.get("colormap", "viridis")))
+        if cmap is None:
+            cmap = pg.colormap.get("viridis")
+        if bool(export_settings.get("invert", False)):
+            try:
+                cmap = cmap.reverse() or cmap
+            except Exception:
+                pass
+        lut = np.asarray(cmap.getLookupTable(0.0, 1.0, 256))
+        if lut.dtype.kind == "f":
+            lut = np.clip(lut, 0.0, 255.0)
+        lut = lut.astype(np.uint8)
+        indices = np.clip(np.rint(normalized * 255), 0, 255).astype(np.uint8)
+        return lut[indices, :3]
+
+    def _export_image_dataset(
+        self,
+        file_path: pathlib.Path,
+        dataset_path: str,
+        data: np.ndarray,
+        export_settings: dict[str, Any],
+    ) -> None:
+        """Export 2D data as colormapped PNG, optionally also raw TIFF."""
+        from PIL import Image
+        from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+
+        arr = np.asarray(data)
+        if arr.ndim >= 3 and arr.shape[0] == 1:
+            arr = np.squeeze(arr, axis=0)
+
+        if arr.ndim == 2:
+            frames = [(arr, "")]
+        elif arr.ndim >= 3:
+            frames = [(np.asarray(arr[i]), f"slice{i:04d}") for i in range(arr.shape[0])]
+        else:
+            raise ValueError(f"Not an image export shape: {arr.shape}")
+
+        output_dir = pathlib.Path(export_settings["output_dir"])
+        for frame, suffix in frames:
+            if frame.ndim > 2:
+                frame = np.squeeze(frame)
+            if frame.ndim != 2:
+                raise ValueError(f"Cannot export image frame with shape {frame.shape}")
+            stem = self._safe_export_name(file_path, dataset_path, suffix)
+            rgb = self._render_batch_colormapped_rgb(frame, export_settings)
+            img = Image.fromarray(rgb, mode="RGB")
+            incidence = export_settings.get("incidence") or {}
+            if bool(incidence.get("use_incidence", False)) and bool(incidence.get("incidence_applied_in_display", False)):
+                fac = ImageView2DEnhanced._incidence_factor_from_deg(float(incidence.get("incidence_deg", 0.0)))
+                axis = str(incidence.get("incidence_axis", "X")).upper()
+                if fac > 1.0:
+                    w, h = img.size
+                    if axis == "Y":
+                        img = img.resize((w, max(1, int(round(h * fac)))), Image.Resampling.BICUBIC)
+                    else:
+                        img = img.resize((max(1, int(round(w * fac))), h), Image.Resampling.BICUBIC)
+            img.save(output_dir / f"{stem}.png", "PNG")
+            if export_settings.get("save_tiff"):
+                DataExporter.export_image_to_tiff(np.asarray(frame), output_dir / f"{stem}.tif")
 
     def _batch_add_to_calculator_ab(self) -> None:
         """
@@ -2403,6 +3441,26 @@ class MainWindow(QMainWindow):
                     _action.triggered.connect(_make_fth_handler())
                     menu.addAction(_action)
 
+            # Check if CDI tool is open
+            if hasattr(self, 'cdi_tool') and self.cdi_tool is not None and self.cdi_tool.isVisible():
+                if menu.actions():
+                    menu.addSeparator()
+
+                for _ch, _label in [("CL", "CL"), ("CR", "CR"), ("Dark", "Dark")]:
+                    _action = QAction(f"-> CDI as {_label}", self)
+
+                    def _make_cdi_handler(ch=_ch):
+                        def _handler():
+                            if len(parents_list) > 1:
+                                filename = parents_list[0]
+                                dataset_path = "/".join(parents_list[1:])
+                                full_path = f"{filename}::{dataset_path}"
+                                self.cdi_tool.add_dataset_to_combo(full_path, ch)
+                        return _handler
+
+                    _action.triggered.connect(_make_cdi_handler())
+                    menu.addAction(_action)
+
             # Show menu if any actions were added
             if menu.actions():
                 if (viewport := self.tree_view_file.viewport()) is not None:
@@ -2448,15 +3506,15 @@ class MainWindow(QMainWindow):
             files_in_dir = [pathlib.Path(folder_path, name) for name in os.listdir(folder_path)]
         except OSError:
             files_in_dir = []
-        h5_files = [
+        data_files = [
             str(p)
             for p in natsorted(
-                (p for p in files_in_dir if p.is_file() and has_hdf5_extension(p)),
+                (p for p in files_in_dir if p.is_file() and has_supported_extension(p)),
                 key=lambda p: p.name.lower(),
             )
         ]
-        if h5_files:
-            self._start_open_queue(h5_files, mode="folder", mark_known=False)
+        if data_files:
+            self._start_open_queue(data_files, mode="folder", mark_known=False)
 
     @pyqtSlot()
     def _handle_action_clear_files(self) -> None:
@@ -2636,15 +3694,19 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _handle_action_calculator(self) -> None:
         """Open Data Calculator dialog."""
-        from src.gui.data_calculator_enhanced import DataCalculatorEnhanced
-
-        # Use non-modal dialog to allow dragging from main window
+        # Reuse existing dialog if possible so state is preserved and reopening is instant.
         dataset_full_keys_1d = self._peek_dataset_full_keys(min_ndim=1)
-        self.calculator = DataCalculatorEnhanced(
-            self.opened_files,
-            self,
-            dataset_full_keys_1d=dataset_full_keys_1d,
-        )
+        if getattr(self, "calculator", None) is not None:
+            self.calculator.refresh_dataset_keys(dataset_full_keys_1d, opened_files=self.opened_files)
+        else:
+            from src.gui.data_calculator_enhanced import DataCalculatorEnhanced
+
+            # Use non-modal dialog to allow dragging from main window
+            self.calculator = DataCalculatorEnhanced(
+                self.opened_files,
+                self,
+                dataset_full_keys_1d=dataset_full_keys_1d,
+            )
         self.calculator.show()
         self.calculator.raise_()  # Bring to front
         self.calculator.activateWindow()  # Activate the window
@@ -2705,16 +3767,56 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _handle_action_fth(self) -> None:
         """Open FTH/HERALDO Reconstruction Tool."""
-        from src.gui.fth_reconstruction_tool import FTHReconstructionTool
+        # Reuse existing tool if possible so loaded data is preserved and reopening is instant.
+        keys_2d_fth = self._peek_dataset_full_keys(min_ndim=2, min_second_dim=FTH_MIN_SECOND_DIM)
+        if getattr(self, "fth_tool", None) is not None:
+            self.fth_tool.refresh_dataset_keys(keys_2d_fth, opened_files=self.opened_files)
+        else:
+            from src.gui.fth_reconstruction_tool import FTHReconstructionTool
 
-        self.fth_tool = FTHReconstructionTool(
-            parent=self,
-            opened_files=self.opened_files,
-            dataset_full_keys_2d=self._peek_dataset_full_keys(min_ndim=2, min_second_dim=FTH_MIN_SECOND_DIM),
-        )
+            self.fth_tool = FTHReconstructionTool(
+                parent=self,
+                opened_files=self.opened_files,
+                dataset_full_keys_2d=keys_2d_fth,
+            )
         self.fth_tool.show()
         self.fth_tool.raise_()
         self.fth_tool.activateWindow()
+
+    @pyqtSlot()
+    def _handle_action_cdi(self) -> None:
+        """Open CDI Reconstruction Tool."""
+        # Reuse existing tool if possible so loaded data is preserved and reopening is instant.
+        keys_2d = self._peek_dataset_full_keys(min_ndim=2)
+        if getattr(self, "cdi_tool", None) is not None:
+            self.cdi_tool.update_opened_files(self.opened_files, keys_2d)
+        else:
+            from src.gui.cdi_reconstruction_tool import CDIReconstructionTool
+
+            self.cdi_tool = CDIReconstructionTool(
+                parent=self,
+                opened_files=self.opened_files,
+                dataset_full_keys_2d=keys_2d,
+            )
+        self.cdi_tool.show()
+        self.cdi_tool.raise_()
+        self.cdi_tool.activateWindow()
+
+    @pyqtSlot()
+    def _handle_action_xrms_analyze(self) -> None:
+        """Open the unified XRMS Analyze tool (radial / angular / time-resolved)."""
+        # Reuse existing tool if possible so loaded data is preserved and reopening is instant.
+        keys_2d = self._peek_dataset_full_keys(min_ndim=2)
+        if getattr(self, "xrms_tool", None) is not None:
+            self.xrms_tool.set_opened_files(self.opened_files)
+            self.xrms_tool.refresh_dataset_keys(keys_2d)
+        else:
+            from src.gui.xrms_analyze_tool import XRMSAnalyzeTool
+
+            self.xrms_tool = XRMSAnalyzeTool(self.opened_files, keys_2d, self)
+        self.xrms_tool.show()
+        self.xrms_tool.raise_()
+        self.xrms_tool.activateWindow()
 
     @pyqtSlot()
     def _handle_action_q_calibration(self) -> None:
@@ -2855,30 +3957,33 @@ class MainWindow(QMainWindow):
                 elif isinstance(current_widget, ImageView2DEnhanced):
                     image_widget = current_widget
 
-            # Load the data
-            with h5py.File(self.cur_file, "r") as file:
-                h5_obj = file[self.cur_obj_path]
+            if is_hdf5_file(self.cur_file):
+                # Load the data
+                with h5py.File(self.cur_file, "r") as file:
+                    h5_obj = file[self.cur_obj_path]
 
-                # Check if it's a dataset (not a group)
-                if isinstance(h5_obj, h5py.Group):
-                    from PyQt6.QtWidgets import QMessageBox
+                    # Check if it's a dataset (not a group)
+                    if isinstance(h5_obj, h5py.Group):
+                        from PyQt6.QtWidgets import QMessageBox
 
-                    QMessageBox.warning(
-                        self,
-                        "Cannot Export Group",
-                        "Please select a dataset (not a group) for export.",
-                    )
-                    return
+                        QMessageBox.warning(
+                            self,
+                            "Cannot Export Group",
+                            "Please select a dataset (not a group) for export.",
+                        )
+                        return
 
-                # Get the data
-                data = np.array(h5_obj)
+                    # Get the data
+                    data = np.array(h5_obj)
+            else:
+                data = load_regular_data_file(self.cur_file)
 
-                # Determine data type
-                plot_type = self.cb_plot_type.currentText()
-                if plot_type and plot_type != "Auto":
-                    data_type = H5DatasetType.from_string(plot_type)
-                else:
-                    data_type = H5DatasetType.from_numpy_array(data)
+            # Determine data type
+            plot_type = self.cb_plot_type.currentText()
+            if plot_type and plot_type != "Auto":
+                data_type = H5DatasetType.from_string(plot_type)
+            else:
+                data_type = H5DatasetType.from_numpy_array(np.asarray(data))
 
             # If custom X data is set, use plot widget's export (includes X, and optionally q)
             # Otherwise, export only raw Y data
@@ -2992,28 +4097,10 @@ class MainWindow(QMainWindow):
         settings.setValue("main_window/size", self.size())
         settings.setValue("main_window/position", self.pos())
 
-        # Persist monitor folder path so it can be restored on next startup
-        settings.setValue(
-            "settings/monitor_folder",
-            str(self._monitor_folder) if self._monitor_folder else ""
-        )
+        # Monitor folder is not persisted; user must re-enable it manually each session.
+        settings.setValue("settings/monitor_folder", "")
 
-        # Exclude files that belong to the monitored folder from last_opened_files.
-        # They will be reloaded on startup by the async folder scan, so saving them
-        # individually would only cause redundant (and slow) loading at startup.
-        if self._monitor_folder:
-            monitor_prefix = str(self._monitor_folder) + os.sep
-            files_to_save = tuple(
-                f for f in self.opened_files
-                if not str(f).startswith(monitor_prefix)
-            )
-        else:
-            files_to_save = self.opened_files
+        files_to_save = self.opened_files
         settings.setValue("settings/last_opened_files", files_to_save)
         settings.sync()
         self._save_disk_index_cache()
-
-
-
-
-

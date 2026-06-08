@@ -46,8 +46,8 @@ You will have to manually create a desktop shortcut and associate file extension
 
 
 ## Building binaries from source
-Running `python pyinstaller.py` will generate the binary in `/dist/main/main`.
-Use the `windows/compile.iss` script with Inno Setup to generate Installer on Windows.
+Running `python build.py` will generate the binary in `dist/HDF5-Viewer/`.
+Use `python build.py --installer` (with Inno Setup installed) to generate the Windows installer.
 Run `make build` with `build-essential devscripts debhelper` installed to generate a deb package on Linux.
 
 

@@ -34,7 +34,7 @@ fmt:
 
 build:
 	@echo "running pyinstaller..."
-	./venv/bin/python3 pyinstaller.py
+	./venv/bin/python3 build.py
 
 	@echo "running debuild..."
 	debuild --no-tgz-check

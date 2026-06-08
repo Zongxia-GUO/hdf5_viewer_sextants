@@ -1,4 +1,6 @@
 /.idea
+/.vscode
+/.claude
 /.mypy_cache
 /.pytest_cache
 /.tox
@@ -8,6 +10,9 @@
 /out
 /debian/.debhelper
 /debian/hdf5viewer
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars
 /package
 /{envtempdir}
 /pages/public

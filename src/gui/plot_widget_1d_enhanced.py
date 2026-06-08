@@ -18,7 +18,7 @@
 import csv
 import logging
 import pathlib
-from typing import Any, Optional
+from typing import Optional
 
 import h5py
 import numpy as np
@@ -874,8 +874,6 @@ class PlotWidget1DEnhanced(QWidget):
         settings.setValue("paths/last_export_directory", pathlib.Path(file_path).parent)
 
         try:
-            import csv
-
             # Determine delimiter based on file extension
             file_ext = pathlib.Path(file_path).suffix.lower()
             delimiter = "\t" if file_ext == ".txt" else ","

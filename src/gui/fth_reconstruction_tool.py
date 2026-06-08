@@ -43,7 +43,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -51,7 +50,16 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from src.gui._shared import apply_hist_colormap as _apply_hist_colormap
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.recon.fth import (
+    binary_filter as _binary_filter_kernel,
+    bs_step as _bs_step,
+    differential_filter_kernel as _differential_filter_kernel,
+    estimate_balance_ratio as _estimate_balance_ratio_impl,
+    fth_transform as _fth_transform,
+    line_gaussian_filter as _line_gaussian_filter,
+)
 
 # Keep colormap options consistent with the main ImageView2DEnhanced toolbar.
 FTH_COLORMAPS = [
@@ -106,6 +114,11 @@ class _FTHWorker(QThread):
 
     @staticmethod
     def _read_one(filename: str, ds_path: str) -> np.ndarray:
+        from src.lib_h5.file_validator import is_hdf5_file
+        from src.gui.main_window import load_regular_data_file
+
+        if not is_hdf5_file(filename):
+            return np.squeeze(np.asarray(load_regular_data_file(filename))).astype(np.float64)
         with h5py.File(filename, "r") as f:
             return np.squeeze(np.array(f[ds_path])).astype(np.float64)
 
@@ -114,14 +127,13 @@ class _FTHWorker(QThread):
             if self.isInterruptionRequested():
                 return
 
+            single_source = None
             cl = None
             for fn, dp in self._cl:
                 if self.isInterruptionRequested():
                     return
                 arr = self._read_one(fn, dp)
                 cl = arr if cl is None else (cl + arr)
-            if cl is None:
-                raise RuntimeError("No CL datasets provided.")
 
             cr = None
             for fn, dp in self._cr:
@@ -129,102 +141,27 @@ class _FTHWorker(QThread):
                     return
                 arr = self._read_one(fn, dp)
                 cr = arr if cr is None else (cr + arr)
+
+            if cl is None and cr is None:
+                raise RuntimeError("No CL/CR datasets provided.")
+            if cl is None:
+                cl = cr
+                cr = np.zeros_like(cl, dtype=np.asarray(cl).dtype)
+                single_source = "CR"
             if cr is None:
-                raise RuntimeError("No CR datasets provided.")
+                cr = np.zeros_like(cl, dtype=np.asarray(cl).dtype)
+                single_source = "CL"
 
             if self.isInterruptionRequested():
                 return
             dark = self._read_one(*self._dark) if self._dark else None
             if self.isInterruptionRequested():
                 return
+            if single_source is not None:
+                logging.info("FTH single-dataset load: %s used as CL, CR set to zeros.", single_source)
             self.finished.emit(cl, cr, dark)
         except Exception as exc:
             self.error.emit(str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Math helpers
-# ---------------------------------------------------------------------------
-
-def _bs_step(sigma: float, x: np.ndarray) -> np.ndarray:
-    """Smooth step function for beamstop masking.
-
-    Returns values in [0, 1]:  ~0 for x << 0 (inside BS),
-    0.5 at x = 0 (edge), ~1 for x >> 0 (outside BS).
-    ``sigma`` controls the transition width in pixels.
-    """
-    return 0.5 * (1.0 + np.tanh(x / (sigma + 1e-12)))
-
-
-def _line_gaussian_filter(Nx: int, Ny: int, phi_deg: float,
-                           sigma: float, shift: float) -> np.ndarray:
-    """Gaussian line-notch filter computed analytically (no rotated interpolation).
-
-    This avoids angle-dependent width artifacts from resampling. Returned values
-    are in [0, 1], with ~0 on the notch line and ~1 far away.
-    """
-    phi = np.deg2rad(phi_deg)
-    rows, cols = np.meshgrid(np.arange(Nx, dtype=float), np.arange(Ny, dtype=float), indexing="ij")
-    drow = rows - (Nx - 1) / 2.0
-    dcol = cols - (Ny - 1) / 2.0
-
-    # Signed perpendicular distance to the line in (col=x, row=y) view coordinates.
-    # shift moves the notch along this perpendicular axis.
-    perp = drow * np.cos(phi) - dcol * np.sin(phi) + shift
-    return 1.0 - np.exp(-(perp ** 2) / (2.0 * sigma ** 2 + 1e-12))
-
-
-def _get_colormap(name: str) -> Optional[pg.ColorMap]:
-    """Resolve colormap name across pyqtgraph/colorcet/matplotlib sources."""
-    aliases = {
-        "Jet": "jet",
-        "Gray": "gray",
-        "Hot": "hot",
-        "bluered": "bwr",
-    }
-    query = aliases.get(name, name)
-
-    # Try native lookup first (handles CET-* and other built-ins)
-    try:
-        return pg.colormap.get(query, skipCache=True)
-    except Exception as exc:
-        logging.debug("Native colormap lookup failed for '%s': %s", query, exc)
-
-    # Fallback to matplotlib maps (jet/gray/hot/bwr, etc.)
-    try:
-        return pg.colormap.get(query, source="matplotlib", skipCache=True)
-    except Exception as exc:
-        logging.warning("Unknown colormap '%s'; keeping previous colormap (%s).", name, exc)
-        return None
-
-
-def _apply_colormap(img_item: pg.ImageItem, name: str, levels=None, invert: bool = False) -> None:
-    """Apply a named colormap to a pg.ImageItem."""
-    cmap = _get_colormap(name)
-    if cmap is not None:
-        if invert:
-            lut = cmap.getLookupTable(0.0, 1.0, 256)
-            lut = lut[::-1]
-            cmap = pg.ColorMap(np.linspace(0.0, 1.0, lut.shape[0]), lut)
-        img_item.setColorMap(cmap)
-    if levels is not None:
-        img_item.setLevels(levels)
-
-
-def _apply_hist_colormap(hist: pg.HistogramLUTItem, name: str, invert: bool = False) -> None:
-    """Apply a named colormap to a HistogramLUTItem gradient.
-
-    Always routes through the histogram so that dragging the handles
-    never overrides the chosen colormap.
-    """
-    cmap = _get_colormap(name)
-    if cmap is None:
-        return
-    if invert:
-        lut = cmap.getLookupTable(0.0, 1.0, 256)
-        lut = lut[::-1]
-        cmap = pg.ColorMap(np.linspace(0.0, 1.0, lut.shape[0]), lut)
-    hist.gradient.setColorMap(cmap)
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +196,8 @@ class FTHReconstructionTool(QMainWindow):
 
         self._CL:  Optional[np.ndarray] = None   # summed raw
         self._CR:  Optional[np.ndarray] = None
+        self._single_dataset_mode: bool = False
+        self._pending_single_dataset_mode: bool = False
         self._dark: Optional[np.ndarray] = None
         self._CL_c: Optional[np.ndarray] = None  # centerd, cropped
         self._CR_c: Optional[np.ndarray] = None
@@ -294,7 +233,7 @@ class FTHReconstructionTool(QMainWindow):
         self._roi_count: int = 2
 
         # display state
-        self._current_slit:    int = 1  # 0=None (combined), 1=Slit1, 2=Slit2
+        self._current_slit:    int = 0  # 0=None (combined), 1=Slit1, 2=Slit2
         self._current_roi:     int = 1
         self._show_realpart:   str = "Real"
         self._rs_scale:        float = 1.0
@@ -360,7 +299,7 @@ class FTHReconstructionTool(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
 
         # status bar at bottom
-        self._status_label = QLabel("Ready -select or drag CL and CR datasets from the HDF5 tree.")
+        self._status_label = QLabel("Ready -select or drag CL/CR datasets from the HDF5 tree. Single dataset is supported.")
         self._status_label.setStyleSheet(
             "color:#aaa; font-size:11px; padding:3px 6px; "
             "border-top:1px solid #444; background:#1a1a1a;"
@@ -520,7 +459,7 @@ class FTHReconstructionTool(QMainWindow):
         lay.addWidget(g_cl)
 
         # CR dataset
-        g_cr = QGroupBox("CR Dataset  (circular right polarisation)")
+        g_cr = QGroupBox("CR Dataset  (optional for single-file mode)")
         fl_cr = QFormLayout(g_cr)
         self._cr_combo = FTHDatasetCombo("-- no CR dataset --")
         self._cr_combo.lineEdit().returnPressed.connect(self._on_dataset_entry_entered)
@@ -618,11 +557,11 @@ class FTHReconstructionTool(QMainWindow):
         fl_phi = QFormLayout(g_phi)
         self._phi1_spin = QDoubleSpinBox()
         self._phi1_spin.setRange(-180.0, 180.0); self._phi1_spin.setValue(0.0)
-        self._phi1_spin.setSingleStep(1.0); self._phi1_spin.setDecimals(2)
+        self._phi1_spin.setSingleStep(0.1); self._phi1_spin.setDecimals(1)
         self._phi1_spin.setSuffix(" deg")
         self._phi2_spin = QDoubleSpinBox()
         self._phi2_spin.setRange(-180.0, 180.0); self._phi2_spin.setValue(90.0)
-        self._phi2_spin.setSingleStep(1.0); self._phi2_spin.setDecimals(2)
+        self._phi2_spin.setSingleStep(0.1); self._phi2_spin.setDecimals(1)
         self._phi2_spin.setSuffix(" deg")
         fl_phi.addRow("Phi 1 (horiz. slit):", self._phi1_spin)
         fl_phi.addRow("Phi 2 (vert.  slit):", self._phi2_spin)
@@ -639,6 +578,16 @@ class FTHReconstructionTool(QMainWindow):
         g_slit_mask.toggled.connect(self._on_slit_mask_toggled)
         self._g_slit_mask = g_slit_mask
         fl_sm2 = QFormLayout(g_slit_mask)
+        self._slit_mask_phi1_chk = QCheckBox("Apply Phi 1 mask")
+        self._slit_mask_phi1_chk.setChecked(True)
+        self._slit_mask_phi2_chk = QCheckBox("Apply Phi 2 mask")
+        self._slit_mask_phi2_chk.setChecked(True)
+        self._slit_mask_phi1_chk.toggled.connect(self._apply_slit_mask)
+        self._slit_mask_phi2_chk.toggled.connect(self._apply_slit_mask)
+        slit_mask_row = QHBoxLayout()
+        slit_mask_row.addWidget(self._slit_mask_phi1_chk)
+        slit_mask_row.addWidget(self._slit_mask_phi2_chk)
+        fl_sm2.addRow("Apply:", slit_mask_row)
         self._slit_mask_width = QDoubleSpinBox()
         self._slit_mask_width.setRange(0.0, 2000.0); self._slit_mask_width.setValue(2.0)
         self._slit_mask_width.setSingleStep(5.0); self._slit_mask_width.setDecimals(1); self._slit_mask_width.setSuffix(" px")
@@ -749,7 +698,7 @@ class FTHReconstructionTool(QMainWindow):
         right_layout.addWidget(self._t1_glw, stretch=1)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([330, 1070])    # Tab 1 needs a wider left panel than Tab 2/3
+        splitter.setSizes([390, 1010])    # Tab 1 needs a wider left panel than Tab 2/3
         splitter.setStretchFactor(0, 0)   # left panel: fixed width on window resize
         splitter.setStretchFactor(1, 1)   # right panel: absorbs all resize
         return tab
@@ -781,14 +730,6 @@ class FTHReconstructionTool(QMainWindow):
         self._filter_combo.currentTextChanged.connect(self._on_filter_type_changed)
         fl_f.addRow("Secondary filter:", self._filter_combo)
 
-        self._chk_balance = QCheckBox("Auto balance CL/CR")
-        self._chk_balance.setChecked(True)
-        fl_f.addRow(self._chk_balance)
-        self._balance_ratio_edit = QLineEdit("1.0000")
-        self._balance_ratio_edit.setReadOnly(True)
-        self._balance_ratio_edit.setFixedWidth(70)
-        fl_f.addRow("Balance ratio:", self._balance_ratio_edit)
-
         # Gaussian params
         self._g_gaussian = QGroupBox("Gaussian filter params")
         fl_gp = QFormLayout(self._g_gaussian)
@@ -810,17 +751,32 @@ class FTHReconstructionTool(QMainWindow):
         self._g_binary.setVisible(False)
         self._on_filter_type_changed(self._filter_combo.currentText())
 
-        btn_row = QHBoxLayout()
-        self._btn_apply_filters = QPushButton("Apply Filters")
-        self._btn_apply_filters.setMinimumHeight(30)
-        self._btn_apply_filters.clicked.connect(self._apply_filters_only)
-        btn_row.addWidget(self._btn_apply_filters)
+        g_filt.setCheckable(True)
+        g_filt.setChecked(False)
+        g_filt.toggled.connect(self._on_diff_filter_toggled)
+        self._g_diff_filter = g_filt
+        lay.addWidget(g_filt)
+
+        # Auto balance row — placed directly below the GroupBox, wrapped so it
+        # can be hidden as a unit by tools that embed this tab.
+        self._chk_balance = QCheckBox("Auto balance CL/CR")
+        self._chk_balance.setChecked(True)
+        self._balance_ratio_edit = QLineEdit("1.0000")
+        self._balance_ratio_edit.setReadOnly(True)
+        self._balance_ratio_edit.setFixedWidth(70)
+        self._balance_widget = QWidget()
+        _bal_row = QHBoxLayout(self._balance_widget)
+        _bal_row.setContentsMargins(0, 0, 0, 0)
+        _bal_row.addWidget(self._chk_balance)
+        _bal_row.addWidget(QLabel("Ratio:"))
+        _bal_row.addWidget(self._balance_ratio_edit)
+        lay.addWidget(self._balance_widget)
+
+        # Compute FTH button — applies filter then computes in one step
         self._btn_compute_fth = QPushButton("Compute FTH")
         self._btn_compute_fth.setMinimumHeight(30)
-        self._btn_compute_fth.clicked.connect(self._compute_fth_only)
-        btn_row.addWidget(self._btn_compute_fth)
-        fl_f.addRow(btn_row)
-        lay.addWidget(g_filt)
+        self._btn_compute_fth.clicked.connect(self._apply_and_compute_fth)
+        lay.addWidget(self._btn_compute_fth)
 
         # FTH display controls
         g_fth_disp = QGroupBox("FTH Display")
@@ -1170,8 +1126,8 @@ class FTHReconstructionTool(QMainWindow):
         cr_entry   = self._cr_combo.get_entry(opened_files=self._opened_files)
         dark_entry = self._dark_combo.get_entry(opened_files=self._opened_files)
 
-        if not cl_entry or not cr_entry:
-            self._set_status("Please select CL and CR datasets.", error=True)
+        if not cl_entry and not cr_entry:
+            self._set_status("Please select at least one CL or CR dataset.", error=True)
             return
 
         if self._worker and self._worker.isRunning():
@@ -1179,9 +1135,18 @@ class FTHReconstructionTool(QMainWindow):
             self._worker.wait(200)
 
         self._load_btn.setEnabled(False)
-        self._set_status("Loading datasets in background...")
+        self._pending_single_dataset_mode = not (cl_entry and cr_entry)
+        self._set_status(
+            "Loading single dataset in background..."
+            if self._pending_single_dataset_mode
+            else "Loading datasets in background..."
+        )
 
-        self._worker = _FTHWorker([cl_entry], [cr_entry], dark_entry)
+        self._worker = _FTHWorker(
+            [cl_entry] if cl_entry else [],
+            [cr_entry] if cr_entry else [],
+            dark_entry,
+        )
         self._worker.finished.connect(self._on_load_finished)
         self._worker.error.connect(self._on_load_error)
         self._worker.start()
@@ -1195,7 +1160,7 @@ class FTHReconstructionTool(QMainWindow):
             self._dark_combo.get_entry(opened_files=self._opened_files) is not None
         )
 
-        if cl_ok and cr_ok and dark_ok:
+        if (cl_ok or cr_ok) and dark_ok:
             self._set_status("Dataset entries validated. Click 'Load Data' to continue.")
         else:
             self._set_status(
@@ -1209,9 +1174,9 @@ class FTHReconstructionTool(QMainWindow):
             return
         if (
             not self._cl_combo.get_entry(opened_files=self._opened_files)
-            or not self._cr_combo.get_entry(opened_files=self._opened_files)
+            and not self._cr_combo.get_entry(opened_files=self._opened_files)
         ):
-            self._set_status("Please select CL and CR datasets.", error=True)
+            self._set_status("Please select at least one CL or CR dataset.", error=True)
             return
         self._apply_locked_on_next_load = True
         self._load_data()
@@ -1227,7 +1192,9 @@ class FTHReconstructionTool(QMainWindow):
             cr = np.clip(cr - dark, 0, None)
         self._CL   = cl
         self._CR   = cr
+        self._single_dataset_mode = bool(self._pending_single_dataset_mode)
         self._dark = dark
+        self._initialize_center_controls_for_loaded_shape(cl.shape)
         # Reset downstream results
         self._CL_smooth = self._CR_smooth = None
         self._bs_mask = None
@@ -1259,7 +1226,27 @@ class FTHReconstructionTool(QMainWindow):
             self._compute_fth_only()
             self._update_t4_display()
             return
-        self._set_status(f"Loaded OK - shape {cl.shape}, centered to ({self._Nx}x{self._Ny}), X0={self._X0} Y0={self._Y0}")
+        mode_label = "single dataset" if self._single_dataset_mode else "CL/CR pair"
+        self._set_status(
+            f"Loaded OK ({mode_label}) - shape {cl.shape}, "
+            f"centered to ({self._Nx}x{self._Ny}), X0={self._X0} Y0={self._Y0}"
+        )
+
+    def _initialize_center_controls_for_loaded_shape(self, shape: tuple[int, int]) -> None:
+        """Use the loaded image geometry instead of stale detector defaults."""
+        rows, cols = int(shape[0]), int(shape[1])
+        center_row = max(0, rows // 2)
+        center_col = max(0, cols // 2)
+        for spin, value, limit in (
+            (self._t1_xmid, center_row, rows),
+            (self._t1_ymid, center_col, cols),
+        ):
+            spin.blockSignals(True)
+            try:
+                spin.setRange(0, max(0, limit - 1))
+                spin.setValue(min(max(0, value), max(0, limit - 1)))
+            finally:
+                spin.blockSignals(False)
 
     def _on_load_error(self, msg: str) -> None:
         sender = self.sender()
@@ -1301,6 +1288,8 @@ class FTHReconstructionTool(QMainWindow):
             "phi1": float(self._phi1_spin.value()),
             "phi2": float(self._phi2_spin.value()),
             "slit_mask_enabled": bool(self._g_slit_mask.isChecked()),
+            "slit_mask_phi1": bool(self._slit_mask_phi1_chk.isChecked()),
+            "slit_mask_phi2": bool(self._slit_mask_phi2_chk.isChecked()),
             "slit_width": float(self._slit_mask_width.value()),
             "slit_sigma": float(self._slit_mask_sigma.value()),
             "bs_mask_enabled": bool(self._g_bs_mask.isChecked()),
@@ -1343,6 +1332,8 @@ class FTHReconstructionTool(QMainWindow):
         self._phi2_spin.setValue(float(lp.get("phi2", self._phi2_spin.value())))
         self._slit_mask_width.setValue(float(lp.get("slit_width", self._slit_mask_width.value())))
         self._slit_mask_sigma.setValue(float(lp.get("slit_sigma", self._slit_mask_sigma.value())))
+        self._slit_mask_phi1_chk.setChecked(bool(lp.get("slit_mask_phi1", True)))
+        self._slit_mask_phi2_chk.setChecked(bool(lp.get("slit_mask_phi2", True)))
         self._g_slit_mask.setChecked(bool(lp.get("slit_mask_enabled", False)))
 
         self._bs_radius.setValue(int(lp.get("bs_radius", self._bs_radius.value())))
@@ -1484,6 +1475,12 @@ class FTHReconstructionTool(QMainWindow):
         self._set_plots_axes_visible([self._t1_main_plot], show_axes)
         self._update_bs_overlay()
         self._update_t1_profile()
+        callback = getattr(self, "_t1_display_updated_callback", None)
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logging.debug("Alignment display update callback failed", exc_info=True)
 
     def _on_t1_toolbar_changed(self, *_) -> None:
         self._update_t1_main_display()
@@ -1911,6 +1908,18 @@ class FTHReconstructionTool(QMainWindow):
                 self._FTH_S1  = self._FTH_S2  = None
                 self._update_t1_main_display()
                 return
+            use_phi1 = bool(getattr(self, "_slit_mask_phi1_chk", None) is None
+                            or self._slit_mask_phi1_chk.isChecked())
+            use_phi2 = bool(getattr(self, "_slit_mask_phi2_chk", None) is None
+                            or self._slit_mask_phi2_chk.isChecked())
+            if not (use_phi1 or use_phi2):
+                self._slit_mask = None
+                self._recompute_smooth_data()
+                self._Holo_S1 = self._Holo_S2 = None
+                self._FTH_S1  = self._FTH_S2  = None
+                self._update_t1_main_display()
+                self._set_status("Slit mask cleared - no slit direction selected.")
+                return
             phi1 = np.deg2rad(self._phi1_spin.value())
             phi2 = np.deg2rad(self._phi2_spin.value())
             sigma = self._slit_mask_sigma.value()
@@ -1929,12 +1938,23 @@ class FTHReconstructionTool(QMainWindow):
             band1 = np.exp(-(edge1 ** 2) / (2 * sigma ** 2))
             band2 = np.exp(-(edge2 ** 2) / (2 * sigma ** 2))
 
-            self._slit_mask = np.clip(1.0 - np.maximum(band1, band2), 0.0, 1.0)
+            bands = []
+            if use_phi1:
+                bands.append(band1)
+            if use_phi2:
+                bands.append(band2)
+            combined_band = np.maximum.reduce(bands)
+            self._slit_mask = np.clip(1.0 - combined_band, 0.0, 1.0)
             self._recompute_smooth_data()
             self._Holo_S1 = self._Holo_S2 = None
             self._FTH_S1  = self._FTH_S2  = None
             self._update_t1_main_display()
-            self._set_status(f"Slit mask applied  (width={width:.1f} px, \u03c3={sigma:.1f} px).")
+            active = ", ".join(
+                name for name, enabled in (("Phi 1", use_phi1), ("Phi 2", use_phi2)) if enabled
+            )
+            self._set_status(
+                f"Slit mask applied ({active}; width={width:.1f} px, \u03c3={sigma:.1f} px)."
+            )
         except Exception as exc:
             self._set_status(f"Slit mask error: {exc}", error=True)
             logging.exception("Slit mask")
@@ -2230,6 +2250,19 @@ class FTHReconstructionTool(QMainWindow):
         except Exception as exc:
             logging.debug("Tab2 ROI profile update failed (%s/%s): %s", panel, kind, exc)
 
+    def _on_diff_filter_toggled(self, checked: bool) -> None:
+        """Enable/disable differential slit filter via the GroupBox checkbox."""
+        if checked:
+            self._on_slit_changed()
+        else:
+            self._current_slit = 0
+
+    def _apply_and_compute_fth(self) -> None:
+        """Apply differential filter then compute FTH in one step."""
+        if not self._apply_filters_only():
+            return
+        self._compute_fth_only()
+
     def _on_slit_changed(self, _=None) -> None:
         prev_slit = self._current_slit
         txt = self._slit_combo.currentText()
@@ -2254,28 +2287,8 @@ class FTHReconstructionTool(QMainWindow):
 
     @staticmethod
     def _estimate_balance_ratio(src_l: np.ndarray, src_r: np.ndarray) -> float:
-        """Estimate scalar ratio r such that src_l ? r*src_r (L1 objective)."""
-        from scipy.optimize import minimize_scalar
-
-        m = np.isfinite(src_l) & np.isfinite(src_r) & (src_l > 0) & (src_r > 0)
-        if not np.any(m):
-            return 1.0
-        a = src_l[m].astype(np.float64, copy=False)
-        b = src_r[m].astype(np.float64, copy=False)
-        step = max(1, a.size // 200_000)
-        a = a[::step]
-        b = b[::step]
-
-        def obj(r: float) -> float:
-            return float(np.sum(np.abs(a - r * b)))
-
-        try:
-            res = minimize_scalar(obj, bounds=(0.1, 10.0), method="bounded")
-            if res.success and np.isfinite(res.x):
-                return float(res.x)
-        except Exception as exc:
-            logging.debug("Auto-balance ratio estimation failed; fallback to 1.0: %s", exc)
-        return 1.0
+        """Estimate scalar ratio r such that src_l ≈ r*src_r; delegates to src.recon.fth."""
+        return _estimate_balance_ratio_impl(src_l, src_r)
 
     def _apply_filters_only(self) -> bool:
         src_l = self._CL_smooth if self._CL_smooth is not None else getattr(self, "_CL_c", None)
@@ -2296,7 +2309,12 @@ class FTHReconstructionTool(QMainWindow):
             self._balance_ratio_edit.setText(f"{self._balance_ratio:.4f}")
             diff = src_l - self._balance_ratio * src_r
 
-            if self._current_slit == 0:
+            diff_filter_active = (
+                getattr(self, "_g_diff_filter", None) is not None
+                and self._g_diff_filter.isChecked()
+                and self._current_slit != 0
+            )
+            if not diff_filter_active:
                 # Normal-FTH path: no slit differential kernels, no slit-specific secondary filters.
                 self._Holo_S1 = diff
                 self._Holo_S2 = diff
@@ -2305,10 +2323,8 @@ class FTHReconstructionTool(QMainWindow):
                 ftype = "None (slit disabled)"
             else:
                 # Differential filter kernels (HERALDO slit path)
-                df1 = 1j * (-(self._xmat - self._X0) * np.sin(np.deg2rad(phi1))
-                            + (self._ymat - self._Y0) * np.cos(np.deg2rad(phi1)))
-                df2 = 1j * (-(self._xmat - self._X0) * np.sin(np.deg2rad(phi2))
-                            + (self._ymat - self._Y0) * np.cos(np.deg2rad(phi2)))
+                df1 = _differential_filter_kernel(self._xmat, self._ymat, self._X0, self._Y0, phi1)
+                df2 = _differential_filter_kernel(self._xmat, self._ymat, self._X0, self._Y0, phi2)
 
                 self._Holo_S1 = diff * df1
                 self._Holo_S2 = diff * df2
@@ -2340,8 +2356,10 @@ class FTHReconstructionTool(QMainWindow):
             self._FTH_S2 = None
             self._t4_autoleveled_key = None
             self._update_t3_holo_display()
+            mode_label = "single-file" if self._single_dataset_mode else "CL/CR"
             self._set_status(
-                f"Filters applied - phi1={phi1:.2f}deg, phi2={phi2:.2f}deg, filter={ftype}, ratio={self._balance_ratio:.4f}"
+                f"Filters applied ({mode_label}) - phi1={phi1:.2f}deg, "
+                f"phi2={phi2:.2f}deg, filter={ftype}, ratio={self._balance_ratio:.4f}"
             )
             return True
         except Exception as exc:
@@ -2358,12 +2376,10 @@ class FTHReconstructionTool(QMainWindow):
             return False
         try:
             # FTH = FFT + phase correction to center
-            phase_corr = np.exp(
-                2j * np.pi * (self._xmat * self._X0 / self._Nx
-                              + self._ymat * self._Y0 / self._Ny)
-            )
-            self._FTH_S1 = np.fft.fftshift(np.fft.fft2(self._Holo2_S1)) * phase_corr
-            self._FTH_S2 = np.fft.fftshift(np.fft.fft2(self._Holo2_S2)) * phase_corr
+            self._FTH_S1 = _fth_transform(
+                self._Holo2_S1, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny)
+            self._FTH_S2 = _fth_transform(
+                self._Holo2_S2, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny)
 
             # Auto-scale based on 95th percentile of selected FTH amplitude
             fth_ref = self._select_slit_data(self._FTH_S1, self._FTH_S2)
@@ -2387,13 +2403,8 @@ class FTHReconstructionTool(QMainWindow):
             self._compute_fth_only()
 
     def _binary_filter(self, phi_deg: float, width: int) -> np.ndarray:
-        """Vectorised binary notch filter: zeros pixels within 'width' of the
-        line through (X0, Y0) at angle phi_deg (perpendicular distance test)."""
-        phi_rad = np.deg2rad(phi_deg)
-        dr = self._xmat - self._X0
-        dc = self._ymat - self._Y0
-        perp = np.abs(dr * np.sin(phi_rad) - dc * np.cos(phi_rad))
-        return (perp > width).astype(float)
+        """Binary notch filter through (X0, Y0); delegates to src.recon.fth."""
+        return _binary_filter_kernel(self._xmat, self._ymat, self._X0, self._Y0, phi_deg, width)
 
     def _select_slit_data(self, d1, d2):
         """Return selected slit data; when slit=None, return combined average."""
@@ -2488,6 +2499,12 @@ class FTHReconstructionTool(QMainWindow):
         if self._t3_profile_roi_items.get("fth") is not None:
             self._update_t3_profile_from_roi("fth")
         self._update_roi_rects()
+        callback = getattr(self, "_t3_fth_display_updated_callback", None)
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logging.debug("FTH display update callback failed", exc_info=True)
 
     @staticmethod
     def _transform_for_display(data: np.ndarray, mode: str) -> np.ndarray:
@@ -3058,6 +3075,10 @@ class FTHReconstructionTool(QMainWindow):
             head2, n2 = self._scan_head_and_number(str(cr_entry[0]))
             head = head1 if head1 else (head2 if head2 else "scan")
             return f"{head}_{n1}_{n2}"
+        single_entry = cl_entry or cr_entry
+        if single_entry:
+            head, n1 = self._scan_head_and_number(str(single_entry[0]))
+            return f"{head}_{n1}_single"
         return "scan_0000_0000"
 
     def _component_display_levels(self, name: str) -> tuple[float, float]:

@@ -102,8 +102,7 @@ class DatasetPathCombo(QComboBox):
                             return
                         if min_second_dim > 0 and (len(shp) < 2 or shp[1] <= min_second_dim):
                             return
-                        if True:
-                            keys.append(f"{_fp}::{name}")
+                        keys.append(f"{_fp}::{name}")
                     f.visititems(_visit)
             except Exception as exc:
                 logging.warning("Skip unreadable dataset file '%s': %s", fp_str, exc)

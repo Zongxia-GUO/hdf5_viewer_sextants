@@ -33,6 +33,11 @@ HDF5_EXTENSIONS = {
     ".mat",      # MATLAB v7.3+ uses HDF5
 }
 
+IMAGE_EXTENSIONS = {".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg"}
+TEXT_EXTENSIONS = {".txt", ".csv"}
+TXT_EXTENSIONS = TEXT_EXTENSIONS  # alias used by the radial/time-resolve tools
+SUPPORTED_DATA_EXTENSIONS = HDF5_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS
+
 
 def is_hdf5_file(file_path: Union[str, pathlib.Path]) -> bool:
     """
@@ -62,14 +67,38 @@ def has_hdf5_extension(file_path: Union[str, pathlib.Path]) -> bool:
     return path.suffix.lower() in HDF5_EXTENSIONS
 
 
+def has_supported_extension(file_path: Union[str, pathlib.Path]) -> bool:
+    """Check if a file has an extension supported by the viewer."""
+    path = pathlib.Path(file_path)
+    return path.suffix.lower() in SUPPORTED_DATA_EXTENSIONS
+
+
+def is_supported_data_file(file_path: Union[str, pathlib.Path]) -> bool:
+    """Return True for valid HDF5 files or supported image/text files."""
+    path = pathlib.Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix in HDF5_EXTENSIONS:
+        return is_hdf5_file(path)
+    return suffix in IMAGE_EXTENSIONS or suffix in TEXT_EXTENSIONS
+
+
 def get_file_filter_string() -> str:
     """
     Get the file filter string for file dialogs.
 
     :return: Filter string in Qt file dialog format
     """
-    extensions = " ".join(f"*{ext}" for ext in sorted(HDF5_EXTENSIONS))
-    return f"HDF5 Files ({extensions});;All Files (*.*)"
+    hdf5_extensions = " ".join(f"*{ext}" for ext in sorted(HDF5_EXTENSIONS))
+    image_extensions = " ".join(f"*{ext}" for ext in sorted(IMAGE_EXTENSIONS))
+    text_extensions = " ".join(f"*{ext}" for ext in sorted(TEXT_EXTENSIONS))
+    all_extensions = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_DATA_EXTENSIONS))
+    return (
+        f"Supported Data Files ({all_extensions});;"
+        f"HDF5 Files ({hdf5_extensions});;"
+        f"Images ({image_extensions});;"
+        f"Text/CSV ({text_extensions});;"
+        "All Files (*.*)"
+    )
 
 
 

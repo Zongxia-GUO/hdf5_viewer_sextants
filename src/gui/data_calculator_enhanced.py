@@ -39,7 +39,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -73,7 +72,7 @@ class DataCalculatorEnhanced(QDialog):
         self.result_data: np.ndarray | None = None
         self.result_widget: QWidget | None = None  # Current result display widget
         self.data_a: np.ndarray | None = None  # Original dataset A
-        self.data_b: np.ndarray | None = None  # Original dataset B
+        self.data_b: np.ndarray | None = None  # Original dataset B, optional for single-dataset operations
         self._is_populating_combos = False
         self._last_keys_sig: tuple[str, ...] = tuple()
         self._last_operation_expr: str = ""
@@ -224,6 +223,12 @@ class DataCalculatorEnhanced(QDialog):
         self.btn_diff_ratio.setAutoDefault(False)
         self.btn_diff_ratio.clicked.connect(lambda: self._perform_operation("(A - B) / (A + B)"))
         row4.addWidget(self.btn_diff_ratio)
+
+        self.btn_fft_a = QPushButton("FFT(A)")
+        self.btn_fft_a.setAutoDefault(False)
+        self.btn_fft_a.setToolTip("Calculate centered FFT magnitude of Dataset A")
+        self.btn_fft_a.clicked.connect(lambda: self._perform_operation("FFT(A)"))
+        row4.addWidget(self.btn_fft_a)
         btn_layout.addLayout(row4)
 
         operation_layout.addLayout(btn_layout)
@@ -232,7 +237,7 @@ class DataCalculatorEnhanced(QDialog):
         custom_layout = QVBoxLayout()
         custom_layout.addWidget(QLabel("Custom Expression:"))
         self.edit_custom = QLineEdit()
-        self.edit_custom.setPlaceholderText("e.g., (A - B) / A")
+        self.edit_custom.setPlaceholderText("e.g., (A - B) / A, A * 2, FFT(A)")
         # Note: Enter key removed to avoid conflict with X->q energy input
         custom_layout.addWidget(self.edit_custom)
 
@@ -243,7 +248,7 @@ class DataCalculatorEnhanced(QDialog):
         operation_layout.addLayout(custom_layout)
 
         # Help text
-        help_label = QLabel("<i>Available: +, -, *, /, **, np.sqrt(), np.abs(), np.log(), etc.</i>")
+        help_label = QLabel("<i>Available: A, optional B, +, -, *, /, **, FFT(A), np.sqrt(), np.abs(), np.log(), etc.</i>")
         help_label.setWordWrap(True)
         help_label.setStyleSheet("color: gray; font-size: 8pt;")
         operation_layout.addWidget(help_label)
@@ -302,7 +307,6 @@ class DataCalculatorEnhanced(QDialog):
         self.result_container_layout.setContentsMargins(0, 0, 0, 0)
 
         # Initial empty plot widget (like main window at startup)
-        import pyqtgraph as pg
         initial_plot = pg.PlotWidget()
         initial_plot.setLabel("bottom", "Index")
         initial_plot.setLabel("left", "Value")
@@ -577,19 +581,42 @@ class DataCalculatorEnhanced(QDialog):
             self.spin_col_b.addItem("N/A", -1)
             self.spin_col_b.setEnabled(False)
 
-    def _load_datasets(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Load the selected datasets with column selection support."""
+    @staticmethod
+    def _fft_magnitude(data: np.ndarray) -> np.ndarray:
+        """Return centered FFT magnitude for 1D/2D/ND numeric data."""
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim == 0:
+            return np.abs(np.fft.fft(np.atleast_1d(arr)))
+        if arr.ndim == 1:
+            return np.abs(np.fft.fftshift(np.fft.fft(arr)))
+        return np.abs(np.fft.fftshift(np.fft.fftn(arr)))
+
+    @staticmethod
+    def _expression_uses_b(expression: str) -> bool:
+        """Return True when expression references the Dataset B variable."""
+        return re.search(r"\bB\b", expression or "") is not None
+
+    def _load_datasets(self, *, require_b: bool = False) -> tuple[np.ndarray, np.ndarray | None] | None:
+        """Load selected datasets with column selection support. Dataset B is optional."""
         resolved_a = self._resolve_dataset_from_combo(self.combo_dataset_a)
         resolved_b = self._resolve_dataset_from_combo(self.combo_dataset_b)
-        if not resolved_a or not resolved_b:
-            QMessageBox.warning(self, "No Selection", "Please select both Dataset A and Dataset B.")
+        if not resolved_a:
+            QMessageBox.warning(self, "No Selection", "Please select Dataset A.")
+            return None
+        if require_b and not resolved_b:
+            QMessageBox.warning(self, "No Selection", "This expression requires Dataset B.")
             return None
 
         try:
             # Load Dataset A
             file_path_a, dataset_path_a = resolved_a
-            with h5py.File(file_path_a, "r") as f:
-                data_a = np.array(f[dataset_path_a])
+            from src.lib_h5.file_validator import is_hdf5_file
+            if is_hdf5_file(file_path_a):
+                with h5py.File(file_path_a, "r") as f:
+                    data_a = np.array(f[dataset_path_a])
+            else:
+                from src.gui.main_window import load_regular_data_file
+                data_a = load_regular_data_file(file_path_a)
 
             # Apply column selection for A
             col_a = self.spin_col_a.currentData()
@@ -598,17 +625,23 @@ class DataCalculatorEnhanced(QDialog):
                 data_a = data_a[:, col_a]
                 logging.info(f"Dataset A: Selected column {col_a}, new shape: {data_a.shape}")
 
-            # Load Dataset B
-            file_path_b, dataset_path_b = resolved_b
-            with h5py.File(file_path_b, "r") as f:
-                data_b = np.array(f[dataset_path_b])
+            data_b = None
+            if resolved_b:
+                # Load Dataset B
+                file_path_b, dataset_path_b = resolved_b
+                if is_hdf5_file(file_path_b):
+                    with h5py.File(file_path_b, "r") as f:
+                        data_b = np.array(f[dataset_path_b])
+                else:
+                    from src.gui.main_window import load_regular_data_file
+                    data_b = load_regular_data_file(file_path_b)
 
-            # Apply column selection for B
-            col_b = self.spin_col_b.currentData()
-            if col_b is not None and col_b >= 0 and data_b.ndim == 2:
-                # Select specific column
-                data_b = data_b[:, col_b]
-                logging.info(f"Dataset B: Selected column {col_b}, new shape: {data_b.shape}")
+                # Apply column selection for B
+                col_b = self.spin_col_b.currentData()
+                if col_b is not None and col_b >= 0 and data_b.ndim == 2:
+                    # Select specific column
+                    data_b = data_b[:, col_b]
+                    logging.info(f"Dataset B: Selected column {col_b}, new shape: {data_b.shape}")
 
             return data_a, data_b
 
@@ -622,14 +655,15 @@ class DataCalculatorEnhanced(QDialog):
 
         :param expression: Expression string (e.g., "A + B")
         """
-        datasets = self._load_datasets()
+        require_b = self._expression_uses_b(expression)
+        datasets = self._load_datasets(require_b=require_b)
         if datasets is None:
             return
 
         data_a, data_b = datasets
 
         # Check shape compatibility
-        if data_a.shape != data_b.shape:
+        if data_b is not None and data_a.shape != data_b.shape:
             reply = QMessageBox.question(
                 self,
                 "Shape Mismatch",
@@ -650,10 +684,18 @@ class DataCalculatorEnhanced(QDialog):
 
             # Create namespace for evaluation
             # Convert to float64 to handle negative values from subtraction
-            namespace = {"A": data_a.astype(np.float64), "B": data_b.astype(np.float64), "np": np}
+            namespace = {
+                "__builtins__": {},
+                "A": data_a.astype(np.float64),
+                "np": np,
+                "FFT": self._fft_magnitude,
+            }
+            if data_b is not None:
+                namespace["B"] = data_b.astype(np.float64)
 
             # Evaluate expression
             self.result_data = eval(expression, namespace)
+            self.result_data = np.asarray(self.result_data)
 
             # Automatically squeeze out dimensions of size 1
             original_shape = self.result_data.shape
@@ -833,32 +875,62 @@ class DataCalculatorEnhanced(QDialog):
             logging.error(f"Failed to capture result pixmap: {e}")
             return None
 
+    def _current_result_image_view(self):
+        """Return active 2D result image viewer, if the result is image-like."""
+        if self.result_widget is None:
+            return None
+        try:
+            from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+            from src.gui.unified_data_viewer import UnifiedDataViewer
+
+            target = self.result_widget
+            if isinstance(target, UnifiedDataViewer):
+                target = target.get_current_widget()
+            if isinstance(target, ImageView2DEnhanced):
+                return target
+        except Exception:
+            return None
+        return None
+
     def _save_result_image(self) -> None:
         """Save current result view as an image."""
+        image_view = self._current_result_image_view()
+        if image_view is not None:
+            image_view.save_colormapped_image_dialog(self._default_export_base_name())
+            return
+
         pixmap = self._result_capture_pixmap()
         if pixmap is None or pixmap.isNull():
             QMessageBox.warning(self, "No Image", "No result image available to save.")
             return
 
-        # Prefer JPEG for 2D image results; PNG as default for plot/screenshot output
+        from src.gui.image_view_2d_enhanced import IMAGE_SAVE_FILTER, ImageView2DEnhanced
+        from PyQt6.QtCore import QSettings
+
+        settings = QSettings()
+        saved_dir = settings.value("paths/last_export_directory", defaultValue=str(pathlib.Path.home()))
+        default_dir = pathlib.Path(str(saved_dir)) if saved_dir else pathlib.Path.home()
+        if not default_dir.exists():
+            default_dir = pathlib.Path.home()
         base = self._default_export_base_name()
-        default_name = f"{base}.jpg" if self.result_data is not None and self.result_data.ndim >= 2 else f"{base}.png"
+        default_name = str(default_dir / f"{base}.png")
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save Result Image",
             default_name,
-            "JPEG Image (*.jpg *.jpeg);;PNG Image (*.png);;BMP Image (*.bmp)",
+            IMAGE_SAVE_FILTER,
         )
         if not file_path:
             return
 
-        fmt = "PNG"
-        if "JPEG" in selected_filter or file_path.lower().endswith((".jpg", ".jpeg")):
-            fmt = "JPG"
-        elif "BMP" in selected_filter or file_path.lower().endswith(".bmp"):
-            fmt = "BMP"
+        export_path = pathlib.Path(file_path)
+        if not export_path.suffix:
+            export_path = export_path.with_suffix(ImageView2DEnhanced.image_extension_from_filter(selected_filter))
+            file_path = str(export_path)
 
-        ok = pixmap.save(file_path, fmt, 95 if fmt == "JPG" else -1)
+        settings.setValue("paths/last_export_directory", str(export_path.parent))
+        fmt = ImageView2DEnhanced.image_format_from_path(file_path, selected_filter)
+        ok = pixmap.save(file_path, fmt, 95 if fmt == "JPEG" else -1)
         if ok:
             logging.info(f"Saved result image to: {file_path}")
         else:
@@ -866,6 +938,11 @@ class DataCalculatorEnhanced(QDialog):
 
     def _copy_result_image(self) -> None:
         """Copy current result image to system clipboard."""
+        image_view = self._current_result_image_view()
+        if image_view is not None:
+            image_view.copy_colormapped_image_to_clipboard()
+            return
+
         pixmap = self._result_capture_pixmap()
         if pixmap is None or pixmap.isNull():
             QMessageBox.warning(self, "No Image", "No result image available to copy.")
@@ -915,6 +992,7 @@ class DataCalculatorEnhanced(QDialog):
             "(a - b) / (a + b)": "asy",
             "a * b": "mul",
             "a / b": "div",
+            "fft(a)": "fft",
         }
         return mapping.get(key, "calcu")
 
@@ -926,6 +1004,9 @@ class DataCalculatorEnhanced(QDialog):
             head_a, n1 = self._scan_head_and_number(str(entry_a[0]))
             head_b, n2 = self._scan_head_and_number(str(entry_b[0]))
             head = head_a if head_a else (head_b if head_b else "scan")
+        elif entry_a:
+            head, n1 = self._scan_head_and_number(str(entry_a[0]))
+            n2 = "single"
         else:
             head, n1, n2 = "scan", "0000", "0000"
         suffix = self._suffix_from_expression(self._last_operation_expr)

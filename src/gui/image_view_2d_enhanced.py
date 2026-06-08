@@ -22,25 +22,27 @@ from typing import Any, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal, QRectF, QBuffer, QByteArray, QMimeData, QSize
+from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal, QRectF, QBuffer, QByteArray, QMimeData, QSize, QSettings
 from PyQt6.QtGui import QIcon, QImage, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
     QSplitter,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from src.img.img_path import img_path
+
+IMAGE_SAVE_FILTER = "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;TIFF Image (*.tif *.tiff)"
 
 
 class SceneEventFilter(QObject):
@@ -65,6 +67,10 @@ class SceneEventFilter(QObject):
 class ImageView2DEnhanced(QWidget):
     """Enhanced ImageView with colormap and scale mode controls."""
     q_calibration_requested = pyqtSignal()
+    # Emitted by TargetItem handle drag: (r_min, r_max, angle_min, angle_max)
+    sigRadialParamsChanged = pyqtSignal(int, int, int, int)
+    # Emitted when the radial center is moved (click or programmatic): (cx, cy)
+    sigRadialCenterChanged = pyqtSignal(float, float)
 
     def __init__(self, parent: Any = None) -> None:
         """Initialize the enhanced 2D image viewer."""
@@ -73,6 +79,8 @@ class ImageView2DEnhanced(QWidget):
         self.data = None  # Store original data (2D slice)
         self.data_3d = None  # Store original 3D data if applicable
         self.current_slice_index = 0  # Current slice index for 3D data
+        self.current_slice_axis = 0  # Current axis used for 3D slicing
+        self._lazy_shape: tuple[int, ...] | None = None
         self.current_transform = "linear"  # Current scale mode
         self.global_min = None  # Global min for locked levels
         self.global_max = None  # Global max for locked levels
@@ -108,6 +116,22 @@ class ImageView2DEnhanced(QWidget):
         # Track which handle is being dragged
         self.dragging_handle = None
         self.drag_start_pos = None
+
+        # Radial profile tool
+        self._radial_mode_active = False
+        self._radial_center: tuple[float, float] | None = None
+        self._radial_center_marker = None  # ScatterPlotItem shown on the image
+        self._radial_r_min: int = 0
+        self._radial_r_max: int = 0          # 0 means "use maximum possible"
+        self._radial_angle_min: int = 0      # degrees, -180–180
+        self._radial_angle_max: int = 180    # degrees, -180–180
+        self._radial_arc1 = None             # PlotDataItem — first arc sector boundary
+        self._radial_arc2 = None             # PlotDataItem — symmetric arc sector boundary
+        self._radial_handle_outer_start = None  # TargetItem corner handles
+        self._radial_handle_outer_end   = None
+        self._radial_handle_inner_start = None
+        self._radial_handle_inner_end   = None
+        self._radial_active_drag_attr: str | None = None  # attr name of handle being dragged
 
         # Event filter for mouse press/release events
         self.scene_event_filter = None
@@ -202,6 +226,12 @@ class ImageView2DEnhanced(QWidget):
         self.combo_scale.currentTextChanged.connect(self._update_scale)
         control_layout.addWidget(self.combo_scale)
 
+        self.btn_auto_contrast = QPushButton("Auto")
+        self.btn_auto_contrast.setFixedSize(42, 24)
+        self.btn_auto_contrast.setToolTip("Auto contrast from histogram percentiles")
+        self.btn_auto_contrast.clicked.connect(self._auto_contrast)
+        control_layout.addWidget(self.btn_auto_contrast)
+
         control_layout.addSpacing(10)  # Reduced from 20
 
         # Show axes checkbox
@@ -214,8 +244,8 @@ class ImageView2DEnhanced(QWidget):
         control_layout.addSpacing(10)  # Reduced from 20
 
         # ROI controls - CHANGED TO BUTTONS
-        roi_label = QLabel("ROI:")
-        control_layout.addWidget(roi_label)
+        self.label_roi = QLabel("ROI:")
+        control_layout.addWidget(self.label_roi)
 
         # Line ROI button
         self.btn_roi_line = QPushButton("━")
@@ -262,6 +292,14 @@ class ImageView2DEnhanced(QWidget):
         # Slice navigator for 3D data (initially hidden)
         self.slice_layout = QHBoxLayout()
 
+        self.label_slice_axis = QLabel("Axis:")
+        self.slice_layout.addWidget(self.label_slice_axis)
+
+        self.combo_slice_axis = QComboBox()
+        self.combo_slice_axis.setToolTip("Choose which 3D array axis the slice slider moves through")
+        self.combo_slice_axis.currentIndexChanged.connect(self._on_slice_axis_changed)
+        self.slice_layout.addWidget(self.combo_slice_axis)
+
         self.label_slice = QLabel("Slice:")
         self.slice_layout.addWidget(self.label_slice)
 
@@ -288,6 +326,8 @@ class ImageView2DEnhanced(QWidget):
         layout.addLayout(self.slice_layout)
 
         # Hide slice controls initially (only show for 3D data)
+        self.label_slice_axis.hide()
+        self.combo_slice_axis.hide()
         self.label_slice.hide()
         self.slider_slice.hide()
         self.label_slice_info.hide()
@@ -326,6 +366,8 @@ class ImageView2DEnhanced(QWidget):
 
         # Connect mouse movement to update coordinates
         self.graphics_layout.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        # sigMouseClicked fires only on genuine clicks (no drag) — used by radial tool
+        self.graphics_layout.scene().sigMouseClicked.connect(self._on_scene_clicked)
 
         # Store references for compatibility
         self.image_view = type('ImageViewCompat', (), {
@@ -406,52 +448,49 @@ class ImageView2DEnhanced(QWidget):
         # Remove sector control points if they exist
         self._remove_sector_control_points()
 
-        # Check if data is 3D or higher
-        # Special case: if first dimension is 1, treat as 2D (squeeze the singleton dimension)
-        if data.ndim >= 3 and data.shape[0] > 1:
+        # Remove radial overlays when loading new data
+        self._remove_radial_overlays()
+        self._radial_center = None
+        if self._radial_mode_active:
+            self.roi_plot_widget.hide()
+
+        # Check if data is genuinely 3D after removing singleton dimensions.
+        # This lets stacks stored as (H, W, N), (N, H, W), or (1, H, W, N)
+        # choose the correct slice axis instead of always assuming axis 0.
+        display_source = np.squeeze(data) if data.ndim >= 3 else data
+        if display_source.ndim >= 3:
             # True 3D data with multiple slices - enable slice mode
             # Performance: convert to float32 to halve memory usage
-            self.data_3d = self._to_float32(data)
+            self.data_3d = self._to_float32(display_source)
             self.current_slice_index = 0
+            self.current_slice_axis = 0
 
             # Calculate global min/max for locked levels
-            self.global_min = float(np.nanmin(data)) if data.size > 0 else 0
-            self.global_max = float(np.nanmax(data)) if data.size > 0 else 0
+            self.global_min = float(np.nanmin(display_source)) if display_source.size > 0 else 0
+            self.global_max = float(np.nanmax(display_source)) if display_source.size > 0 else 0
 
-            # Setup slider
-            num_slices = data.shape[0]
-            self.slider_slice.setMaximum(num_slices - 1)
-            self.slider_slice.setValue(0)
-            self.label_slice_info.setText(f"1 / {num_slices}")
-
-            # Show slice controls
-            self.label_slice.show()
-            self.slider_slice.show()
-            self.label_slice_info.show()
-            self.chk_lock_levels.show()
+            self._configure_slice_axis_combo(self.data_3d.shape)
+            self._reset_slice_slider(self.data_3d.shape[self.current_slice_axis])
+            self._show_slice_controls()
 
             # Extract first slice as current data (no copy needed, data_3d owns the memory)
-            self.data = self.data_3d[0]
+            self.data = self._extract_full_slice(0)
 
         else:
             # 2D data or 3D data with singleton first dimension
             # Squeeze any singleton dimensions if present
-            if data.ndim >= 3 and data.shape[0] == 1:
-                # Squeeze the singleton dimension: (1, H, W) -> (H, W)
-                data = data.squeeze(axis=0)
+            if data.ndim >= 3:
+                data = display_source
                 logging.info(f"Squeezed singleton dimension: shape now {data.shape}")
             self.data_3d = None
+            self._lazy_shape = None
             # Performance: convert to float32
             self.data = self._to_float32(data)
             self.global_min = None
             self.global_max = None
             self.locked_levels = None
 
-            # Hide slice controls
-            self.label_slice.hide()
-            self.slider_slice.hide()
-            self.label_slice_info.hide()
-            self.chk_lock_levels.hide()
+            self._hide_slice_controls()
             self.chk_lock_levels.setChecked(False)
 
         # Reset lazy loader when a full dataset is supplied
@@ -461,7 +500,13 @@ class ImageView2DEnhanced(QWidget):
         # Apply current transform and display
         self._update_display()
 
-    def set_data_lazy(self, first_slice: np.ndarray, total_slices: int, loader) -> None:
+    def set_data_lazy(
+        self,
+        first_slice: np.ndarray,
+        total_slices: int,
+        loader,
+        full_shape: tuple[int, ...] | None = None,
+    ) -> None:
         """
         Display a large 3D dataset without loading it all into memory.
 
@@ -472,7 +517,9 @@ class ImageView2DEnhanced(QWidget):
         Args:
             first_slice: 2-D array for slice 0 (already downloaded by worker)
             total_slices: total number of slices in the full 3-D dataset
-            loader: callable(int) -> np.ndarray that reads one slice from the server
+            loader: callable(axis, idx) or callable(idx) that reads one slice from the server
+            full_shape: Full source dataset shape. When supplied, the axis selector can
+                browse X/Y/Z instead of being limited to axis 0.
         """
         # Remove existing ROI / sector overlays
         if self.current_roi is not None:
@@ -489,26 +536,83 @@ class ImageView2DEnhanced(QWidget):
 
         # Lazy state
         self._slice_loader = loader
-        self._slice_cache = {0: self._to_float32(first_slice)}  # pre-cache slice 0
+        self._slice_cache = {(0, 0): self._to_float32(first_slice)}  # pre-cache axis 0, slice 0
         self.data_3d = None                     # not fully loaded
+        self._lazy_shape = tuple(full_shape) if full_shape is not None else (int(total_slices),) + tuple(first_slice.shape)
         self.global_min = None
         self.global_max = None
         self.locked_levels = None
         self.current_slice_index = 0
-        self.data = self._slice_cache[0]
+        self.current_slice_axis = 0
+        self.data = self._slice_cache[(0, 0)]
 
-        # Slider
-        self.slider_slice.setMaximum(total_slices - 1)
-        self.slider_slice.setValue(0)
-        self.label_slice_info.setText(f"1 / {total_slices}")
+        self._configure_slice_axis_combo(self._lazy_shape)
+        self._reset_slice_slider(self._lazy_shape[self.current_slice_axis])
 
+        self._show_slice_controls()
+        self.chk_lock_levels.setChecked(False)
+
+        self._update_display()
+
+    def _configure_slice_axis_combo(self, shape: tuple[int, ...]) -> None:
+        """Populate the X/Y/Z slice-axis selector for a 3D dataset shape."""
+        axis_names = ["X", "Y", "Z"]
+        max_axes = min(3, len(shape))
+        previous_axis = min(self.current_slice_axis, max_axes - 1)
+
+        self.combo_slice_axis.blockSignals(True)
+        self.combo_slice_axis.clear()
+        for axis in range(max_axes):
+            self.combo_slice_axis.addItem(f"{axis_names[axis]} ({shape[axis]})", axis)
+        self.combo_slice_axis.setCurrentIndex(previous_axis)
+        self.combo_slice_axis.blockSignals(False)
+        self.current_slice_axis = previous_axis
+
+    def _show_slice_controls(self) -> None:
+        """Show controls used for 3D slice browsing."""
+        self.label_slice_axis.show()
+        self.combo_slice_axis.show()
         self.label_slice.show()
         self.slider_slice.show()
         self.label_slice_info.show()
         self.chk_lock_levels.show()
-        self.chk_lock_levels.setChecked(False)
 
-        self._update_display()
+    def _hide_slice_controls(self) -> None:
+        """Hide controls used for 3D slice browsing."""
+        self.label_slice_axis.hide()
+        self.combo_slice_axis.hide()
+        self.label_slice.hide()
+        self.slider_slice.hide()
+        self.label_slice_info.hide()
+        self.chk_lock_levels.hide()
+
+    def _reset_slice_slider(self, num_slices: int) -> None:
+        """Reset the slice slider for the selected axis."""
+        num_slices = max(1, int(num_slices))
+        self.slider_slice.blockSignals(True)
+        self.slider_slice.setMinimum(0)
+        self.slider_slice.setMaximum(num_slices - 1)
+        self.slider_slice.setValue(0)
+        self.slider_slice.blockSignals(False)
+        self.current_slice_index = 0
+        self.label_slice_info.setText(f"1 / {num_slices}")
+
+    def _extract_full_slice(self, index: int) -> np.ndarray:
+        """Return one 2D/3D slice from a fully loaded ndarray."""
+        if self.data_3d is None:
+            raise ValueError("No full 3D data is loaded")
+        return np.take(self.data_3d, int(index), axis=int(self.current_slice_axis))
+
+    def _load_lazy_slice(self, axis: int, index: int) -> np.ndarray:
+        """Load one slice from the lazy loader, accepting old and new call signatures."""
+        if self._slice_loader is None:
+            raise ValueError("No lazy slice loader is configured")
+        try:
+            return self._slice_loader(int(axis), int(index))
+        except TypeError:
+            if int(axis) != 0:
+                raise
+            return self._slice_loader(int(index))
 
     def _update_display(self) -> None:
         """Update the display with current transform."""
@@ -540,18 +644,74 @@ class ImageView2DEnhanced(QWidget):
                 else:
                     self.histogram.setLevels(data_min, data_max)
 
-            # Reapply display geometry for persisted incident correction.
-            actual_scale_x, actual_scale_y = self._effective_display_scales()
+            # Reapply display geometry (incidence scale centred on display_origin).
             self.view_box.setAspectLocked(True, ratio=1.0)
-            self.image_item.resetTransform()
-            if actual_scale_x != 1.0 or actual_scale_y != 1.0:
-                tr = QTransform()
-                tr.scale(actual_scale_x, actual_scale_y)
-                self.image_item.setTransform(tr)
+            self._apply_display_transform()
             self._auto_fit_view()
 
         except Exception as e:
             logging.error(f"Failed to display image: {e}")
+
+    @staticmethod
+    def _robust_auto_levels(display_data: np.ndarray) -> tuple[float, float] | None:
+        """Return contrast levels from histogram-like percentiles."""
+        finite = np.asarray(display_data)[np.isfinite(display_data)]
+        if finite.size == 0:
+            return None
+
+        data_min = float(finite.min())
+        data_max = float(finite.max())
+        if data_max <= data_min:
+            eps = abs(data_min) * 1e-6 or 1.0
+            return data_min - eps, data_max + eps
+
+        low, high = np.percentile(finite, [0.5, 99.5])
+        low = float(low)
+        high = float(high)
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            low, high = data_min, data_max
+
+        # Difference images should keep zero centered, with balanced positive
+        # and negative clipping bounds.
+        if data_min < 0 < data_max:
+            bound = max(abs(low), abs(high))
+            if not np.isfinite(bound) or bound <= 0:
+                bound = max(abs(data_min), abs(data_max))
+            return -float(bound), float(bound)
+
+        # Positive-only images use the actual histogram lower edge so the low
+        # tail is not clipped, while the upper edge remains percentile-based to
+        # avoid a few hot pixels flattening the contrast.
+        if data_min >= 0:
+            upper = high if high > 0 else data_max
+            return float(data_min), float(upper)
+
+        # Negative-only images use the actual upper edge for the same reason.
+        if data_max <= 0:
+            lower = low if low < 0 else data_min
+            return float(lower), float(data_max)
+
+        return low, high
+
+    def _auto_contrast(self) -> None:
+        """Set color levels from the current image histogram distribution."""
+        if self.data is None:
+            return
+
+        try:
+            display_data = self._transform_data(self.data)
+            levels = self._robust_auto_levels(display_data)
+            if levels is None:
+                return
+
+            level_min, level_max = levels
+            self.histogram.setLevels(level_min, level_max)
+            if self.chk_lock_levels.isChecked():
+                self.locked_levels = (level_min, level_max)
+
+            logging.info("Auto contrast levels: [%.6g, %.6g]", level_min, level_max)
+        except Exception as exc:
+            logging.error("Failed to apply auto contrast: %s", exc)
 
     def _transform_data(self, data: np.ndarray) -> np.ndarray:
         """
@@ -596,8 +756,11 @@ class ImageView2DEnhanced(QWidget):
 
             export_path = pathlib.Path(file_path)
             img = Image.fromarray(rgb, mode="RGB")
-            if export_path.suffix.lower() in [".jpg", ".jpeg"]:
+            suffix = export_path.suffix.lower()
+            if suffix in [".jpg", ".jpeg"]:
                 img.save(export_path, "JPEG", quality=95)
+            elif suffix in [".tif", ".tiff"]:
+                img.save(export_path, "TIFF")
             else:
                 img.save(export_path, "PNG")
             logging.info(
@@ -610,6 +773,60 @@ class ImageView2DEnhanced(QWidget):
         except Exception as exc:
             logging.error("Failed to export colormapped image: %s", exc)
             return False
+
+    @staticmethod
+    def image_extension_from_filter(selected_filter: str) -> str:
+        """Infer image extension from a save-dialog filter."""
+        text = (selected_filter or "").lower()
+        if "*.jpg" in text or "*.jpeg" in text:
+            return ".jpg"
+        if "*.tif" in text or "*.tiff" in text:
+            return ".tif"
+        return ".png"
+
+    @staticmethod
+    def image_format_from_path(file_path: str, selected_filter: str = "") -> str:
+        """Return the Qt/PIL image format name for a path/filter pair."""
+        suffix = pathlib.Path(file_path).suffix.lower()
+        if suffix in [".jpg", ".jpeg"] or "jpeg" in (selected_filter or "").lower():
+            return "JPEG"
+        if suffix in [".tif", ".tiff"] or "tiff" in (selected_filter or "").lower():
+            return "TIFF"
+        return "PNG"
+
+    def save_colormapped_image_dialog(self, default_base_name: str = "image") -> bool:
+        """Save current colormapped image through the shared image save dialog."""
+        rgb = self.render_colormapped_rgb()
+        if rgb is None:
+            QMessageBox.warning(self, "No Image", "No image data available to save.")
+            return False
+
+        settings = QSettings()
+        saved_dir = settings.value("paths/last_export_directory", defaultValue=str(pathlib.Path.home()))
+        default_dir = pathlib.Path(str(saved_dir)) if saved_dir else pathlib.Path.home()
+        if not default_dir.exists():
+            default_dir = pathlib.Path.home()
+
+        stem = pathlib.Path(str(default_base_name or "image")).stem or "image"
+        default_path = str(default_dir / f"{stem}.png")
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Image",
+            default_path,
+            IMAGE_SAVE_FILTER,
+        )
+        if not file_path:
+            return False
+
+        export_path = pathlib.Path(file_path)
+        if not export_path.suffix:
+            export_path = export_path.with_suffix(self.image_extension_from_filter(selected_filter))
+
+        settings.setValue("paths/last_export_directory", str(export_path.parent))
+        ok = self.export_colormapped_image(export_path)
+        if not ok:
+            QMessageBox.critical(self, "Save Failed", f"Failed to save image:\n{export_path}")
+        return ok
 
     def render_colormapped_rgb(self, data: np.ndarray | None = None) -> np.ndarray | None:
         """Render data to an RGB uint8 array using current scale, levels, and colormap."""
@@ -694,12 +911,20 @@ class ImageView2DEnhanced(QWidget):
 
         p = self._q_calibration or {}
         if bool(p.get("use_incidence", False)) and bool(p.get("incidence_applied_in_display", False)):
-            fac = self._incidence_factor_from_deg(float(p.get("incidence_deg", 0.0)))
-            axis_u = str(p.get("incidence_axis", "X")).strip().upper()
-            if axis_u == "Y":
-                actual_scale_y *= fac
+            if "incidence_deg_x" in p or "incidence_deg_y" in p:
+                # Dual-axis mode: independent X and Y corrections
+                if "incidence_deg_x" in p:
+                    actual_scale_x *= self._incidence_factor_from_deg(float(p["incidence_deg_x"]))
+                if "incidence_deg_y" in p:
+                    actual_scale_y *= self._incidence_factor_from_deg(float(p["incidence_deg_y"]))
             else:
-                actual_scale_x *= fac
+                # Legacy single-axis mode (used by Q-Cal tool)
+                fac = self._incidence_factor_from_deg(float(p.get("incidence_deg", 0.0)))
+                axis_u = str(p.get("incidence_axis", "X")).strip().upper()
+                if axis_u == "Y":
+                    actual_scale_y *= fac
+                else:
+                    actual_scale_x *= fac
 
         return float(actual_scale_x), float(actual_scale_y)
 
@@ -717,10 +942,64 @@ class ImageView2DEnhanced(QWidget):
         except Exception:
             return 1.0
 
+    # ------------------------------------------------------------------ #
+    # Pixel ↔ view conversion (accounts for scale + display origin)      #
+    # ------------------------------------------------------------------ #
+
+    def _pixel_to_view(self, px_col: float, px_row: float) -> tuple[float, float]:
+        """Convert pixel (col, row) to view (vx, vy).
+
+        With row-major ImageItem: view_x = col direction, view_y = row direction.
+        sx scales the col/x axis, sy scales the row/y axis.
+        """
+        sx, sy = self._effective_display_scales()
+        p = self._q_calibration or {}
+        orig = p.get("display_origin")
+        if orig is not None:
+            orig_col, orig_row = float(orig[0]), float(orig[1])
+            vx = (px_col - orig_col) * sx + orig_col
+            vy = (px_row - orig_row) * sy + orig_row
+        else:
+            vx = px_col * sx
+            vy = px_row * sy
+        return float(vx), float(vy)
+
+    def _view_to_pixel(self, vx: float, vy: float) -> tuple[float, float]:
+        """Convert view (vx, vy) to pixel (col, row). Inverse of _pixel_to_view."""
+        sx, sy = self._effective_display_scales()
+        p = self._q_calibration or {}
+        orig = p.get("display_origin")
+        if orig is not None:
+            orig_col, orig_row = float(orig[0]), float(orig[1])
+            px_col = (vx - orig_col) / sx + orig_col if sx > 0 else vx
+            px_row = (vy - orig_row) / sy + orig_row if sy > 0 else vy
+        else:
+            px_col = vx / sx if sx > 0 else vx
+            px_row = vy / sy if sy > 0 else vy
+        return float(px_col), float(px_row)
+
+    def _apply_display_transform(self) -> None:
+        """Apply the geometric transform (incidence scale centred on display_origin)."""
+        sx, sy = self._effective_display_scales()
+        self.image_item.resetTransform()
+        if sx != 1.0 or sy != 1.0:
+            p = self._q_calibration or {}
+            orig = p.get("display_origin")
+            tr = QTransform()
+            if orig is not None:
+                orig_col, orig_row = float(orig[0]), float(orig[1])
+                # Scale centred on origin: T(orig_col, orig_row) · S(sx,sy) · T(-orig_col, -orig_row)
+                tr.translate(orig_col, orig_row)
+                tr.scale(sx, sy)
+                tr.translate(-orig_col, -orig_row)
+            else:
+                tr.scale(sx, sy)
+            self.image_item.setTransform(tr)
+
+    # ------------------------------------------------------------------ #
+
     def apply_incidence_display_correction(self, theta_deg: float, axis: str = "X") -> None:
         """Apply incidence-angle geometry correction to image display transform."""
-        # Persist incident correction in calibration state so later display updates
-        # (e.g. switching Linear/Log) keep the same geometric correction.
         if self._q_calibration is None:
             self._q_calibration = {}
         self._q_calibration["use_incidence"] = True
@@ -728,13 +1007,8 @@ class ImageView2DEnhanced(QWidget):
         self._q_calibration["incidence_axis"] = "Y" if str(axis or "X").strip().upper() == "Y" else "X"
         self._q_calibration["incidence_applied_in_display"] = True
 
-        actual_scale_x, actual_scale_y = self._effective_display_scales()
         self.view_box.setAspectLocked(True, ratio=1.0)
-        self.image_item.resetTransform()
-        if actual_scale_x != 1.0 or actual_scale_y != 1.0:
-            tr = QTransform()
-            tr.scale(actual_scale_x, actual_scale_y)
-            self.image_item.setTransform(tr)
+        self._apply_display_transform()
         self._auto_fit_view()
 
     def configure_q_tool_mode(self) -> None:
@@ -1146,27 +1420,29 @@ class ImageView2DEnhanced(QWidget):
     def _on_slice_changed(self, value: int) -> None:
         """Handle slice slider value change for 3D data (full or lazy)."""
         self.current_slice_index = value
+        axis = int(self.current_slice_axis)
 
         if self.data_3d is not None:
             # Fully loaded in memory
-            self.data = self.data_3d[value]
-            num_slices = self.data_3d.shape[0]
+            self.data = self._extract_full_slice(value)
+            num_slices = self.data_3d.shape[axis]
 
         elif self._slice_loader is not None:
             # Lazy mode: serve from local cache or fetch from server
-            if value in self._slice_cache:
-                self.data = self._slice_cache[value]
+            cache_key = (axis, int(value))
+            if cache_key in self._slice_cache:
+                self.data = self._slice_cache[cache_key]
             else:
                 try:
-                    self.data = self._to_float32(self._slice_loader(value))
+                    self.data = self._to_float32(self._load_lazy_slice(axis, value))
                     # Keep up to 8 slices cached to avoid repeated network reads
                     if len(self._slice_cache) >= 8:
                         del self._slice_cache[next(iter(self._slice_cache))]
-                    self._slice_cache[value] = self.data
+                    self._slice_cache[cache_key] = self.data
                 except Exception as e:
-                    logging.error(f"Failed to load slice {value}: {e}")
+                    logging.error(f"Failed to load axis {axis} slice {value}: {e}")
                     return
-            num_slices = self.slider_slice.maximum() + 1
+            num_slices = self._lazy_shape[axis] if self._lazy_shape else self.slider_slice.maximum() + 1
 
         else:
             return
@@ -1179,8 +1455,40 @@ class ImageView2DEnhanced(QWidget):
 
         logging.debug(f"Displaying slice {value + 1} of {num_slices}")
 
+    def _on_slice_axis_changed(self, _index: int) -> None:
+        """Handle X/Y/Z slice axis changes for 3D data."""
+        axis_data = self.combo_slice_axis.currentData()
+        if axis_data is None:
+            return
+
+        self.current_slice_axis = int(axis_data)
+        shape = self.data_3d.shape if self.data_3d is not None else self._lazy_shape
+        if not shape or self.current_slice_axis >= len(shape):
+            return
+
+        self._reset_slice_slider(shape[self.current_slice_axis])
+        try:
+            if self.data_3d is not None:
+                self.data = self._extract_full_slice(0)
+            elif self._slice_loader is not None:
+                cache_key = (self.current_slice_axis, 0)
+                if cache_key not in self._slice_cache:
+                    self._slice_cache[cache_key] = self._to_float32(
+                        self._load_lazy_slice(self.current_slice_axis, 0)
+                    )
+                self.data = self._slice_cache[cache_key]
+            self._update_display()
+            if self.current_roi is not None:
+                self._update_roi_statistics()
+        except Exception as e:
+            logging.error(f"Failed to switch slice axis to {self.current_slice_axis}: {e}")
+
     def _on_roi_button_clicked(self, roi_type: str) -> None:
         """Handle ROI button click."""
+        # Switching to a standard ROI deactivates radial mode
+        if self._radial_mode_active:
+            self._deactivate_radial_mode()
+
         # Get the button that was clicked
         if roi_type == "Line":
             clicked_button = self.btn_roi_line
@@ -1899,6 +2207,296 @@ class ImageView2DEnhanced(QWidget):
 
         # Update statistics plot
         self._update_roi_statistics()
+
+    # ------------------------------------------------------------------ #
+    # Radial profile tool                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _remove_radial_overlays(self) -> None:
+        """Remove center marker, arc overlays and corner handles from the view."""
+        for attr in (
+            "_radial_center_marker", "_radial_arc1", "_radial_arc2",
+            "_radial_handle_outer_start", "_radial_handle_outer_end",
+            "_radial_handle_inner_start", "_radial_handle_inner_end",
+        ):
+            item = getattr(self, attr, None)
+            if item is not None:
+                self.view_box.removeItem(item)
+                setattr(self, attr, None)
+
+    @staticmethod
+    def _arc_boundary_xy(
+        cx: float, cy: float,
+        r_min: int, r_max: int,
+        a_start_deg: float, a_end_deg: float,
+        r_fallback: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Closed boundary of one arc sector as (x, y) VIEW-space arrays.
+
+        (cx, cy) and the radii are all in view coordinates so the figure
+        always appears as a circle regardless of incidence-correction scaling.
+        """
+        n = max(3, int(abs(a_end_deg - a_start_deg)) * 2)
+        theta = np.linspace(np.radians(a_start_deg), np.radians(a_end_deg), n)
+        r_o = r_max if r_max > 0 else r_fallback
+        x_out = cx + r_o * np.cos(theta)
+        y_out = cy + r_o * np.sin(theta)
+        if r_min > 0:
+            x_in = cx + r_min * np.cos(theta[::-1])
+            y_in = cy + r_min * np.sin(theta[::-1])
+        else:
+            x_in = np.array([cx])
+            y_in = np.array([cy])
+        x = np.concatenate([x_out, x_in, [x_out[0]]])
+        y = np.concatenate([y_out, y_in, [y_out[0]]])
+        return x, y
+
+    def _draw_radial_overlay(
+        self, cx: float, cy: float,
+        r_min: int, r_max: int,
+        angle_min: int, angle_max: int,
+    ) -> None:
+        """Draw two symmetric arc sector boundaries in VIEW space (always circular)."""
+        pen = pg.mkPen("y", width=1, style=Qt.PenStyle.DashLine)
+        if self.data is not None:
+            h, w = self.data.shape[:2]
+            r_fb = float(int(np.ceil(max(
+                np.hypot(cx, cy), np.hypot(w - cx, cy),
+                np.hypot(cx, h - cy), np.hypot(w - cx, h - cy),
+            ))))
+        else:
+            r_fb = float(max(r_min + 10, 100))
+
+        for i, offset in enumerate([0, 180]):
+            x, y = self._arc_boundary_xy(
+                cx, cy, r_min, r_max,
+                angle_min + offset, angle_max + offset, r_fb,
+            )
+            attr = f"_radial_arc{i + 1}"
+            item = getattr(self, attr)
+            if item is None:
+                item = pg.PlotDataItem(x, y, pen=pen)
+                item.setZValue(9)
+                self.view_box.addItem(item)
+                setattr(self, attr, item)
+            else:
+                item.setData(x, y)
+
+        self._place_radial_handles(cx, cy, r_min, r_max, angle_min, angle_max, r_fb)
+
+    def _place_radial_handles(
+        self, cx: float, cy: float,
+        r_min: int, r_max: int,
+        angle_min: int, angle_max: int,
+        r_fallback: float,
+    ) -> None:
+        """Create or update the 4 draggable TargetItem corner handles (view-space positions)."""
+        r_o = float(r_max) if r_max > 0 else r_fallback
+        r_i = float(r_min)
+        a0 = np.radians(angle_min)
+        a1 = np.radians(angle_max)
+        positions = {
+            "_radial_handle_outer_start": (cx + r_o * np.cos(a0), cy + r_o * np.sin(a0)),
+            "_radial_handle_outer_end":   (cx + r_o * np.cos(a1), cy + r_o * np.sin(a1)),
+            "_radial_handle_inner_start": (cx + r_i * np.cos(a0), cy + r_i * np.sin(a0)),
+            "_radial_handle_inner_end":   (cx + r_i * np.cos(a1), cy + r_i * np.sin(a1)),
+        }
+        pen        = pg.mkPen("w", width=1)
+        brush      = pg.mkBrush("w")
+        hover_pen  = pg.mkPen("y", width=2)
+        hover_brush = pg.mkBrush("y")
+        for attr, (hx, hy) in positions.items():
+            if attr == self._radial_active_drag_attr:
+                continue  # Don't reposition the handle currently being dragged
+            handle = getattr(self, attr)
+            if handle is None:
+                handle = pg.TargetItem(
+                    pos=(float(hx), float(hy)),
+                    movable=True,
+                    symbol="s",
+                    size=10,
+                    pen=pen,
+                    brush=brush,
+                    hoverPen=hover_pen,
+                    hoverBrush=hover_brush,
+                )
+                handle.setZValue(12)
+                self.view_box.addItem(handle)
+                handle_name = attr.replace("_radial_handle_", "")
+                handle.sigPositionChanged.connect(
+                    lambda item, name=handle_name, a=attr: self._on_radial_handle_moved(item, name, a)
+                )
+                setattr(self, attr, handle)
+            else:
+                handle.blockSignals(True)
+                handle.setPos(float(hx), float(hy))
+                handle.blockSignals(False)
+
+    def _on_radial_handle_moved(self, item, handle_name: str, attr: str) -> None:
+        """Called by TargetItem.sigPositionChanged when a corner handle is dragged."""
+        if self._radial_center is None:
+            return
+        pos = item.pos()
+        self._radial_active_drag_attr = attr
+        self._update_radial_handle_drag(float(pos.x()), float(pos.y()), handle_name)
+        self._radial_active_drag_attr = None
+
+    def _update_radial_handle_drag(self, vx: float, vy: float, handle_name: str) -> None:
+        """Recompute r/angle from dragged handle position and update everything."""
+        if self._radial_center is None:
+            return
+        cx, cy = self._radial_center
+        # Tout en coordonnées vue : le handle est déjà en vue.
+        dx, dy = vx - cx, vy - cy
+        new_r     = max(0, int(round(float(np.hypot(dx, dy)))))
+        new_angle = int(round(float(np.degrees(np.arctan2(dy, dx)))))
+        new_angle = max(-180, min(180, new_angle))
+
+        r_min = self._radial_r_min
+        r_max = self._radial_r_max
+        a_min = self._radial_angle_min
+        a_max = self._radial_angle_max
+
+        handle = handle_name
+        if handle == "outer_start":
+            r_max, a_min = new_r, new_angle
+        elif handle == "outer_end":
+            r_max, a_max = new_r, new_angle
+        elif handle == "inner_start":
+            r_min, a_min = new_r, new_angle
+        elif handle == "inner_end":
+            r_min, a_max = new_r, new_angle
+
+        # Keep r_min < r_max when both non-zero
+        if r_max > 0 and r_min >= r_max:
+            if "inner" in handle:
+                r_min = max(0, r_max - 1)
+            else:
+                r_max = r_min + 1
+
+        self._radial_r_min = r_min
+        self._radial_r_max = r_max
+        self._radial_angle_min = a_min
+        self._radial_angle_max = a_max
+
+        self._draw_radial_overlay(cx, cy, r_min, r_max, a_min, a_max)
+        self.sigRadialParamsChanged.emit(r_min, r_max, a_min, a_max)
+
+    def _on_scene_clicked(self, event) -> None:
+        """Place or move the radial-profile center when the image is clicked."""
+        if not self._radial_mode_active:
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        view_pt = self.view_box.mapSceneToView(event.scenePos())
+        # Stocker directement en coordonnées vue : la figure reste ronde.
+        self._set_radial_center(view_pt.x(), view_pt.y())
+        event.accept()
+
+    def activate_radial_profile(self) -> None:
+        """Enable center-click mode (radial overlays are managed by the dialog)."""
+        if self.roi_type is not None:
+            self._on_roi_type_changed("None")
+        self._radial_mode_active = True
+
+    def deactivate_radial_profile(self) -> None:
+        """Disable center-click mode and remove overlays."""
+        self._deactivate_radial_mode()
+
+    def _set_radial_center(self, cx: float, cy: float) -> None:
+        """Place or move the radial-profile center marker.
+
+        (cx, cy) are VIEW-space coordinates: the figure always looks like a
+        circle regardless of incidence-correction scaling.
+        """
+        self._radial_center = (cx, cy)
+        if self._radial_center_marker is None:
+            self._radial_center_marker = pg.ScatterPlotItem(
+                [cx], [cy],
+                symbol="+",
+                size=20,
+                pen=pg.mkPen("r", width=2),
+                brush=pg.mkBrush(None),
+            )
+            self._radial_center_marker.setZValue(10)
+            self.view_box.addItem(self._radial_center_marker)
+        else:
+            self._radial_center_marker.setData([cx], [cy])
+
+        self._draw_radial_overlay(
+            cx, cy,
+            self._radial_r_min, self._radial_r_max,
+            self._radial_angle_min, self._radial_angle_max,
+        )
+        self.sigRadialCenterChanged.emit(cx, cy)
+
+    def _deactivate_radial_mode(self) -> None:
+        """Turn off center-click mode and clean up overlays."""
+        self._radial_mode_active = False
+        self._radial_center = None
+        self._remove_radial_overlays()
+
+    @staticmethod
+    def _compute_full_radial_profile(
+        data: np.ndarray,
+        cx: float,
+        cy: float,
+        r_min: int = 0,
+        r_max: int = 0,
+        angle_min: int = 0,
+        angle_max: int = 180,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Azimuthal average within two symmetric arc sectors.
+
+        Arc 1: angle_min → angle_max
+        Arc 2: (angle_min+180°) → (angle_max+180°)
+        Radial range: r_min to r_max (0 = no outer limit).
+
+        Returns (r_bins, mean_intensity) as 1-D float64 arrays.
+        """
+        h, w = data.shape[:2]
+        y_idx, x_idx = np.indices((h, w))
+        dx = x_idx.astype(np.float64) - cx
+        dy = y_idx.astype(np.float64) - cy
+        r = np.sqrt(dx ** 2 + dy ** 2)
+
+        # Angular mask — two symmetric arcs.
+        # Normalize everything to 0–360 so comparisons work regardless of sign.
+        angles = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+        a0 = float(angle_min) % 360.0
+        a1 = float(angle_max) % 360.0
+        a0s = (a0 + 180.0) % 360.0
+        a1s = (a1 + 180.0) % 360.0
+
+        def _arc_mask(a_start, a_end):
+            if a_start <= a_end:
+                return (angles >= a_start) & (angles <= a_end)
+            # Wrap-around: arc crosses the 0°/360° boundary
+            return (angles >= a_start) | (angles <= a_end)
+
+        angle_mask = _arc_mask(a0, a1) | _arc_mask(a0s, a1s)
+
+        # Radial mask
+        r_mask = r >= float(r_min)
+        if r_max > 0:
+            r_mask &= r <= float(r_max)
+
+        combined = angle_mask & r_mask
+        if not combined.any():
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+        r_int = np.round(r).astype(np.int64)
+        flat_r = r_int[combined].ravel()
+        flat_data = data[combined].ravel().astype(np.float64)
+        n_bins = int(flat_r.max()) + 1
+        radial_sum = np.bincount(flat_r, weights=flat_data, minlength=n_bins)
+        radial_count = np.bincount(flat_r, minlength=n_bins)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean_intensity = np.where(
+                radial_count > 0, radial_sum / radial_count, np.nan
+            )
+        return np.arange(n_bins, dtype=np.float64), mean_intensity
 
     def _calculate_radial_profile(
         self,

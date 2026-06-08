@@ -6,7 +6,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from src.gui.fth_reconstruction_tool import FTH_COLORMAPS, FTHReconstructionTool, _get_colormap
+from src.gui._shared import get_colormap as _get_colormap
+from src.gui.fth_reconstruction_tool import FTH_COLORMAPS, FTHReconstructionTool
 
 
 def _write_h5(path: Path, dataset: str, data: np.ndarray) -> None:
@@ -59,6 +60,39 @@ def test_smoke_load_cl_cr_in_background(qapp, tmp_path: Path):
     tool.close()
 
 
+def test_smoke_load_single_dataset_in_background(qapp, tmp_path: Path):
+    h5_path = tmp_path / "single.h5"
+    data = np.ones((128, 128), dtype=np.float64) * 11.0
+    _write_h5(h5_path, "img", data)
+
+    tool = FTHReconstructionTool(opened_files=())
+    tool.add_dataset_to_combo(f"{h5_path}::img", "CL")
+
+    tool._load_data()
+    ok = _wait_until(lambda: tool._CL is not None and tool._CR is not None and tool._CL_c is not None, timeout_s=5.0)
+    assert ok, "Single dataset load did not complete in time"
+    np.testing.assert_allclose(tool._CL, data)
+    np.testing.assert_allclose(tool._CR, np.zeros_like(data))
+    assert tool._single_dataset_mode is True
+    assert tool._CL_c is not None and tool._CR_c is not None
+    tool.close()
+
+
+def test_loaded_image_center_defaults_to_data_geometry(qapp):
+    tool = FTHReconstructionTool(opened_files=())
+    tool._CL = np.ones((1228, 1228), dtype=np.float64)
+    tool._CR = np.ones((1228, 1228), dtype=np.float64)
+
+    tool._initialize_center_controls_for_loaded_shape(tool._CL.shape)
+    tool._compute_centered_hologram()
+
+    assert tool._t1_xmid.value() == 614
+    assert tool._t1_ymid.value() == 614
+    assert tool._CL_c is not None
+    assert tool._CL_c.shape == (1226, 1226)
+    tool.close()
+
+
 def test_slit_none_path_has_no_secondary_slit_filter(qapp):
     tool = _prepare_tool_with_arrays(qapp)
     tool._chk_balance.setChecked(False)
@@ -71,6 +105,32 @@ def test_slit_none_path_has_no_secondary_slit_filter(qapp):
     diff = tool._CL_c - tool._CR_c
     assert np.allclose(tool._Holo2_S1, diff)
     assert np.allclose(tool._Holo2_S2, diff)
+    tool.close()
+
+
+def test_slit_mask_can_apply_each_direction_independently(qapp):
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._phi1_spin.setValue(0.0)
+    tool._phi2_spin.setValue(90.0)
+    tool._slit_mask_width.setValue(0.0)
+    tool._slit_mask_sigma.setValue(1.0)
+
+    tool._g_slit_mask.setChecked(True)
+    tool._slit_mask_phi1_chk.setChecked(True)
+    tool._slit_mask_phi2_chk.setChecked(False)
+    tool._apply_slit_mask()
+    phi1_only = tool._slit_mask.copy()
+
+    tool._slit_mask_phi1_chk.setChecked(False)
+    tool._slit_mask_phi2_chk.setChecked(True)
+    tool._apply_slit_mask()
+    phi2_only = tool._slit_mask.copy()
+
+    center = tool._X0
+    assert phi1_only[center, 10] < 0.01
+    assert phi1_only[10, center] > 0.99
+    assert phi2_only[10, center] < 0.01
+    assert phi2_only[center, 10] > 0.99
     tool.close()
 
 
@@ -131,4 +191,3 @@ def test_gray_colormap_is_available_for_fth(qapp):
     assert "gray" in FTH_COLORMAPS
     cmap = _get_colormap("gray")
     assert cmap is not None
-

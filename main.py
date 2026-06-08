@@ -16,9 +16,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging.config
+import os
 import sys
 
 import pyqtgraph as pg
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from src.gui.main_window import MainWindow
@@ -41,12 +43,34 @@ if sys.platform == "win32":
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("hdf5viewer")
 
 
+def configure_light_color_scheme() -> None:
+    """Ask Qt's Windows platform plugin to stay light without changing widget style."""
+    if sys.platform != "win32":
+        return
+
+    platform = os.environ.get("QT_QPA_PLATFORM", "")
+    platform_lower = platform.lower()
+    if not platform:
+        os.environ["QT_QPA_PLATFORM"] = "windows:darkmode=0"
+    elif platform_lower.startswith("windows") and "darkmode=" not in platform_lower:
+        os.environ["QT_QPA_PLATFORM"] = f"{platform}:darkmode=0"
+
+
+def apply_light_color_scheme(app: QApplication) -> None:
+    """Request the light color scheme when the current Qt version supports it."""
+    set_color_scheme = getattr(app.styleHints(), "setColorScheme", None)
+    if set_color_scheme is not None:
+        set_color_scheme(Qt.ColorScheme.Light)
+
+
 def main() -> None:
     """HDF5 File Viewer entry point."""
     logging.config.dictConfig(logging_config)
     logging.info("Starting GUI...")
 
+    configure_light_color_scheme()
     app = QApplication(sys.argv)
+    apply_light_color_scheme(app)
     app.setOrganizationName("HDF5Viewer")
     app.setApplicationName("HDF5ViewerPython")
     main_win = MainWindow()
