@@ -228,10 +228,16 @@ def find_iscc() -> str | None:
     on_path = shutil.which("ISCC") or shutil.which("iscc")
     if on_path:
         return on_path
-    candidates = [
-        r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-        r"C:\Program Files\Inno Setup 6\ISCC.exe",
+    # Search the standard install roots for any Inno Setup version (6, 7, ...).
+    roots = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
     ]
+    candidates = []
+    for root in roots:
+        candidates += glob.glob(os.path.join(root, "Inno Setup *", "ISCC.exe"))
+    # Prefer the highest version directory if several are installed.
+    candidates.sort(reverse=True)
     return next((c for c in candidates if os.path.exists(c)), None)
 
 
