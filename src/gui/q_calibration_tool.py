@@ -50,6 +50,12 @@ from src.lib_h5.table_writer import write_table
 from src.recon import profiles as pr
 
 
+# How wide the status line may get. It sits in the settings panel, and the panel
+# is sized by the controls above it — not by whatever the last message happened
+# to say.
+STATUS_MAX_WIDTH = 420
+
+
 class QCalibrationTool(QDialog):
     """Q-calibration workspace: left controls + right 2D image."""
 
@@ -256,6 +262,13 @@ class QCalibrationTool(QDialog):
 
         self._status = QLabel("Ready")
         self._status.setStyleSheet("color: #444;")
+        # A label asks for the full width of its text, and the messages here are
+        # unbounded — a saved path, or one note per loaded stack. Left free, the
+        # first "Loaded: … mean of 400 frames …" doubled the panel and squeezed
+        # the image beside it to a sliver. Capped and elided instead, with the
+        # whole message on hover.
+        self._status.setMaximumWidth(STATUS_MAX_WIDTH)
+        self._status.setMinimumWidth(0)
         left_lay.addWidget(self._status)
         left_lay.addStretch(1)
 
@@ -337,7 +350,19 @@ class QCalibrationTool(QDialog):
             btn.setDefault(False)
 
     def _set_status(self, text: str, error: bool = False) -> None:
-        self._status.setText(text)
+        """Show a status message without letting it resize the panel.
+
+        Elided from the middle: these messages carry the useful part at both
+        ends — what happened at the front, the file name or the frame count at
+        the back — and cutting from the right would drop the half that says how
+        it turned out.
+        """
+        message = str(text or "")
+        metrics = self._status.fontMetrics()
+        self._status.setText(
+            metrics.elidedText(message, Qt.TextElideMode.ElideMiddle, STATUS_MAX_WIDTH)
+        )
+        self._status.setToolTip(message)
         self._status.setStyleSheet("color: #b00020;" if error else "color: #444;")
 
     def _populate_dataset_combo(self) -> None:

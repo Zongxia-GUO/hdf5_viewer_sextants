@@ -53,7 +53,7 @@ def test_the_status_line_says_the_frames_were_averaged(tool, scan):
     """Otherwise the only clue is a shape that no longer matches the dataset."""
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
-    assert "mean of 400 frames" in tool._status.text()
+    assert "mean of 400 frames" in tool._status.toolTip()
 
 
 def test_an_array_handed_over_is_reduced_the_same_way(tool):
@@ -62,14 +62,14 @@ def test_an_array_handed_over_is_reduced_the_same_way(tool):
     tool.load_array_data(STACK, source_label="from viewer")
 
     assert float(tool._data[0, 0]) == pytest.approx(199.5)
-    assert "mean of 400 frames" in tool._status.text()
+    assert "mean of 400 frames" in tool._status.toolTip()
 
 
 def test_a_plain_image_says_nothing_extra(tool, scan):
     tool.load_dataset_full_key(f"{scan}::entry/signal/flat", auto_load=True, slot="CL")
 
     assert tool._data.shape == (20, 12)
-    assert "mean of" not in tool._status.text()
+    assert "mean of" not in tool._status.toolTip()
 
 
 def test_frames_are_counted_along_the_first_axis(tool):
@@ -87,17 +87,78 @@ def test_frames_are_counted_along_the_first_axis(tool):
 def test_the_note_is_cleared_between_loads(tool, scan):
     """A note left over from a stack would claim a plain image was averaged."""
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
-    assert "mean of" in tool._status.text()
+    assert "mean of" in tool._status.toolTip()
 
     tool.load_array_data(np.ones((8, 8), dtype=np.float32), source_label="plain")
 
-    assert "mean of" not in tool._status.text()
+    assert "mean of" not in tool._status.toolTip()
 
 
 def test_a_two_dimensional_array_is_untouched(tool):
     frame = np.arange(24.0, dtype=np.float32).reshape(4, 6)
 
     np.testing.assert_array_equal(tool._flatten_stack(frame, "CL"), frame)
+
+
+# ---------------------------------------------------------------------------
+# The status line must not resize the window
+# ---------------------------------------------------------------------------
+
+def test_loading_a_stack_does_not_widen_the_settings_panel(qapp, scan):
+    """A QLabel asks for the full width of its text, and these messages are
+    unbounded — one note per loaded stack, or a saved path. Left free, the first
+    "Loaded: … mean of 400 frames …" doubled the panel and squeezed the image
+    beside it to a sliver."""
+    from PyQt6.QtWidgets import QApplication, QSplitter
+
+    from src.gui.q_calibration_tool import QCalibrationTool
+
+    tool = QCalibrationTool(opened_files=(scan,), dataset_full_keys_2d=[])
+    tool.show()
+    QApplication.processEvents()
+    try:
+        splitter = tool.findChild(QSplitter)
+        before = splitter.sizes()[0]
+
+        tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
+        tool._cr_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
+        tool._load_data()
+        QApplication.processEvents()
+
+        assert "mean of 400 frames" in tool._status.toolTip(), "the message really is long"
+        assert splitter.sizes()[0] == before
+    finally:
+        tool.close()
+        tool.deleteLater()
+
+
+def test_a_long_message_is_elided_but_kept_in_full_on_hover(qapp, scan):
+    from src.gui.q_calibration_tool import STATUS_MAX_WIDTH, QCalibrationTool
+
+    tool = QCalibrationTool(opened_files=(scan,), dataset_full_keys_2d=[])
+    try:
+        message = "Saved image: " + "C:/a/very/deep/folder/" * 6 + "pattern.png"
+        tool._set_status(message)
+
+        shown = tool._status.text()
+        assert shown != message, "not elided"
+        assert tool._status.toolTip() == message, "the whole message is still reachable"
+        width = tool._status.fontMetrics().horizontalAdvance(shown)
+        assert width <= STATUS_MAX_WIDTH
+    finally:
+        tool.deleteLater()
+
+
+def test_a_short_message_is_left_alone(qapp, scan):
+    from src.gui.q_calibration_tool import QCalibrationTool
+
+    tool = QCalibrationTool(opened_files=(scan,), dataset_full_keys_2d=[])
+    try:
+        tool._set_status("Switched to pixel axes.")
+
+        assert tool._status.text() == "Switched to pixel axes."
+    finally:
+        tool.deleteLater()
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +195,7 @@ def test_one_frame_can_be_picked(tool, scan):
     tool._combo_frame.setCurrentIndex(1 + 3)
 
     assert float(tool._data[0, 0]) == pytest.approx(3.0)
-    assert "frame 3 of 400" in tool._status.text()
+    assert "frame 3 of 400" in tool._status.toolTip()
 
 
 def test_changing_the_frame_reloads_without_pressing_load(tool, scan):
@@ -161,7 +222,7 @@ def test_the_axis_used_is_reported(tool, scan):
 
     tool._combo_frame_axis.setCurrentIndex(1)
 
-    assert "axis 1" in tool._status.text()
+    assert "axis 1" in tool._status.toolTip()
 
 
 # ---------------------------------------------------------------------------
