@@ -20,7 +20,7 @@ import numpy as np
 import pyqtgraph as pg
 from scipy.ndimage import median_filter
 from PyQt6.QtCore import QByteArray, QBuffer, QMimeData, Qt, pyqtSignal, QThread
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,11 +46,17 @@ from PyQt6.QtWidgets import (
 )
 
 from src.gui._shared import (
+    IMAGE_SAVE_FILTERS as _IMAGE_SAVE_FILTERS,
+    RAW_TIFF_SUFFIXES as _RAW_TIFF_SUFFIXES,
     apply_colormap as _apply_colormap,
+    array_to_qimage as _array_to_qimage,
+    extension_for_filter as _extension_for_filter,
     set_combo_light_palette as _set_combo_light_palette,
     set_widget_light_palette as _set_widget_light_palette,
 )
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.gui.export_naming import remember_save_directory, suggested_save_path
+from src.lib_h5.data_exporter import DataExporter
 from src.gui.fth_reconstruction_tool import FTHReconstructionTool
 from src.recon.cdi import (
     fft2c as _fft2c,
@@ -564,7 +570,7 @@ class _CDIReconWorker(QThread):
     # (restart_idx, global_iter, fourier_error, current_psi_copy)
     progress     = pyqtSignal(int, int, float, object)
     restart_done = pyqtSignal(int, float)   # (restart_idx, final_error)
-    finished     = pyqtSignal(object, list) # (best_obj, error_list)
+    finished     = pyqtSignal(object, list)  # (best_obj, error_list)
     error        = pyqtSignal(str)
 
     def __init__(
@@ -1425,21 +1431,29 @@ class CDIReconstructionTool(QMainWindow):
         fl_e.addRow("Crop:", roi_row)
 
         self._cdi_exp_target_combo = QComboBox()
-        self._cdi_exp_target_combo.addItems(["Real", "Imag.", "Phase", "Abs."])
+        self._cdi_exp_target_combo.addItems(["Real", "Imag.", "Phase", "Abs.", "Full"])
+        self._cdi_exp_target_combo.setToolTip(
+            "Which component Copy and Export act on. 'Full' means all four."
+        )
         fl_e.addRow("Image:", self._cdi_exp_target_combo)
 
+        # Both buttons follow the Target: a single component, or all four when
+        # Target is "Full" — Copy then yields one composite picture, Export four files.
         exp_row = QHBoxLayout()
         self._cdi_copy_btn = QPushButton("Copy")
+        self._cdi_copy_btn.setToolTip(
+            "Copy the target to the clipboard ('Full' copies the four panels as one image)"
+        )
         self._cdi_copy_btn.clicked.connect(self._copy_selected_cdi_component_jpeg)
-        self._cdi_save_btn = QPushButton("Save")
-        self._cdi_save_btn.clicked.connect(self._save_selected_cdi_component)
         exp_row.addWidget(self._cdi_copy_btn)
-        exp_row.addWidget(self._cdi_save_btn)
-        fl_e.addRow(exp_row)
 
-        self._cdi_save_all_btn = QPushButton("Save all")
-        self._cdi_save_all_btn.clicked.connect(self._save_all_cdi_components)
-        fl_e.addRow(self._cdi_save_all_btn)
+        self._cdi_export_btn = QPushButton("Export")
+        self._cdi_export_btn.setToolTip(
+            "Save the target as an image ('Full' writes one file per component)"
+        )
+        self._cdi_export_btn.clicked.connect(self._export_selected_cdi_component)
+        exp_row.addWidget(self._cdi_export_btn)
+        fl_e.addRow(exp_row)
         lay.addWidget(g_exp)
 
         lay.addStretch()
@@ -1801,8 +1815,14 @@ class CDIReconstructionTool(QMainWindow):
         if mask is None:
             QMessageBox.warning(self, "No Mask", "No support shapes defined.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Support Mask", "", "NumPy (*.npy)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Support Mask",
+            suggested_save_path(self._current_cdi_export_name_base(), "support_mask", ".npy"),
+            "NumPy (*.npy)",
+        )
         if path:
+            remember_save_directory(path)
             np.save(path, mask)
             self._set_status(f"Saved mask → {path}")
 
@@ -2154,10 +2174,11 @@ class CDIReconstructionTool(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Bad Pixel Mask",
-            "",
+            suggested_save_path(self._current_cdi_export_name_base(), "badpixel_mask", ".npz"),
             "NumPy archive with center (*.npz);;Legacy mask only (*.npy)",
         )
         if path:
+            remember_save_directory(path)
             fth = self._fth_tool
             xmid = int(fth._t1_xmid.value())
             ymid = int(fth._t1_ymid.value())
@@ -3727,9 +3748,13 @@ class CDIReconstructionTool(QMainWindow):
             return
         if self._result_diff is not None:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save Tutorial Reconstruction", "", "NumPy archive (*.npz)"
+                self,
+                "Save Tutorial Reconstruction",
+                suggested_save_path(self._current_cdi_export_name_base(), "cdi_tutorial", ".npz"),
+                "NumPy archive (*.npz)",
             )
             if path:
+                remember_save_directory(path)
                 np.savez(
                     path,
                     reconstructed=self._result_obj,
@@ -3743,9 +3768,13 @@ class CDIReconstructionTool(QMainWindow):
                 self._set_status(f"Saved tutorial reconstruction -> {path}")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Reconstruction", "", "NumPy (*.npy)"
+            self,
+            "Save Reconstruction",
+            suggested_save_path(self._current_cdi_export_name_base(), "cdi", ".npy"),
+            "NumPy (*.npy)",
         )
         if path:
+            remember_save_directory(path)
             np.save(path, self._result_obj)
             self._set_status(f"Saved reconstruction → {path}")
 
@@ -3831,7 +3860,10 @@ class CDIReconstructionTool(QMainWindow):
         }
 
     def _selected_cdi_export_component_name(self) -> str:
+        """The chosen component, or ``"full"`` for all four at once."""
         txt = self._cdi_exp_target_combo.currentText().strip().lower()
+        if txt.startswith("full"):
+            return "full"
         if txt.startswith("real"):
             return "real"
         if txt.startswith("imag"):
@@ -3839,6 +3871,43 @@ class CDIReconstructionTool(QMainWindow):
         if txt.startswith("phase"):
             return "phase"
         return "abs"
+
+    def _composite_cdi_components_qimage(self, components: dict[str, np.ndarray]) -> Optional[QImage]:
+        """Tile the four components into one 2x2 picture, in display order.
+
+        Used by Copy when the target is "Full": the clipboard takes a single
+        image, so the four panels are laid out the way they are on screen.
+        """
+        order = ("real", "imag", "phase", "abs")
+        tiles = []
+        for name in order:
+            arr = components.get(name)
+            if arr is None:
+                return None
+            tiles.append(self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name), name))
+
+        gap = 4
+        cell_w = max(img.width() for img in tiles)
+        cell_h = max(img.height() for img in tiles)
+        # RGB, since the tiles now carry their colormaps.
+        sheet = QImage(cell_w * 2 + gap, cell_h * 2 + gap, QImage.Format.Format_RGB888)
+        sheet.fill(0)
+
+        painter = QPainter(sheet)
+        try:
+            for idx, img in enumerate(tiles):
+                col, row = idx % 2, idx // 2
+                painter.drawImage(col * (cell_w + gap), row * (cell_h + gap), img)
+        finally:
+            painter.end()
+        return sheet
+
+    def _export_selected_cdi_component(self) -> None:
+        """Export the target: one file, or four files when the target is "Full"."""
+        if self._selected_cdi_export_component_name() == "full":
+            self._save_all_cdi_components()
+        else:
+            self._save_selected_cdi_component()
 
     def _current_cdi_export_name_base(self) -> str:
         channel = "result"
@@ -3868,28 +3937,37 @@ class CDIReconstructionTool(QMainWindow):
             hi = lo + 1.0
         return lo, hi
 
-    @staticmethod
-    def _component_to_qimage(arr: np.ndarray, levels: tuple[float, float]) -> QImage:
-        lo, hi = float(levels[0]), float(levels[1])
-        if not np.isfinite(lo):
-            lo = float(np.nanmin(arr))
-        if not np.isfinite(hi):
-            hi = float(np.nanmax(arr))
-        if hi <= lo:
-            hi = lo + 1e-12
-        norm = np.clip((arr.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
-        img_u8 = (norm * 255.0).astype(np.uint8)
-        h, w = img_u8.shape
-        qimg = QImage(img_u8.data, w, h, img_u8.strides[0], QImage.Format.Format_Grayscale8)
-        return qimg.copy()
+    def _cdi_component_colormap(self, name: str) -> str:
+        """The colormap the named component is shown with on the result page.
+
+        Phase has its own picker because a wrapped phase is a diverging
+        quantity; the other three follow the amplitude one.
+        """
+        if str(name).lower() == "phase":
+            return self._res_phase_cmap.currentText()
+        return self._res_amp_cmap.currentText()
+
+    def _component_to_qimage(self, arr: np.ndarray, levels: tuple[float, float],
+                             name: str = "") -> QImage:
+        """Render a component the way the result page shows it, colormap included."""
+        return _array_to_qimage(arr, levels, colormap=self._cdi_component_colormap(name))
 
     def _copy_selected_cdi_component_jpeg(self) -> None:
+        """Copy the target to the clipboard; "Full" copies one 2x2 composite."""
         components = self._get_cdi_export_components()
         if components is None:
             return
         name = self._selected_cdi_export_component_name()
-        arr = components[name]
-        qimg = self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name))
+
+        if name == "full":
+            composite = self._composite_cdi_components_qimage(components)
+            if composite is None:
+                self._set_status("Could not build the composite image.")
+                return
+            qimg = composite
+        else:
+            arr = components[name]
+            qimg = self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name), name)
         try:
             ba = QByteArray()
             buf = QBuffer(ba)
@@ -3915,45 +3993,54 @@ class CDIReconstructionTool(QMainWindow):
             return
         name = self._selected_cdi_export_component_name()
         arr = components[name]
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected = QFileDialog.getSaveFileName(
             self,
             f"Save CDI {name}",
-            f"{self._current_cdi_export_name_base()}_{name}.png",
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+            suggested_save_path(self._current_cdi_export_name_base(), name, ".png"),
+            _IMAGE_SAVE_FILTERS,
         )
         if not path:
             return
+        remember_save_directory(path)
         p = pathlib.Path(path)
+        if not p.suffix:
+            p = p.with_suffix(_extension_for_filter(selected))
         try:
-            qimg = self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name))
-            if not qimg.save(str(p)):
-                raise RuntimeError("Image save failed")
+            self._write_cdi_component(arr, name, p)
             self._set_status(f"Saved CDI image: {p.name}")
         except Exception as exc:
             self._set_status(f"CDI save failed: {exc}")
             logging.exception("CDI save selected component")
 
+    def _write_cdi_component(self, arr: np.ndarray, name: str, path: pathlib.Path) -> None:
+        """Write one component: values to a TIFF, the coloured picture otherwise."""
+        if path.suffix.lower() in _RAW_TIFF_SUFFIXES:
+            if not DataExporter.export_raw_tiff(np.asarray(arr), path):
+                raise RuntimeError("Raw TIFF save failed")
+            return
+        qimg = self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name), name)
+        if not qimg.save(str(path)):
+            raise RuntimeError(f"Image save failed: {path.name}")
+
     def _save_all_cdi_components(self) -> None:
         components = self._get_cdi_export_components()
         if components is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected = QFileDialog.getSaveFileName(
             self,
             "Save all CDI components",
-            f"{self._current_cdi_export_name_base()}.png",
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+            suggested_save_path(self._current_cdi_export_name_base(), extension=".png"),
+            _IMAGE_SAVE_FILTERS,
         )
         if not path:
             return
+        remember_save_directory(path)
         p = pathlib.Path(path)
-        ext = p.suffix.lower() or ".png"
+        ext = p.suffix.lower() or _extension_for_filter(selected)
         try:
             stem = p.with_suffix("")
             for name, arr in components.items():
-                qimg = self._component_to_qimage(arr, self._cdi_component_display_levels(arr, name))
-                out_path = pathlib.Path(f"{stem}_{name}{ext}")
-                if not qimg.save(str(out_path)):
-                    raise RuntimeError(f"Image save failed: {out_path.name}")
+                self._write_cdi_component(arr, name, pathlib.Path(f"{stem}_{name}{ext}"))
             self._set_status(f"Saved CDI images: {stem.name}_real/imag/phase/abs{ext}")
         except Exception as exc:
             self._set_status(f"CDI save all failed: {exc}")

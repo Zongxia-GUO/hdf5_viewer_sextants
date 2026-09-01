@@ -1,4 +1,4 @@
-﻿"""Logging config."""
+"""Logging config."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -46,6 +46,3 @@ logging_config = {
         }
     },
 }
-
-
-

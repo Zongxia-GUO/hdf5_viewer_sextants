@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -63,8 +63,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.gui.export_naming import (
+    remember_save_directory,
+    short_series_label,
+    suggested_save_path,
+)
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.file_validator import is_hdf5_file
+from src.lib_h5.table_format import (
+    DEFAULT_TABLE_FORMAT_KEY,
+    format_from_filter,
+    get_table_format,
+    save_dialog_filter,
+)
+from src.lib_h5.table_writer import write_table
 from src.recon import curve_fit as cf
 from src.recon import incidence as inc
 from src.recon import profiles as pr
@@ -660,6 +673,14 @@ class XRMSAnalyzeTool(QDialog):
         right_v.addWidget(self._img)
 
         self._plot_profile = self._make_plot("Radius (pixels)", "Intensity", "Profile")
+        # The only way this curve leaves the tool: it has no buttons of its own,
+        # and pyqtgraph's own Export bypasses the naming and dialect rules every
+        # other export in the application follows.
+        attach_plot_menu(
+            self._plot_profile,
+            on_export=self._export_profile,
+            on_plot=self._plot_profile_window,
+        )
         right_v.addWidget(self._plot_profile)
         right_v.setSizes([620, 280])
         right_v.setStretchFactor(0, 3)
@@ -1257,7 +1278,7 @@ class XRMSAnalyzeTool(QDialog):
         btn_refresh.setAutoDefault(False)
         btn_refresh.clicked.connect(self._b4_refresh)
         side.addWidget(btn_refresh)
-        btn_csv = QPushButton("Export CSV…")
+        btn_csv = QPushButton("Export")
         btn_csv.setAutoDefault(False)
         btn_csv.clicked.connect(self._b4_export_csv)
         side.addWidget(btn_csv)
@@ -1333,14 +1354,25 @@ class XRMSAnalyzeTool(QDialog):
         p.setLabel("left", self._b4_label(key))
         p.setTitle(self._b4_label(key), color="w")
 
+    def _b4_default_export_name(self) -> str:
+        """Scan and dataset of the CL slot, tagged as an XRMS batch result."""
+        combo = self._slot_combo.get("CL")
+        entry = combo.currentText().strip() if combo is not None else ""
+        return short_series_label(entry, fallback="xrms") if "::" in entry else "xrms"
+
     def _b4_export_csv(self) -> None:
         if not self._b3_results:
             self._b4_status.setText("Nothing to export — run Batch first.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export batch results", "xrms_batch.csv",
-                                              "CSV files (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export batch results",
+            suggested_save_path(self._b4_default_export_name(), "xrms_batch", extension=".csv"),
+            "CSV files (*.csv)",
+        )
         if not path:
             return
+        remember_save_directory(path)
         import csv
         keys: list[str] = []
         for row in self._b3_results:
@@ -1377,6 +1409,75 @@ class XRMSAnalyzeTool(QDialog):
             return full_key
 
     # ── main-window contract ──────────────────────────────────────────────── #
+
+    def reset_results(self) -> None:
+        """Throw away everything loaded and everything computed from it.
+
+        The window is kept alive between uses so that reopening is instant, but
+        that made closing it look like a reset it was not: the tool came back
+        showing the previous run's images, profiles and fit table, which read as
+        results for whatever dataset was opened next. It also held whole image
+        stacks in memory for as long as the application ran.
+        """
+        self._clear_all_rois()
+        self._reset_beamstop_for_new_geometry()
+        self._clear_fit_items()
+
+        for slot in self._slot_names:
+            self._slots[slot] = None
+        self._combined = None
+        self._combined_delay = None
+        self._data = None
+        self._n_frames = 0
+
+        # Derived geometry, valid only for the stack that has just gone.
+        self._grid_cache = None
+        self._polar_cache = None
+        self._display_origin = None
+
+        self._radial_x = self._radial_y = None
+        self._angular_x = self._angular_y = None
+        self._time_x = self._time_y = None
+
+        self._b3_results = []
+        self._b3_bg_xs = None
+        self._b3_range_xs = None
+        self._b3_clear_items()
+        for item in self._b3_overlay_items:
+            try:
+                self._b3_img_plot.removeItem(item)
+            except Exception:
+                pass
+        self._b3_overlay_items = []
+
+        self._reset_result_views()
+
+    def _reset_result_views(self) -> None:
+        """Blank every widget that was showing a result."""
+        self._plot_profile.clear()
+        self._plot_profile.setTitle("Profile", color="w")
+        for plot in (self._fit_top, self._fit_bottom,
+                     self._b3_profile_plot, self._b3_sub_plot, *self._b4_plots):
+            plot.clear()
+        # clear() takes the draggable fit-range lines with it; they are furniture
+        # rather than results, so put them back where the next dataset expects.
+        self._bg_xs = None
+        self._range_xs = None
+        self._arrange_fit_lines()
+        self._fit_results.clear()
+
+        self._img.set_data(np.zeros((1, 1), dtype=np.float32))
+        self._b3_img_item.clear()
+
+        self._lbl_frame_info.setText("0 / 0")
+        for widget in (self._sl_frame, self._spin_frame):
+            widget.blockSignals(True)
+            widget.setRange(0, 0)
+            widget.setValue(0)
+            widget.setEnabled(False)
+            widget.blockSignals(False)
+        self._g_frame.setVisible(False)
+        self._set_status("No data loaded.")
 
     def refresh_dataset_keys(self, keys_2d: list[str]) -> None:
         """Re-sync the available dataset list (main-window contract).
@@ -2452,6 +2553,79 @@ class XRMSAnalyzeTool(QDialog):
         else:
             self._plot_profile.setTitle(f"{roi['name']} — empty region", color="w")
 
+    # ── Getting the profile out ───────────────────────────────────────── #
+
+    def _profile_columns(self) -> tuple[list[str], list[np.ndarray]] | None:
+        """The profile on screen as ``(headers, columns)``, or None.
+
+        Headed with the axis in use, so a radial profile says radius and an
+        azimuthal one says angle. This curve had no way out of the tool at all;
+        only page 4's batch table had an Export button.
+        """
+        roi = self._selected_roi()
+        if roi is None:
+            return None
+        name = str(roi.get("name", "profile"))
+        if roi.get("mode") == "angular" and self._angular_x is not None:
+            return (["Angle (deg)", f"{name} (intensity)"],
+                    [self._angular_x, self._angular_y])
+        if self._radial_x is not None:
+            return (["Radius (pixels)", f"{name} (intensity)"],
+                    [self._radial_x, self._radial_y])
+        return None
+
+    def _export_profile(self) -> None:
+        """Write the ROI profile through the application's own export rules."""
+        columns = self._profile_columns()
+        if columns is None:
+            self._set_status("No profile to export — select a ROI first.", error=True)
+            return
+        headers, data = columns
+
+        settings = QSettings()
+        fmt = get_table_format(str(settings.value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)))
+        path, selected = QFileDialog.getSaveFileName(
+            self,
+            "Export ROI Profile",
+            suggested_save_path("xrms_profile", extension=fmt.suffix),
+            save_dialog_filter(fmt),
+        )
+        if not path:
+            return
+
+        fmt = format_from_filter(selected) or fmt
+        out = pathlib.Path(path)
+        if not out.suffix:
+            out = out.with_suffix(fmt.suffix)
+        try:
+            write_table(out, headers, data, fmt)
+        except Exception as exc:
+            logging.error("XRMS profile export failed: %s", exc)
+            QMessageBox.critical(self, "Export Failed", f"Failed to export the profile:\n{exc}")
+            return
+
+        remember_save_directory(out)
+        settings.setValue("export/table_format", fmt.key)
+        self._set_status(f"Profile exported to {out.name}")
+
+    def _plot_profile_window(self) -> None:
+        """Open the ROI profile in a Plot window."""
+        from src.gui.plot_dialog import open_plot_dialog
+        from src.gui.plot_series import Series
+
+        columns = self._profile_columns()
+        if columns is None:
+            self._set_status("No profile to plot — select a ROI first.", error=True)
+            return
+        headers, data = columns
+        dialog = open_plot_dialog(
+            self,
+            [Series(headers[1], data[1], data[0])],
+            title="Time Resolved XRMS",
+        )
+        if dialog is not None:
+            dialog.le_x_label.setText(headers[0])
+
     def _update_time_plot(self) -> None:
         """Compute the selected ROI's mean-intensity-per-frame series (no plot)."""
         self._time_x = self._time_y = None
@@ -2782,6 +2956,7 @@ class XRMSAnalyzeTool(QDialog):
             p0=p0,
             fit_lo=self._fit_range()[0],
             fit_hi=self._fit_range()[1],
+            source_key=self._b4_default_export_name(),
             parent=self,
         )
         dlg.show()
@@ -2795,9 +2970,11 @@ class XRMSAnalyzeTool(QDialog):
         self._status.setStyleSheet("color: #b00020;" if error else "color: #444;")
 
     def closeEvent(self, event) -> None:
+        """Closing the window means starting over next time."""
         try:
-            self._clear_all_rois()
-        except Exception:
-            pass
+            self.reset_results()
+        except Exception as exc:
+            # A window must always be closable; a failed tidy-up is not a reason
+            # to trap the user in it.
+            logging.warning("Could not reset the XRMS tool on close: %s", exc)
         super().closeEvent(event)
-

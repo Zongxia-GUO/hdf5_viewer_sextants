@@ -72,6 +72,14 @@ GPU_DLL_PATTERNS = [
     "nvinfer*.dll", "nvrtc*.dll",
 ]
 
+# The scientific packages ship their own test suites. Nothing in the app imports
+# them, and they are the single biggest contributor to the *file count* — which
+# is what a cold start pays for, since every file is an open, a read and an
+# antivirus scan before the window appears. Removed after the build rather than
+# excluded during it: --collect-all is what pulls them in, and it is required
+# for these packages to work at all in the frozen app.
+TEST_PACKAGE_OWNERS = ("scipy", "numpy", "matplotlib", "PIL", "h5py", "pyqtgraph", "zmq")
+
 
 def print_header(text: str) -> None:
     """Print a banner."""
@@ -140,12 +148,20 @@ def build_args(onefile: bool) -> list[str]:
         "--hidden-import=scipy.special",
         "--hidden-import=scipy.optimize",
         "--hidden-import=src.gui.dataset_path_combo",
+        # matplotlib: the Plot windows. The Qt backend is picked at runtime, so
+        # static analysis never sees it — name it explicitly or the frozen app
+        # falls back to Agg and no canvas appears.
+        "--hidden-import=matplotlib",
+        "--hidden-import=matplotlib.backends.backend_qtagg",
+        "--hidden-import=matplotlib.backends.backend_agg",
 
         # Collect full package data. CRITICAL: dropping these breaks the
         # pyqtgraph HistogramLUTItem and parts of scipy in the frozen app.
+        # matplotlib needs its mpl-data (fonts, matplotlibrc) the same way.
         "--collect-all=h5py",
         "--collect-all=pyqtgraph",
         "--collect-all=scipy",
+        "--collect-all=matplotlib",
 
         # Exclude GPU/CUDA stacks (fixes the multi-GB bloat problem).
         "--exclude-module=cupy",
@@ -157,7 +173,8 @@ def build_args(onefile: bool) -> list[str]:
         "--exclude-module=tensorflow",
 
         # Exclude heavy packages this app never imports (size only, safe).
-        "--exclude-module=matplotlib",
+        # tkinter stays excluded even though matplotlib is now bundled — the Qt
+        # backend is the only one we use, and TkAgg would drag in all of Tk.
         "--exclude-module=pandas",
         "--exclude-module=tkinter",
         "--exclude-module=IPython",
@@ -173,8 +190,32 @@ def build_args(onefile: bool) -> list[str]:
     return args
 
 
+def strip_bundled_test_suites(dist_dir: str) -> tuple[int, int]:
+    """Delete the dependencies' own test packages; return (files, bytes)."""
+    internal = pathlib.Path(dist_dir) / "_internal"
+    if not internal.exists():
+        internal = pathlib.Path(dist_dir)
+
+    files = 0
+    total = 0
+    for owner in TEST_PACKAGE_OWNERS:
+        root = internal / owner
+        if not root.exists():
+            continue
+        # Sort deepest-first so a nested tests/ inside a tests/ is already gone.
+        for candidate in sorted(root.rglob("tests"), key=lambda p: -len(p.parts)):
+            if not candidate.is_dir():
+                continue
+            for item in candidate.rglob("*"):
+                if item.is_file():
+                    files += 1
+                    total += item.stat().st_size
+            shutil.rmtree(candidate, ignore_errors=True)
+    return files, total
+
+
 def post_build_cleanup(onefile: bool) -> None:
-    """Strip CUDA DLLs from an onedir build (onefile is packed, nothing to do)."""
+    """Trim an onedir build (onefile is packed, nothing to do)."""
     if onefile or sys.platform != "win32":
         return
 
@@ -192,6 +233,13 @@ def post_build_cleanup(onefile: bool) -> None:
                 os.remove(match)
                 print(f"  Removed {os.path.basename(match)} ({human_size(size)})")
     print(f"  Reclaimed {human_size(total)}" if total else "  No CUDA DLLs found (good!)")
+
+    print_header("POST-BUILD: stripping bundled test suites")
+    files, freed = strip_bundled_test_suites(dist_dir)
+    print(
+        f"  Removed {files} file(s), {human_size(freed)} — fewer files to page in on a cold start"
+        if files else "  No bundled test suites found"
+    )
 
 
 def report(onefile: bool) -> bool:

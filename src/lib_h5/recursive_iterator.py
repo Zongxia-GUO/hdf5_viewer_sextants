@@ -1,4 +1,4 @@
-﻿"""Recursive iterators for files and groups."""
+"""Recursive iterators for files and groups."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -52,6 +52,3 @@ def recursive_group(file_path: pathlib.Path, group: str, depth: int) -> list[tup
                 item_list.append((f"{name}", depth, is_last))
 
     return item_list
-
-
-

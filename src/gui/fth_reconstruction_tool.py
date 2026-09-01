@@ -1,4 +1,4 @@
-﻿"""FTH/HERALDO Holographic Reconstruction Tool - MATLAB HERALDO GUI style."""
+"""FTH/HERALDO Holographic Reconstruction Tool - MATLAB HERALDO GUI style."""
 
 # Copyright (C) 2023 Dennis Lönard
 #
@@ -24,7 +24,7 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QBuffer, QByteArray, pyqtSignal, QThread
-from PyQt6.QtGui import QAction, QCursor, QImage, QPixmap, QTransform
+from PyQt6.QtGui import QAction, QCursor, QImage, QPainter, QPixmap, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,8 +50,16 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from src.gui._shared import apply_hist_colormap as _apply_hist_colormap
+from src.gui._shared import (
+    IMAGE_SAVE_FILTERS as _IMAGE_SAVE_FILTERS,
+    RAW_TIFF_SUFFIXES as _RAW_TIFF_SUFFIXES,
+    apply_hist_colormap as _apply_hist_colormap,
+    array_to_qimage as _array_to_qimage,
+    extension_for_filter as _extension_for_filter,
+)
+from src.gui.export_naming import remember_save_directory, suggested_save_path
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.lib_h5.data_exporter import DataExporter
 from src.recon.fth import (
     binary_filter as _binary_filter_kernel,
     bs_step as _bs_step,
@@ -79,6 +87,7 @@ FTH_COLORMAPS = [
 # ---------------------------------------------------------------------------
 # Dataset selector: dropdown + drag-and-drop combined
 # ---------------------------------------------------------------------------
+
 
 class FTHDatasetCombo(DatasetPathCombo):
     """FTH dataset selector using shared drag-drop/entry behavior."""
@@ -243,6 +252,9 @@ class FTHReconstructionTool(QMainWindow):
         self._last_roi_phase_fit: float = 0.0
         self._t4_autoleveled_key: tuple | None = None  # (slit, roi_idx) last auto-leveled
         self._t4_rs_base:         float = 1.0          # auto-detected FT amplitude base
+        # False while the Reconstruction page's phase / FT amplitude still
+        # follow the Filter & FTH page; a drag here takes them over.
+        self._t4_sliders_touched: bool = False
         self._t4_panel_display: dict = {0: {}, 1: {}, 2: {}, 3: {}}
         self._t4_disp_data: list[Optional[np.ndarray]] = [None, None, None, None]
         # Tab-1 ROI/profile & coordinate display state
@@ -299,7 +311,9 @@ class FTHReconstructionTool(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
 
         # status bar at bottom
-        self._status_label = QLabel("Ready -select or drag CL/CR datasets from the HDF5 tree. Single dataset is supported.")
+        self._status_label = QLabel(
+            "Ready -select or drag CL/CR datasets from the HDF5 tree. Single dataset is supported."
+        )
         self._status_label.setStyleSheet(
             "color:#aaa; font-size:11px; padding:3px 6px; "
             "border-top:1px solid #444; background:#1a1a1a;"
@@ -392,10 +406,10 @@ class FTHReconstructionTool(QMainWindow):
 
     @staticmethod
     def _add_plusminus_row(form: QFormLayout, label: str,
-                            spin: QSpinBox) -> None:
+                           spin: QSpinBox) -> None:
         """Add spin +/-1 +/-5 buttons on the same row."""
         row = QHBoxLayout()
-        for delta, text in [(-5, "-5"), (-1, "-1"), (+1, "+1"), (+5, "+5")]: 
+        for delta, text in [(-5, "-5"), (-1, "-1"), (+1, "+1"), (+5, "+5")]:
             b = QPushButton(text)
             b.setFixedWidth(30)
             b.clicked.connect(lambda _, d=delta, s=spin: s.setValue(s.value() + d))
@@ -590,11 +604,13 @@ class FTHReconstructionTool(QMainWindow):
         fl_sm2.addRow("Apply:", slit_mask_row)
         self._slit_mask_width = QDoubleSpinBox()
         self._slit_mask_width.setRange(0.0, 2000.0); self._slit_mask_width.setValue(2.0)
-        self._slit_mask_width.setSingleStep(5.0); self._slit_mask_width.setDecimals(1); self._slit_mask_width.setSuffix(" px")
+        self._slit_mask_width.setSingleStep(5.0); self._slit_mask_width.setDecimals(1)
+        self._slit_mask_width.setSuffix(" px")
         fl_sm2.addRow("Width (px):", self._slit_mask_width)
         self._slit_mask_sigma = QDoubleSpinBox()
         self._slit_mask_sigma.setRange(1.0, 2000.0); self._slit_mask_sigma.setValue(50.0)
-        self._slit_mask_sigma.setSingleStep(10.0); self._slit_mask_sigma.setDecimals(1); self._slit_mask_sigma.setSuffix(" px")
+        self._slit_mask_sigma.setSingleStep(10.0); self._slit_mask_sigma.setDecimals(1)
+        self._slit_mask_sigma.setSuffix(" px")
         fl_sm2.addRow("sigma band (px):", self._slit_mask_sigma)
         self._slit_mask_width.valueChanged.connect(self._apply_slit_mask)
         self._slit_mask_sigma.valueChanged.connect(self._apply_slit_mask)
@@ -703,11 +719,9 @@ class FTHReconstructionTool(QMainWindow):
         splitter.setStretchFactor(1, 1)   # right panel: absorbs all resize
         return tab
 
-
     # ------------------------------------------------------------------
     # TAB 3 -Filter & FTH
     # ------------------------------------------------------------------
-
     def _build_tab3(self) -> QWidget:
         tab = QWidget()
         splitter = self._make_splitter()
@@ -898,14 +912,14 @@ class FTHReconstructionTool(QMainWindow):
         self._t3_glw.addItem(self._t3_fth_hist, row=0, col=3)
 
         # ROI rectangle overlays on FTH panel
-        self._roi1_rect = pg.RectROI([0, 0], [50, 50],
-                                      pen=pg.mkPen("r", width=1.5), movable=False, rotatable=False, resizable=False)
-        self._roi2_rect = pg.RectROI([0, 0], [50, 50],
-                                      pen=pg.mkPen((255, 128, 0), width=1.5), movable=False, rotatable=False, resizable=False)
-        self._roi3_rect = pg.RectROI([0, 0], [50, 50],
-                                      pen=pg.mkPen((0, 220, 120), width=1.5), movable=False, rotatable=False, resizable=False)
-        self._roi4_rect = pg.RectROI([0, 0], [50, 50],
-                                      pen=pg.mkPen((80, 180, 255), width=1.5), movable=False, rotatable=False, resizable=False)
+        self._roi1_rect = pg.RectROI([0, 0], [50, 50], pen=pg.mkPen("r", width=1.5),
+                                     movable=False, rotatable=False, resizable=False)
+        self._roi2_rect = pg.RectROI([0, 0], [50, 50], pen=pg.mkPen((255, 128, 0), width=1.5),
+                                     movable=False, rotatable=False, resizable=False)
+        self._roi3_rect = pg.RectROI([0, 0], [50, 50], pen=pg.mkPen((0, 220, 120), width=1.5),
+                                     movable=False, rotatable=False, resizable=False)
+        self._roi4_rect = pg.RectROI([0, 0], [50, 50], pen=pg.mkPen((80, 180, 255), width=1.5),
+                                     movable=False, rotatable=False, resizable=False)
         self._t3_fth_plot.addItem(self._roi1_rect)
         self._t3_fth_plot.addItem(self._roi2_rect)
         self._t3_fth_plot.addItem(self._roi3_rect)
@@ -956,6 +970,7 @@ class FTHReconstructionTool(QMainWindow):
         self._t4_roi_size.valueChanged.connect(self._update_t4_display)
         fl_sel.addRow("ROI size (px):", self._t4_roi_size)
         # Sync with t3 slider -use blockSignals to prevent infinite recursion
+
         def _on_t4_roi_slider(v):
             self._roi_size = v
             self._t4_roi_size.blockSignals(True)
@@ -979,6 +994,7 @@ class FTHReconstructionTool(QMainWindow):
         self._t4_rs_slider = QSlider(Qt.Orientation.Horizontal)
         self._t4_rs_slider.setRange(1, 400); self._t4_rs_slider.setValue(100)
         self._t4_rs_slider.valueChanged.connect(self._update_t4_display)
+        self._t4_rs_slider.sliderMoved.connect(self._mark_t4_sliders_touched)
         self._t4_rs_entry = QLineEdit("1.0"); self._t4_rs_entry.setFixedWidth(54)
         self._t4_rs_entry.returnPressed.connect(self._on_t4_rs_text)
         rs4_row = QHBoxLayout()
@@ -989,6 +1005,9 @@ class FTHReconstructionTool(QMainWindow):
         self._t4_ph_slider = QSlider(Qt.Orientation.Horizontal)
         self._t4_ph_slider.setRange(-314, 314); self._t4_ph_slider.setValue(0)
         self._t4_ph_slider.valueChanged.connect(self._update_t4_display)
+        # sliderMoved fires for a drag only, so inheriting a value in code does
+        # not count as the user having taken the page's sliders over.
+        self._t4_ph_slider.sliderMoved.connect(self._mark_t4_sliders_touched)
         self._t4_ph_entry = QLineEdit("0.00"); self._t4_ph_entry.setFixedWidth(54)
         self._t4_ph_entry.returnPressed.connect(self._on_t4_ph_text)
         ph4_row = QHBoxLayout()
@@ -1028,21 +1047,29 @@ class FTHReconstructionTool(QMainWindow):
         g_exp = QGroupBox("Save && Export")
         fl_exp = QFormLayout(g_exp)
         self._exp_target_combo = QComboBox()
-        self._exp_target_combo.addItems(["Real", "Imag.", "Phase", "Abs."])
+        self._exp_target_combo.addItems(["Real", "Imag.", "Phase", "Abs.", "Full"])
+        self._exp_target_combo.setToolTip(
+            "Which component Copy and Export act on. 'Full' means all four."
+        )
         fl_exp.addRow("Target:", self._exp_target_combo)
 
+        # Both buttons follow the Target: a single component, or all four when
+        # Target is "Full" — Copy then yields one composite picture, Export four files.
         btn_row = QHBoxLayout()
         self._btn_copy_component = QPushButton("Copy")
+        self._btn_copy_component.setToolTip(
+            "Copy the target to the clipboard ('Full' copies the four panels as one image)"
+        )
         self._btn_copy_component.clicked.connect(self._copy_selected_component_jpeg)
-        self._btn_save_component = QPushButton("Save")
-        self._btn_save_component.clicked.connect(self._save_selected_component)
         btn_row.addWidget(self._btn_copy_component)
-        btn_row.addWidget(self._btn_save_component)
-        fl_exp.addRow(btn_row)
 
-        self._btn_save_all_components = QPushButton("Save All")
-        self._btn_save_all_components.clicked.connect(self._save_all_components)
-        fl_exp.addRow(self._btn_save_all_components)
+        self._btn_export_component = QPushButton("Export")
+        self._btn_export_component.setToolTip(
+            "Save the target as an image ('Full' writes one file per component)"
+        )
+        self._btn_export_component.clicked.connect(self._export_selected_component)
+        btn_row.addWidget(self._btn_export_component)
+        fl_exp.addRow(btn_row)
         lay.addWidget(g_exp)
 
         splitter.addWidget(scroll)
@@ -1182,7 +1209,7 @@ class FTHReconstructionTool(QMainWindow):
         self._load_data()
 
     def _on_load_finished(self, cl: np.ndarray, cr: np.ndarray,
-                           dark: Optional[np.ndarray]) -> None:
+                          dark: Optional[np.ndarray]) -> None:
         sender = self.sender()
         if sender is not self._worker:
             return
@@ -1306,7 +1333,9 @@ class FTHReconstructionTool(QMainWindow):
             "roi_size": int(self._roi_size),
             "roi_offsets": roi_offsets,
         }
-        self._btn_lock_params.setStyleSheet("QPushButton { background-color: #c9302c; color: white; font-weight: 600; }")
+        self._btn_lock_params.setStyleSheet(
+            "QPushButton { background-color: #c9302c; color: white; font-weight: 600; }"
+        )
         self._set_status("Current params locked.")
 
     def _apply_locked_params_to_current_data(self) -> None:
@@ -1394,7 +1423,18 @@ class FTHReconstructionTool(QMainWindow):
         self._update_t3_holo_display()
         self._update_t3_fth_display()
         self._update_t4_display()
+        # Run Locked exists to get from a new file to a reconstruction in one
+        # click; the alignment and filter pages have just been set from the
+        # locked parameters, so there is nothing left to do on them.
+        self._show_reconstruction_tab()
         self._set_status("Locked params applied to loaded data.")
+
+    def _show_reconstruction_tab(self) -> None:
+        """Bring the Reconstruction page to the front."""
+        for index in range(self._tabs.count()):
+            if self._tabs.tabText(index) == "Reconstruction":
+                self._tabs.setCurrentIndex(index)
+                return
 
     def _compute_centered_hologram(self) -> None:
         """Crop CL/CR to the largest centered square, compute X0/Y0/Xmat/Ymat."""
@@ -1681,7 +1721,7 @@ class FTHReconstructionTool(QMainWindow):
         ymid = float(ymid)   # center in current centerd-image view coordinates (col)
         L = max(self._Nx, self._Ny) * 0.7
         for spin, line in [(self._phi1_spin, self._t1_slit1_line),
-                            (self._phi2_spin, self._t1_slit2_line)]:
+                           (self._phi2_spin, self._t1_slit2_line)]:
             phi_rad = np.deg2rad(spin.value())
             # phi=0 ->horizontal slit ->horizontal guide line (dx=L, dy=0)
             dx = np.cos(phi_rad) * L
@@ -1732,7 +1772,8 @@ class FTHReconstructionTool(QMainWindow):
         if self._CL is None:
             return
         self._set_status(
-            f"Beamstop center pending: row={self._bs_cx.value()}, col={self._bs_cy.value()}. Click 'Apply BS Center' to apply."
+            f"Beamstop center pending: row={self._bs_cx.value()}, col={self._bs_cy.value()}. "
+            "Click 'Apply BS Center' to apply."
         )
 
     def _on_apply_bs_center_clicked(self) -> None:
@@ -2092,12 +2133,16 @@ class FTHReconstructionTool(QMainWindow):
         act_sy = QAction(f"Scale Y... ({eff['sy']:.4g})", menu)
 
         def _set_scale_x():
-            v, ok = QInputDialog.getDouble(self, "Set Scale X", f"{panel.capitalize()} Scale X:", float(eff["sx"]), 1e-6, 1e6, 6)
+            v, ok = QInputDialog.getDouble(
+                self, "Set Scale X", f"{panel.capitalize()} Scale X:", float(eff["sx"]), 1e-6, 1e6, 6
+            )
             if ok:
                 self._t3_set_panel_override(panel, "sx", float(v))
 
         def _set_scale_y():
-            v, ok = QInputDialog.getDouble(self, "Set Scale Y", f"{panel.capitalize()} Scale Y:", float(eff["sy"]), 1e-6, 1e6, 6)
+            v, ok = QInputDialog.getDouble(
+                self, "Set Scale Y", f"{panel.capitalize()} Scale Y:", float(eff["sy"]), 1e-6, 1e6, 6
+            )
             if ok:
                 self._t3_set_panel_override(panel, "sy", float(v))
 
@@ -2355,6 +2400,9 @@ class FTHReconstructionTool(QMainWindow):
             self._FTH_S1 = None
             self._FTH_S2 = None
             self._t4_autoleveled_key = None
+            # A fresh reconstruction: the Reconstruction page follows the
+            # Filter & FTH page again until it is adjusted on its own.
+            self._t4_sliders_touched = False
             self._update_t3_holo_display()
             mode_label = "single-file" if self._single_dataset_mode else "CL/CR"
             self._set_status(
@@ -2388,6 +2436,9 @@ class FTHReconstructionTool(QMainWindow):
             self._rs_scale_slider.setValue(100)
             self._rs_scale = self._rs_scale_base
             self._t4_autoleveled_key = None
+            # A fresh reconstruction: the Reconstruction page follows the
+            # Filter & FTH page again until it is adjusted on its own.
+            self._t4_sliders_touched = False
 
             self._update_t3_fth_display()
             self._set_status("FTH computed.")
@@ -3046,7 +3097,10 @@ class FTHReconstructionTool(QMainWindow):
         }
 
     def _selected_export_component_name(self) -> str:
+        """The chosen component, or ``"full"`` for all four at once."""
         txt = self._exp_target_combo.currentText().strip().lower()
+        if txt.startswith("full"):
+            return "full"
         if txt.startswith("real"):
             return "real"
         if txt.startswith("imag"):
@@ -3054,6 +3108,36 @@ class FTHReconstructionTool(QMainWindow):
         if txt.startswith("phase"):
             return "phase"
         return "abs"
+
+    def _composite_components_qimage(self, components: dict[str, np.ndarray]) -> Optional[QImage]:
+        """Tile the four components into one 2x2 picture, in display order.
+
+        Used by Copy when the target is "Full": the clipboard takes a single
+        image, so the four panels are laid out the way they are on screen.
+        """
+        order = ("real", "imag", "phase", "abs")
+        tiles = []
+        for name in order:
+            arr = components.get(name)
+            if arr is None:
+                return None
+            tiles.append(self._component_to_qimage(arr, self._component_display_levels(name), name))
+
+        gap = 4
+        cell_w = max(img.width() for img in tiles)
+        cell_h = max(img.height() for img in tiles)
+        # RGB, since the tiles now carry their colormaps.
+        sheet = QImage(cell_w * 2 + gap, cell_h * 2 + gap, QImage.Format.Format_RGB888)
+        sheet.fill(0)
+
+        painter = QPainter(sheet)
+        try:
+            for idx, img in enumerate(tiles):
+                col, row = idx % 2, idx // 2
+                painter.drawImage(col * (cell_w + gap), row * (cell_h + gap), img)
+        finally:
+            painter.end()
+        return sheet
 
     @staticmethod
     def _scan_head_and_number(file_path: str) -> tuple[str, str]:
@@ -3090,33 +3174,53 @@ class FTHReconstructionTool(QMainWindow):
             return -float(np.pi), float(np.pi)
         return 0.0, float(rs)
 
-    @staticmethod
-    def _component_to_qimage(arr: np.ndarray, levels: tuple[float, float]) -> QImage:
-        """Convert array to grayscale QImage using provided levels."""
-        lo, hi = float(levels[0]), float(levels[1])
-        if not np.isfinite(lo):
-            lo = float(np.nanmin(arr))
-        if not np.isfinite(hi):
-            hi = float(np.nanmax(arr))
-        if hi <= lo:
-            hi = lo + 1e-12
-        norm = np.clip((arr.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
-        img_u8 = (norm * 255.0).astype(np.uint8)
-        h, w = img_u8.shape
-        qimg = QImage(img_u8.data, w, h, img_u8.strides[0], QImage.Format.Format_Grayscale8)
-        return qimg.copy()
+    # The reconstruction panels, in the order _get_t4_export_components lists
+    # them, so a component can find the panel whose settings it is shown with.
+    _T4_PANEL_ORDER = ("real", "imag", "phase", "abs")
+
+    def _component_display_settings(self, name: str) -> dict:
+        """The panel settings the named component is displayed with."""
+        try:
+            panel_idx = self._T4_PANEL_ORDER.index(str(name).lower())
+        except ValueError:
+            return self._t4_effective_display(0)
+        return self._t4_effective_display(panel_idx)
+
+    def _component_to_qimage(self, arr: np.ndarray, levels: tuple[float, float],
+                             name: str = "") -> QImage:
+        """Render a component the way its panel shows it — colormap included.
+
+        Saving and copying used to produce grey pictures whatever was on
+        screen, which threw away the one setting that makes a phase map
+        readable at all.
+        """
+        eff = self._component_display_settings(name)
+        mode = str(eff["scale"])
+        return _array_to_qimage(
+            self._transform_for_display(np.asarray(arr, dtype=np.float32), mode),
+            self._transform_levels(levels, mode),
+            colormap=str(eff["cmap"]),
+            invert=bool(eff["invert"]),
+        )
 
     def _copy_selected_component_jpeg(self) -> None:
-        """Copy selected reconstructed component as JPEG image to clipboard."""
+        """Copy the target to the clipboard; "Full" copies one 2x2 composite."""
         components = self._get_t4_export_components()
         if components is None:
             return
         name = self._selected_export_component_name()
-        arr = components.get(name)
-        if arr is None:
-            self._set_status("Invalid export component selected.", error=True)
-            return
-        qimg = self._component_to_qimage(arr, self._component_display_levels(name))
+
+        if name == "full":
+            qimg = self._composite_components_qimage(components)
+            if qimg is None:
+                self._set_status("Could not build the composite image.", error=True)
+                return
+        else:
+            arr = components.get(name)
+            if arr is None:
+                self._set_status("Invalid export component selected.", error=True)
+                return
+            qimg = self._component_to_qimage(arr, self._component_display_levels(name), name)
         try:
             ba = QByteArray()
             buf = QBuffer(ba)
@@ -3143,6 +3247,13 @@ class FTHReconstructionTool(QMainWindow):
             self._set_status(f"Copy failed: {exc}", error=True)
             logging.exception("FTH copy JPEG")
 
+    def _export_selected_component(self) -> None:
+        """Export the target: one file, or four files when the target is "Full"."""
+        if self._selected_export_component_name() == "full":
+            self._save_all_components()
+        else:
+            self._save_selected_component()
+
     def _save_selected_component(self) -> None:
         """Save selected reconstructed component. Format is chosen in dialog."""
         components = self._get_t4_export_components()
@@ -3154,48 +3265,55 @@ class FTHReconstructionTool(QMainWindow):
             self._set_status("Invalid export component selected.", error=True)
             return
 
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected = QFileDialog.getSaveFileName(
             self,
             f"Save {name}",
-            f"{self._current_export_name_base()}_{name}.png",
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+            suggested_save_path(self._current_export_name_base(), name, ".png"),
+            _IMAGE_SAVE_FILTERS,
         )
         if not path:
             return
+        remember_save_directory(path)
         p = pathlib.Path(path)
+        if not p.suffix:
+            p = p.with_suffix(_extension_for_filter(selected))
         try:
-            qimg = self._component_to_qimage(arr, self._component_display_levels(name))
-            ok = qimg.save(str(p))
-            if not ok:
-                raise RuntimeError("Image save failed")
+            self._write_component(arr, name, p)
             self._set_status(f"Saved image: {p.name}")
         except Exception as exc:
             self._set_status(f"Save failed: {exc}", error=True)
             logging.exception("FTH save selected component")
+
+    def _write_component(self, arr: np.ndarray, name: str, path: pathlib.Path) -> None:
+        """Write one component: values to a TIFF, the coloured picture otherwise."""
+        if path.suffix.lower() in _RAW_TIFF_SUFFIXES:
+            if not DataExporter.export_raw_tiff(np.asarray(arr), path):
+                raise RuntimeError("Raw TIFF save failed")
+            return
+        qimg = self._component_to_qimage(arr, self._component_display_levels(name), name)
+        if not qimg.save(str(path)):
+            raise RuntimeError(f"Image save failed for {path.name}")
 
     def _save_all_components(self) -> None:
         """Save all four reconstructed components. Format is chosen in dialog."""
         components = self._get_t4_export_components()
         if components is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected = QFileDialog.getSaveFileName(
             self,
             "Save all reconstruction components",
-            f"{self._current_export_name_base()}.png",
-            "Image Files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+            suggested_save_path(self._current_export_name_base(), extension=".png"),
+            _IMAGE_SAVE_FILTERS,
         )
         if not path:
             return
+        remember_save_directory(path)
         p = pathlib.Path(path)
-        ext = p.suffix.lower()
+        ext = p.suffix.lower() or _extension_for_filter(selected)
         try:
             stem = p.with_suffix("")
             for n, a in components.items():
-                qimg = self._component_to_qimage(a, self._component_display_levels(n))
-                out_path = pathlib.Path(f"{stem}_{n}{ext}")
-                ok = qimg.save(str(out_path))
-                if not ok:
-                    raise RuntimeError(f"Image save failed for {out_path.name}")
+                self._write_component(a, n, pathlib.Path(f"{stem}_{n}{ext}"))
             self._set_status(f"Saved all images: {stem.name}_*.{ext.lstrip('.')}")
         except Exception as exc:
             self._set_status(f"Save all failed: {exc}", error=True)
@@ -3216,7 +3334,31 @@ class FTHReconstructionTool(QMainWindow):
             self._update_t3_holo_display()
             self._update_t3_fth_display()
         elif idx == 2:  # Reconstruction
+            self._inherit_t3_display_sliders()
             self._update_t4_display()
+
+    def _mark_t4_sliders_touched(self, *_args) -> None:
+        """The user dragged a Reconstruction slider; it is theirs from now on."""
+        self._t4_sliders_touched = True
+
+    def _inherit_t3_display_sliders(self) -> None:
+        """Carry the Filter & FTH phase / FT amplitude over to Reconstruction.
+
+        They are the same two quantities on both pages, so arriving at the
+        reconstruction with them back at their defaults threw away the tuning
+        just done on the hologram. Once they have been moved here, though, they
+        are this page's own — inheriting again would undo that work every time
+        the user looked back at the previous tab.
+        """
+        if self._t4_sliders_touched:
+            return
+        for source, target in (
+            (self._phase_scale_slider, self._t4_ph_slider),
+            (self._rs_scale_slider, self._t4_rs_slider),
+        ):
+            blocked = target.blockSignals(True)
+            target.setValue(source.value())
+            target.blockSignals(blocked)
 
     # ==================================================================
     # Utilities
@@ -3239,7 +3381,3 @@ class FTHReconstructionTool(QMainWindow):
             self._worker.requestInterruption()
             self._worker.wait(500)
         super().closeEvent(event)
-
-
-
-

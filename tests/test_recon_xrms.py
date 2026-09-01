@@ -1,7 +1,6 @@
 """Tests for the XRMS Analyze pure backend (profiles + curve_fit)."""
 
 import numpy as np
-import pytest
 
 from src.recon import curve_fit as cf
 from src.recon import profiles as pr

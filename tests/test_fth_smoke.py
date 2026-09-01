@@ -39,6 +39,75 @@ def _prepare_tool_with_arrays(qapp, n: int = 128) -> FTHReconstructionTool:
     return tool
 
 
+def _select_reconstruction_tab(tool):
+    """What switching to the last page does, without a real click."""
+    tool._tabs.setCurrentIndex(2)
+    tool._on_tab_changed(2)
+
+
+def test_reconstruction_inherits_the_phase_and_amplitude_just_tuned(qapp):
+    """They are the same two quantities on both pages; arriving with them back
+    at their defaults threw away the tuning done on the hologram."""
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._phase_scale_slider.setValue(120)
+    tool._rs_scale_slider.setValue(250)
+
+    _select_reconstruction_tab(tool)
+
+    assert tool._t4_ph_slider.value() == 120
+    assert tool._t4_rs_slider.value() == 250
+
+
+def test_a_reconstruction_slider_the_user_moved_is_not_overwritten(qapp):
+    """Inheriting again would undo that work on every visit to the page."""
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._phase_scale_slider.setValue(120)
+    _select_reconstruction_tab(tool)
+
+    tool._t4_ph_slider.setValue(-200)
+    tool._mark_t4_sliders_touched()      # what a drag emits
+
+    tool._tabs.setCurrentIndex(1)
+    _select_reconstruction_tab(tool)
+
+    assert tool._t4_ph_slider.value() == -200
+
+
+def test_inheriting_does_not_count_as_the_user_taking_over(qapp):
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._phase_scale_slider.setValue(90)
+
+    _select_reconstruction_tab(tool)
+
+    assert tool._t4_sliders_touched is False
+    tool._phase_scale_slider.setValue(-90)
+    _select_reconstruction_tab(tool)
+    assert tool._t4_ph_slider.value() == -90, "still following the previous page"
+
+
+def test_run_locked_lands_on_the_reconstruction_page(qapp):
+    """Run Locked is one click from a new file to a reconstruction, so it must
+    not stop on the alignment page it has just finished setting up."""
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._lock_current_params()
+    tool._tabs.setCurrentIndex(0)
+
+    tool._apply_locked_params_to_current_data()
+
+    index = tool._tabs.currentIndex()
+    assert tool._tabs.tabText(index) == "Reconstruction"
+
+
+def test_the_other_pages_are_still_reachable(qapp):
+    """Switching pages is a convenience, not a lock."""
+    tool = _prepare_tool_with_arrays(qapp)
+    tool._lock_current_params()
+    tool._apply_locked_params_to_current_data()
+
+    tool._tabs.setCurrentIndex(0)
+    assert tool._tabs.tabText(tool._tabs.currentIndex()) == "Alignment"
+
+
 def test_smoke_load_cl_cr_in_background(qapp, tmp_path: Path):
     cl_path = tmp_path / "cl.h5"
     cr_path = tmp_path / "cr.h5"

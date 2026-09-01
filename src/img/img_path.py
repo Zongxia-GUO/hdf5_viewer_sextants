@@ -1,4 +1,4 @@
-﻿"""Image path utils."""
+"""Image path utils."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -21,18 +21,35 @@ import sys
 
 
 def img_path() -> pathlib.Path:
-    """
-    Get path to img directory
+    """Get path to img directory.
+
+    Three layouts, because PyInstaller has two and the source tree is a third:
+
+    * ``--onedir``  — the data sits beside the exe in ``_internal/img``
+    * ``--onefile`` — the exe unpacks to a temp directory named by
+      ``sys._MEIPASS``, and the data is at ``img`` directly under it; there is
+      no ``_internal`` there at all
+    * running from source — this file's own directory
+
+    Only the first was handled, so every icon in a one-file build resolved to a
+    path that does not exist. The candidates are tried in order and the first
+    that is really there wins, which also survives PyInstaller changing its
+    layout again.
     """
     if getattr(sys, "frozen", False):
-        path = pathlib.Path(sys.executable).parent
-        path = pathlib.Path(path, "_internal", "img")
+        roots = []
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            roots.append(pathlib.Path(meipass))
+        roots.append(pathlib.Path(sys.executable).parent)
+
+        candidates = [pathlib.Path(root, *parts)
+                      for root in roots
+                      for parts in (("_internal", "img"), ("img",))]
+        path = next((c for c in candidates if c.is_dir()), candidates[0])
     else:
         path = pathlib.Path(__file__).absolute().parent
 
     logging.info(f"Image path '{path}'")
 
     return path
-
-
-

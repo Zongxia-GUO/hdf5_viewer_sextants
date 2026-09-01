@@ -1,4 +1,4 @@
-﻿"""About Page rendered with html/about_page.html text."""
+"""About Page rendered with html/about_page.html text."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -80,6 +80,3 @@ class AboutPage(QWidget):
             "and are licensed under a "
             '<a href="https://www.streamlinehq.com/license-freeLinkware">Link-ware License</a>.'
         )
-
-
-

@@ -1,4 +1,4 @@
-﻿"""HDF5 File validation and detection utilities."""
+"""HDF5 File validation and detection utilities."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -99,6 +99,3 @@ def get_file_filter_string() -> str:
         f"Text/CSV ({text_extensions});;"
         "All Files (*.*)"
     )
-
-
-

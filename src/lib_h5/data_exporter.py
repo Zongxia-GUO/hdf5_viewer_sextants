@@ -1,4 +1,4 @@
-﻿"""Data export utilities for HDF5 datasets."""
+"""Data export utilities for HDF5 datasets."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -198,6 +198,43 @@ class DataExporter:
             return False
 
     @staticmethod
+    def export_raw_tiff(data: npt.NDArray, file_path: pathlib.Path) -> bool:
+        """Write the values themselves to a TIFF: no colormap, no rescaling.
+
+        A TIFF from this application is *data* — something to reopen in ImageJ
+        and measure. PNG and JPEG are the pictures, and carry the colormap and
+        any display geometry. Keeping the two apart is what makes a saved TIFF
+        worth trusting: the older writer normalised floats to 16 bits, so the
+        numbers in the file were no longer the numbers that were measured.
+
+        Integer data keeps its dtype; anything else is written as 32-bit float,
+        which TIFF stores exactly.
+        """
+        try:
+            from PIL import Image
+
+            values = np.asarray(data)
+            if values.ndim > 2:
+                values = np.squeeze(values)
+            if values.ndim != 2:
+                logging.error("Raw TIFF needs 2D data, got shape %s", values.shape)
+                return False
+
+            if values.dtype in (np.uint8, np.uint16, np.int16, np.int32):
+                img = Image.fromarray(values)
+            else:
+                img = Image.fromarray(values.astype(np.float32), mode="F")
+            img.save(file_path, "TIFF")
+            logging.info("Wrote raw TIFF (%s): %s", values.dtype, file_path)
+            return True
+        except ImportError:
+            logging.error("PIL/Pillow is required for image export.")
+            return False
+        except Exception as exc:
+            logging.error("Failed to write raw TIFF: %s", exc)
+            return False
+
+    @staticmethod
     def export_image_to_tiff(data: npt.NDArray, file_path: pathlib.Path) -> bool:
         """
         Export image data to TIFF file.
@@ -340,8 +377,13 @@ class DataExporter:
         return data
 
     @staticmethod
-    def _format_csv_value(value: Any) -> str:
-        """Format a value for CSV export."""
+    def _format_csv_value(value: Any, decimal: str = ".") -> str:
+        """Format a value for CSV/TXT export.
+
+        :param value: the cell value.
+        :param decimal: decimal mark to emit; pass ``","`` for the csv2 dialect
+            so European Excel reads the cell as a number instead of text.
+        """
         if isinstance(value, bytes):
             try:
                 return value.decode("utf-8")
@@ -361,7 +403,8 @@ class DataExporter:
                 elif np.isinf(value):
                     return "Inf" if value > 0 else "-Inf"
                 else:
-                    return f"{value:.10g}"
+                    text = f"{value:.10g}"
+                    return text if decimal == "." else text.replace(".", decimal)
 
             elif isinstance(value, (np.integer, int)):
                 return str(value)
@@ -439,6 +482,3 @@ class DataExporter:
             return ".png"
         else:
             return ".txt"
-
-
-

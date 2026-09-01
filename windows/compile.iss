@@ -5,13 +5,15 @@
 ; Version comes from src/version.py via build.py (ISCC /DMyAppVersion=...).
 ; This fallback is only used when compiling the .iss directly.
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.2.0"
 #endif
 #define MyAppPublisher "Dennis L�nard"
 #define MyAppExeName "HDF5-Viewer.exe"
 #define MyAppAssocName "HDF5 File"
 #define MyAppAssocExt ".h5"
 #define MyAppAssocKey StringChange(MyAppAssocName, " ", "") + MyAppAssocExt
+; Keep in step with APP_USER_MODEL_ID in main.py.
+#define MyAppUserModelID "Soleil.SEXTANTS.HDF5Viewer"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -57,8 +59,12 @@ Root: HKA; Subkey: "Software\Classes\{#MyAppAssocKey}\shell\open\command"; Value
 Root: HKA; Subkey: "Software\Classes\Applications\{#MyAppExeName}\SupportedTypes"; ValueType: string; ValueName: ".myp"; ValueData: ""
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; AppUserModelID must match APP_USER_MODEL_ID in main.py. The app declares that
+; identity to Windows; if no shortcut carries it, the shell has nothing to take
+; the taskbar icon from on the very first run and shows a placeholder until it
+; has scraped and cached the window icon.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppUserModelID}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; AppUserModelID: "{#MyAppUserModelID}"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

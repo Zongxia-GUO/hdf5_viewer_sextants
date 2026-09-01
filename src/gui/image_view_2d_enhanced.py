@@ -1,4 +1,4 @@
-﻿"""Enhanced 2D Image Viewer with colormap and scale controls."""
+"""Enhanced 2D Image Viewer with colormap and scale controls."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -22,8 +22,8 @@ from typing import Any, Optional
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal, QRectF, QBuffer, QByteArray, QMimeData, QSize, QSettings
-from PyQt6.QtGui import QIcon, QImage, QTransform
+from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal, QRectF, QBuffer, QByteArray, QMimeData
+from PyQt6.QtGui import QImage, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,9 +40,44 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.img.img_path import img_path
+from src.gui._shared import quick_icon_button
+from src.gui.plot_context_menu import attach_plot_menu
+from src.gui.export_naming import (
+    export_stem,
+    remember_save_directory,
+    suggested_save_path,
+)
+from src.lib_h5.data_exporter import DataExporter
 
 IMAGE_SAVE_FILTER = "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;TIFF Image (*.tif *.tiff)"
+
+# Magnitude data reads best on one hue running light to dark. Data that spans
+# zero — a difference, an asymmetry — needs two hues meeting at a neutral
+# midpoint, or the sign of a pixel cannot be read off the picture at all.
+SEQUENTIAL_COLORMAP = "viridis"
+DIVERGING_COLORMAP = "CET-D9"
+
+# Below this share of the (finite) pixels on the smaller side, the negatives
+# are noise around a positive signal rather than a real second direction.
+DIVERGING_MIN_SHARE = 0.01
+
+
+def is_diverging(data: np.ndarray) -> bool:
+    """True when the data genuinely runs both sides of zero.
+
+    A handful of negative pixels in a detector frame is read-out noise, not a
+    diverging quantity, so a share of the data has to sit on each side before
+    the colormap changes under the user.
+    """
+    values = np.asarray(data)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return False
+    negative = int(np.count_nonzero(finite < 0))
+    positive = int(np.count_nonzero(finite > 0))
+    if not negative or not positive:
+        return False
+    return min(negative, positive) / finite.size >= DIVERGING_MIN_SHARE
 
 
 class SceneEventFilter(QObject):
@@ -77,9 +112,13 @@ class ImageView2DEnhanced(QWidget):
         super().__init__(parent)
 
         self.data = None  # Store original data (2D slice)
+        self.source_dataset_key: str | None = None  # "<file>::<dataset>", for export names
         self.data_3d = None  # Store original 3D data if applicable
         self.current_slice_index = 0  # Current slice index for 3D data
         self.current_slice_axis = 0  # Current axis used for 3D slicing
+        # Whether this viewer offers the axis choice at all; see
+        # set_axis_choice_visible.
+        self._axis_choice_allowed = True
         self._lazy_shape: tuple[int, ...] | None = None
         self.current_transform = "linear"  # Current scale mode
         self.global_min = None  # Global min for locked levels
@@ -155,20 +194,14 @@ class ImageView2DEnhanced(QWidget):
         control_layout = QHBoxLayout()
         control_layout.setSpacing(5)  # Reduce spacing between widgets
 
-        self.btn_copy_image = QPushButton()
-        self.btn_copy_image.setIcon(QIcon(str(pathlib.Path(img_path(), "copy.ico"))))
-        self.btn_copy_image.setIconSize(QSize(16, 16))
-        self.btn_copy_image.setFixedSize(28, 24)
-        self.btn_copy_image.setToolTip("Copy current image data with the active colormap")
-        self.btn_copy_image.clicked.connect(self.copy_colormapped_image_to_clipboard)
+        self.btn_copy_image = quick_icon_button(
+            "copy.ico", "Quick copy: put the image, with its colormap, on the clipboard"
+        )
+        self.btn_copy_image.clicked.connect(self.quick_copy)
         control_layout.addWidget(self.btn_copy_image)
 
-        self.btn_save_image = QPushButton()
-        self.btn_save_image.setIcon(QIcon(str(pathlib.Path(img_path(), "save.ico"))))
-        self.btn_save_image.setIconSize(QSize(16, 16))
-        self.btn_save_image.setFixedSize(28, 24)
-        self.btn_save_image.setToolTip("Save/export current dataset")
-        self.btn_save_image.clicked.connect(self._request_main_export)
+        self.btn_save_image = quick_icon_button("save.ico", "Quick export: save the image as displayed")
+        self.btn_save_image.clicked.connect(self.quick_export)
         control_layout.addWidget(self.btn_save_image)
 
         self.btn_q_calibration = QPushButton("Q")
@@ -197,10 +230,13 @@ class ImageView2DEnhanced(QWidget):
             "CET-D1",      # Blue-white-red diverging
             "CET-D9",      # Blue-red diverging
         ])
-        self.combo_colormap.setCurrentText("viridis")
+        self.combo_colormap.setCurrentText(SEQUENTIAL_COLORMAP)
         self.combo_colormap.setMinimumWidth(0)  # Allow shrinking
         self.combo_colormap.setMaximumWidth(100)  # Reduced from 120
         self.combo_colormap.currentTextChanged.connect(self._update_colormap)
+        # `activated` fires only for a real click, so setting the combo in code
+        # does not count as the user having made a choice.
+        self.combo_colormap.activated.connect(self._on_colormap_chosen)
         control_layout.addWidget(self.combo_colormap)
 
         # Invert colormap checkbox
@@ -399,6 +435,16 @@ class ImageView2DEnhanced(QWidget):
             self.roi_plot_widget.getAxis(axis).setPen(axis_pen)
             self.roi_plot_widget.getAxis(axis).setTextPen(axis_pen)
 
+        # The Line / Rect / Sector profile had no way out of the viewer: the
+        # image above it has Copy and Save, the curve computed from it had
+        # nothing, and pyqtgraph's own Export ignores the application's naming
+        # and dialect rules.
+        attach_plot_menu(
+            self.roi_plot_widget,
+            on_export=self.export_roi_profile,
+            on_plot=self.plot_roi_profile,
+        )
+
         self.roi_plot_widget.hide()
 
         # Create a vertical splitter for image and ROI plot
@@ -497,6 +543,8 @@ class ImageView2DEnhanced(QWidget):
         self._slice_loader = None
         self._slice_cache = {}
 
+        self._match_colormap_to_data()
+
         # Apply current transform and display
         self._update_display()
 
@@ -538,7 +586,10 @@ class ImageView2DEnhanced(QWidget):
         self._slice_loader = loader
         self._slice_cache = {(0, 0): self._to_float32(first_slice)}  # pre-cache axis 0, slice 0
         self.data_3d = None                     # not fully loaded
-        self._lazy_shape = tuple(full_shape) if full_shape is not None else (int(total_slices),) + tuple(first_slice.shape)
+        self._lazy_shape = (
+            tuple(full_shape) if full_shape is not None
+            else (int(total_slices),) + tuple(first_slice.shape)
+        )
         self.global_min = None
         self.global_max = None
         self.locked_levels = None
@@ -555,23 +606,41 @@ class ImageView2DEnhanced(QWidget):
         self._update_display()
 
     def _configure_slice_axis_combo(self, shape: tuple[int, ...]) -> None:
-        """Populate the X/Y/Z slice-axis selector for a 3D dataset shape."""
-        axis_names = ["X", "Y", "Z"]
+        """Populate the slice-axis selector for a 3D dataset shape.
+
+        Numbered rather than X/Y/Z: see :func:`src.gui.batch_export.axis_label`.
+        """
+        from src.gui.batch_export import axis_label
+
         max_axes = min(3, len(shape))
         previous_axis = min(self.current_slice_axis, max_axes - 1)
 
         self.combo_slice_axis.blockSignals(True)
         self.combo_slice_axis.clear()
         for axis in range(max_axes):
-            self.combo_slice_axis.addItem(f"{axis_names[axis]} ({shape[axis]})", axis)
+            self.combo_slice_axis.addItem(axis_label(axis, shape[axis]), axis)
         self.combo_slice_axis.setCurrentIndex(previous_axis)
         self.combo_slice_axis.blockSignals(False)
         self.current_slice_axis = previous_axis
 
+    def set_axis_choice_visible(self, visible: bool) -> None:
+        """Show or hide the slice-axis selector, keeping the slider.
+
+        Hidden where the axis has already been decided upstream — the
+        calculator picks it per operand and reorients the result to match — so
+        that there are not two controls for one choice, one of which would only
+        re-cut a result whose orientation is already settled.
+        """
+        self._axis_choice_allowed = bool(visible)
+        showing = self.combo_slice_axis.isVisibleTo(self) or self.slider_slice.isVisibleTo(self)
+        self.label_slice_axis.setVisible(bool(visible) and showing)
+        self.combo_slice_axis.setVisible(bool(visible) and showing)
+
     def _show_slice_controls(self) -> None:
         """Show controls used for 3D slice browsing."""
-        self.label_slice_axis.show()
-        self.combo_slice_axis.show()
+        if getattr(self, "_axis_choice_allowed", True):
+            self.label_slice_axis.show()
+            self.combo_slice_axis.show()
         self.label_slice.show()
         self.slider_slice.show()
         self.label_slice_info.show()
@@ -613,6 +682,27 @@ class ImageView2DEnhanced(QWidget):
             if int(axis) != 0:
                 raise
             return self._slice_loader(int(index))
+
+    def _on_colormap_chosen(self, _index: int) -> None:
+        """The user picked a colormap; stop choosing one for them."""
+        self._colormap_is_automatic = False
+
+    def _match_colormap_to_data(self) -> None:
+        """Point the colormap at the kind of data now loaded.
+
+        Only while the choice is still ours: once the user has picked one, the
+        colormap is their decision and must survive the next dataset.
+        """
+        if not getattr(self, "_colormap_is_automatic", True) or self.data is None:
+            return
+
+        wanted = DIVERGING_COLORMAP if is_diverging(self.data) else SEQUENTIAL_COLORMAP
+        if self.combo_colormap.currentText() == wanted:
+            return
+        blocked = self.combo_colormap.blockSignals(True)
+        self.combo_colormap.setCurrentText(wanted)
+        self.combo_colormap.blockSignals(blocked)
+        self._update_colormap()
 
     def _update_display(self) -> None:
         """Update the display with current transform."""
@@ -746,21 +836,27 @@ class ImageView2DEnhanced(QWidget):
             return data
 
     def export_colormapped_image(self, file_path: str | pathlib.Path, data: np.ndarray | None = None) -> bool:
-        """Export the current 2D image using the active colormap and levels."""
+        """Export the current 2D image: a picture in PNG/JPEG, values in TIFF."""
         try:
             from PIL import Image
+
+            export_path = pathlib.Path(file_path)
+            suffix = export_path.suffix.lower()
+            if suffix in [".tif", ".tiff"]:
+                # A TIFF is data, so it carries the values as recorded rather
+                # than the coloured picture of them.
+                source = self.data if data is None else data
+                if source is None:
+                    return False
+                return DataExporter.export_raw_tiff(np.asarray(source), export_path)
 
             rgb = self.render_colormapped_rgb(data=data)
             if rgb is None:
                 return False
 
-            export_path = pathlib.Path(file_path)
             img = Image.fromarray(rgb, mode="RGB")
-            suffix = export_path.suffix.lower()
             if suffix in [".jpg", ".jpeg"]:
                 img.save(export_path, "JPEG", quality=95)
-            elif suffix in [".tif", ".tiff"]:
-                img.save(export_path, "TIFF")
             else:
                 img.save(export_path, "PNG")
             logging.info(
@@ -801,18 +897,12 @@ class ImageView2DEnhanced(QWidget):
             QMessageBox.warning(self, "No Image", "No image data available to save.")
             return False
 
-        settings = QSettings()
-        saved_dir = settings.value("paths/last_export_directory", defaultValue=str(pathlib.Path.home()))
-        default_dir = pathlib.Path(str(saved_dir)) if saved_dir else pathlib.Path.home()
-        if not default_dir.exists():
-            default_dir = pathlib.Path.home()
-
+        # A faithful copy of one frame, so the name is just that dataset.
         stem = pathlib.Path(str(default_base_name or "image")).stem or "image"
-        default_path = str(default_dir / f"{stem}.png")
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save Image",
-            default_path,
+            suggested_save_path(stem, extension=".png"),
             IMAGE_SAVE_FILTER,
         )
         if not file_path:
@@ -822,7 +912,7 @@ class ImageView2DEnhanced(QWidget):
         if not export_path.suffix:
             export_path = export_path.with_suffix(self.image_extension_from_filter(selected_filter))
 
-        settings.setValue("paths/last_export_directory", str(export_path.parent))
+        remember_save_directory(export_path)
         ok = self.export_colormapped_image(export_path)
         if not ok:
             QMessageBox.critical(self, "Save Failed", f"Failed to save image:\n{export_path}")
@@ -895,14 +985,110 @@ class ImageView2DEnhanced(QWidget):
         except Exception as exc:
             logging.error("Failed to copy colormapped image: %s", exc)
 
-    def _request_main_export(self) -> None:
-        """Ask the main window to run the existing Export action."""
-        win = self.window()
-        handler = getattr(win, "_handle_action_export_current", None)
-        if callable(handler):
-            handler()
-        else:
-            logging.warning("Main export handler not available from image viewer")
+    def set_source_dataset_key(self, full_key: str | None) -> None:
+        """Remember which dataset is on screen, for the quick-export file name."""
+        self.source_dataset_key = full_key
+
+    def quick_export(self) -> None:
+        """Quick export: write the image exactly as rendered on screen.
+
+        Self-contained on purpose — this used to delegate to the main window's
+        export action, which silently did nothing whenever the viewer lived
+        inside a tool dialog (there is no main window in that parent chain).
+        """
+        self.save_colormapped_image_dialog(export_stem(self.source_dataset_key, "image"))
+
+    def quick_copy(self) -> None:
+        """Quick copy: put the rendered image on the clipboard."""
+        self.copy_colormapped_image_to_clipboard()
+
+    # ── Getting a Line / Rect / Sector ROI profile out ────────────────── #
+
+    def roi_profile_columns(self) -> tuple[list[str], list[np.ndarray]] | None:
+        """The ROI profile as ``(headers, columns)``, or None when there is none.
+
+        Read back off the drawn curve rather than recomputed, so what is written
+        is what is on screen — including the q axis, which the line ROI switches
+        to on its own once a calibration is in force.
+        """
+        items = self.roi_plot_widget.plotItem.listDataItems()
+        if not items:
+            return None
+        x, y = items[0].getData()
+        if x is None or y is None or len(x) == 0:
+            return None
+
+        axis = self.roi_plot_widget.plotItem.getAxis("bottom")
+        name = (axis.labelText or "Distance").strip()
+        units = (axis.labelUnits or "").strip()
+        header = f"{name} ({units})" if units else name
+        return [header, "Pixel intensity"], [np.asarray(x), np.asarray(y)]
+
+    def export_roi_profile(self) -> None:
+        """Write the ROI profile through the application's own export rules."""
+        from PyQt6.QtCore import QSettings
+        from PyQt6.QtWidgets import QFileDialog
+
+        from src.gui.export_naming import remember_save_directory, suggested_save_path
+        from src.lib_h5.table_format import (
+            DEFAULT_TABLE_FORMAT_KEY,
+            format_from_filter,
+            get_table_format,
+            save_dialog_filter,
+        )
+        from src.lib_h5.table_writer import write_table
+
+        columns = self.roi_profile_columns()
+        if columns is None:
+            QMessageBox.information(
+                self, "No Profile", "Draw a Line, Rect or Sector ROI first."
+            )
+            return
+        headers, data = columns
+
+        settings = QSettings()
+        fmt = get_table_format(str(settings.value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)))
+        stem = export_stem(self.source_dataset_key, "profile")
+        path, selected = QFileDialog.getSaveFileName(
+            self,
+            "Export ROI Profile",
+            suggested_save_path(stem, suffix="profile", extension=fmt.suffix),
+            save_dialog_filter(fmt),
+        )
+        if not path:
+            return
+
+        fmt = format_from_filter(selected) or fmt
+        out = pathlib.Path(path)
+        if not out.suffix:
+            out = out.with_suffix(fmt.suffix)
+        try:
+            write_table(out, headers, data, fmt)
+        except Exception as exc:
+            logging.error("ROI profile export failed: %s", exc)
+            QMessageBox.critical(self, "Export Failed", f"Failed to export the profile:\n{exc}")
+            return
+
+        remember_save_directory(out)
+        settings.setValue("export/table_format", fmt.key)
+        logging.info("Exported ROI profile to %s", out)
+
+    def plot_roi_profile(self) -> None:
+        """Open the ROI profile in a Plot window."""
+        from src.gui.plot_dialog import open_plot_dialog
+        from src.gui.plot_series import Series
+
+        columns = self.roi_profile_columns()
+        if columns is None:
+            QMessageBox.information(
+                self, "No Profile", "Draw a Line, Rect or Sector ROI first."
+            )
+            return
+        headers, data = columns
+        label = export_stem(self.source_dataset_key, "profile")
+        dialog = open_plot_dialog(self, [Series(label, data[1], data[0])], title=label)
+        if dialog is not None:
+            dialog.le_x_label.setText(headers[0])
 
     def _effective_display_scales(self) -> tuple[float, float]:
         """Return effective display scales, including incident correction if active."""
@@ -1225,8 +1411,6 @@ class ImageView2DEnhanced(QWidget):
                 q1 = p1[1]
                 v0 = self.view_box.mapSceneToView(q0)
                 v1 = self.view_box.mapSceneToView(q1)
-                dx = float(v1.x() - v0.x())
-                dy = float(v1.y() - v0.y())
             else:
                 return
             dist = self._distance_between_points_in_current_unit(
@@ -1299,7 +1483,7 @@ class ImageView2DEnhanced(QWidget):
                 self.histogram.gradient.setColorMap(cmap)
                 logging.debug(f"Applied colormap: {colormap_name}, inverted: {invert}")
             else:
-                logging.error(f"Colormap is None after processing, cannot apply")
+                logging.error("Colormap is None after processing, cannot apply")
 
         except Exception as e:
             logging.error(f"Failed to set colormap '{colormap_name}': {e}")
@@ -1637,15 +1821,20 @@ class ImageView2DEnhanced(QWidget):
 
                         # Plot the radial profile
                         pen = pg.mkPen(color='c', width=2)
-                        self.roi_plot_widget.plot(radii, intensities, pen=pen, symbol='o', symbolSize=4, symbolBrush='c')
+                        self.roi_plot_widget.plot(
+                            radii, intensities, pen=pen, symbol='o', symbolSize=4, symbolBrush='c'
+                        )
 
                         # Set labels
                         self.roi_plot_widget.setLabel('left', 'Pixel Intensity', units='')
                         self.roi_plot_widget.setLabel('bottom', 'Distance', units=self._roi_distance_unit())
 
                         # Set title with statistics
-                        title = f"Radial Profile | Angle: {self.sector_angle_start:.0f} deg-{self.sector_angle_end:.0f} deg | " \
-                                f"R: {self.sector_radius_inner:.0f}-{self.sector_radius_outer:.0f}px"
+                        title = (
+                            f"Radial Profile | Angle: {self.sector_angle_start:.0f} deg-"
+                            f"{self.sector_angle_end:.0f} deg | "
+                            f"R: {self.sector_radius_inner:.0f}-{self.sector_radius_outer:.0f}px"
+                        )
                         self.roi_plot_widget.setTitle(title)
                     else:
                         self.roi_plot_widget.setTitle("No data in sector region")
@@ -1762,7 +1951,10 @@ class ImageView2DEnhanced(QWidget):
                     profile_length = self._distance_between_points_in_current_unit(vx0, vy0, vx1, vy1)
                 else:
                     profile_length = float(np.sqrt(np.sum(np.diff(self.current_roi.getState()['points'], axis=0)**2)))
-                title = f"Line Profile | Mean: {mean_val:.3g} | Std: {std_val:.3g} | Length: {profile_length:.3g} {self._roi_distance_unit()}"
+                title = (
+                    f"Line Profile | Mean: {mean_val:.3g} | Std: {std_val:.3g} | "
+                    f"Length: {profile_length:.3g} {self._roi_distance_unit()}"
+                )
                 self.roi_plot_widget.setTitle(title)
 
             elif self.roi_type == "Rectangle":
@@ -1816,7 +2008,10 @@ class ImageView2DEnhanced(QWidget):
                 self.roi_plot_widget.setLabel('bottom', 'Distance', units=self._roi_distance_unit())
 
                 # Set title with statistics
-                title = f"Rectangle Profile ({profile_direction}) | Mean: {mean_val:.3g} | Std: {std_val:.3g} | Range: [{min_val:.3g}, {max_val:.3g}]"
+                title = (
+                    f"Rectangle Profile ({profile_direction}) | Mean: {mean_val:.3g} | "
+                    f"Std: {std_val:.3g} | Range: [{min_val:.3g}, {max_val:.3g}]"
+                )
                 self.roi_plot_widget.setTitle(title)
 
             logging.debug(f"Updated ROI plot: mean={mean_val:.4g}")
@@ -2768,7 +2963,6 @@ class ImageView2DEnhanced(QWidget):
         self.dragging_handle = None
         self.drag_start_pos = None
 
-
     def _update_sector_control_point_positions(self) -> None:
         """Update positions of control points to match current sector parameters."""
         if self.sector_center is None:
@@ -2812,6 +3006,3 @@ class ImageView2DEnhanced(QWidget):
 
         if self.sector_handle_inner_end is not None:
             self.sector_handle_inner_end.setData([x_inner_end], [y_inner_end])
-
-
-

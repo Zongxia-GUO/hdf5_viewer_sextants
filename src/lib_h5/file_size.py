@@ -1,4 +1,4 @@
-﻿"""File size formatting util."""
+"""File size formatting util."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -30,6 +30,3 @@ def file_size_to_str(file_path: str) -> str:
         return f"{size/1024:.2f} kB"
     else:
         return f"{size} bytes"
-
-
-

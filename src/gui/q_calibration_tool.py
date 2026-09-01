@@ -10,7 +10,7 @@ import h5py
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtCore import QBuffer, QByteArray, QMimeData
+from PyQt6.QtCore import QBuffer, QByteArray, QMimeData, QSettings
 from PyQt6.QtGui import QClipboard, QImage
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,8 +32,21 @@ from PyQt6.QtWidgets import (
 )
 
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.gui.export_naming import (
+    remember_save_directory,
+    short_series_label,
+    suggested_save_path,
+)
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
+from src.lib_h5.table_format import (
+    DEFAULT_TABLE_FORMAT_KEY,
+    format_from_filter,
+    get_table_format,
+    save_dialog_filter,
+)
+from src.lib_h5.table_writer import write_table
 from src.recon import profiles as pr
 
 
@@ -53,7 +66,9 @@ class QCalibrationTool(QDialog):
         self._raw_data: np.ndarray | None = None    # as-loaded, before incidence resampling
         self._pending_center_pick = False
         self._incident_applied = False
-        self._q_axes_active = False
+        # What was done to reduce a stack of frames to one pattern, for the
+        # status line to report. See _flatten_stack.
+        self._stack_notes: list[str] = []
 
         # ROI subsystem (Ring / Sector / Circle + radial / azimuthal profiles).
         self._N_ANGLE_BINS = 360
@@ -84,7 +99,9 @@ class QCalibrationTool(QDialog):
         # Left panel
         left = QWidget()
         left_lay = QVBoxLayout(left)
-        left_lay.setContentsMargins(4, 4, 4, 4)
+        # Zero inside the splitter panels; the dialog's own margin is the only
+        # inset, matching the calculator and comparison windows.
+        left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(8)
 
         g_ds = QGroupBox("Input Datasets  (CL / CR / BG)")
@@ -94,6 +111,9 @@ class QCalibrationTool(QDialog):
         self._bg_combo = DatasetPathCombo("-- no BG (optional) --")
         for combo in (self._cl_combo, self._cr_combo, self._bg_combo):
             combo.lineEdit().returnPressed.connect(self._load_data)
+            # A stack in any slot brings up the frame controls, before loading:
+            # the choice has to be available *while* choosing what to load.
+            combo.currentTextChanged.connect(self._refresh_frame_controls)
         self._combos = {"CL": self._cl_combo, "CR": self._cr_combo, "BG": self._bg_combo}
         fl_ds.addRow("CL:", self._cl_combo)
         fl_ds.addRow("CR:", self._cr_combo)
@@ -107,9 +127,34 @@ class QCalibrationTool(QDialog):
         self._combo_operation.addItem("Asymmetry  diff / sum", "asym")
         self._combo_operation.setToolTip(
             "How CL / CR / BG combine into the 2-D image to calibrate.\n"
-            "BG defaults to zero when not loaded; 3-D stacks are averaged over frames."
+            "BG defaults to zero when not loaded."
         )
         fl_ds.addRow("Operation:", self._combo_operation)
+
+        # Which frame of a stack to calibrate. One control for all three slots:
+        # they are required to have the same shape anyway, and three copies of
+        # the same question would be three chances to answer it inconsistently.
+        self._row_frames = QHBoxLayout()
+        self._lbl_frames = QLabel("Axis:")
+        self._combo_frame_axis = QComboBox()
+        self._combo_frame_axis.setToolTip("Which array axis the frames are counted along")
+        self._combo_frame_axis.setMinimumWidth(55)
+        self._combo_frame_axis.currentIndexChanged.connect(self._on_frame_axis_changed)
+        self._combo_frame = QComboBox()
+        self._combo_frame.setMinimumWidth(90)
+        self._combo_frame.setToolTip(
+            "Which frame to calibrate, or the mean of them all.\n"
+            "The mean is the default: more frames, better statistics."
+        )
+        self._combo_frame.currentIndexChanged.connect(self._on_frame_changed)
+        self._row_frames.addWidget(self._lbl_frames)
+        self._row_frames.addWidget(self._combo_frame_axis)
+        self._row_frames.addWidget(QLabel("Frame:"))
+        self._row_frames.addWidget(self._combo_frame)
+        self._row_frames.addStretch()
+        self._frames_label = QLabel("Frames:")
+        fl_ds.addRow(self._frames_label, self._row_frames)
+        self._show_frame_controls(False)
 
         self._btn_load = QPushButton("Load Data")
         self._btn_load.clicked.connect(self._load_data)
@@ -181,18 +226,22 @@ class QCalibrationTool(QDialog):
         self._spin_dist.setValue(260.0)
         self._spin_dist.setSuffix(" mm")
         fl_geo.addRow("Distance:", self._spin_dist)
-        left_lay.addWidget(g_geo)
 
-        left_lay.addWidget(self._build_roi_group())
-
+        # The axis switch belongs to the geometry it is computed from.
         row_action = QHBoxLayout()
         self._btn_apply = QPushButton("to q")
+        self._btn_apply.setToolTip("Convert the image axes to q using the geometry above")
         self._btn_apply.clicked.connect(self._apply_calibration)
         row_action.addWidget(self._btn_apply)
         self._btn_disable = QPushButton("to pixel")
+        self._btn_disable.setToolTip("Switch the image axes back to pixels")
         self._btn_disable.clicked.connect(self._disable_q)
         row_action.addWidget(self._btn_disable)
-        left_lay.addLayout(row_action)
+        fl_geo.addRow(row_action)
+
+        left_lay.addWidget(g_geo)
+
+        left_lay.addWidget(self._build_roi_group())
 
         for btn in (
             self._btn_load,
@@ -213,7 +262,7 @@ class QCalibrationTool(QDialog):
         # Right panel: image on top, ROI profile plot below (vertical splitter).
         right = QWidget()
         right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(4, 4, 4, 4)
+        right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(4)
         right_split = QSplitter(Qt.Orientation.Vertical)
         self._right_split = right_split
@@ -234,6 +283,14 @@ class QCalibrationTool(QDialog):
         self._profile_plot.setLabel("bottom", "r (px)")
         self._profile_plot.setLabel("left", "Mean intensity")
         self._profile_curve = self._profile_plot.plot([], [], pen=pg.mkPen((0, 200, 255), width=2))
+        # The only way to get this curve out of the tool; it has no buttons of
+        # its own, and pyqtgraph's own Export bypasses the naming and dialect
+        # rules every other export in the application follows.
+        attach_plot_menu(
+            self._profile_plot,
+            on_export=self._export_profile,
+            on_plot=self._plot_profile_window,
+        )
         right_split.addWidget(self._profile_plot)
         right_split.setSizes([620, 200])
         # Hidden until the user starts a ROI (shown by _update_profile_visibility).
@@ -309,8 +366,93 @@ class QCalibrationTool(QDialog):
             self._load_data()
         return True
 
+    # ── Frame selection for a stack ───────────────────────────────────── #
+
+    #: The frame selector's value for "average them all".
+    MEAN_OF_FRAMES = -1
+
+    def _show_frame_controls(self, visible: bool) -> None:
+        self._frames_label.setVisible(visible)
+        self._lbl_frames.setVisible(visible)
+        self._combo_frame_axis.setVisible(visible)
+        self._combo_frame.setVisible(visible)
+        for index in range(self._row_frames.count()):
+            item = self._row_frames.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, QLabel):
+                widget.setVisible(visible)
+
+    def _stack_shape(self) -> tuple[int, ...] | None:
+        """The shape of the first selected slot, if it is a stack of frames."""
+        for slot in ("CL", "CR", "BG"):
+            entry = self._combos[slot].get_entry(opened_files=self._opened_files)
+            if entry is None:
+                continue
+            fp, ds = entry
+            try:
+                with h5py.File(fp, "r") as h5:
+                    if ds in h5 and isinstance(h5[ds], h5py.Dataset):
+                        shape = tuple(h5[ds].shape)
+                        return shape if len(shape) >= 3 else None
+            except Exception as exc:
+                logging.debug("Could not read the shape of %s: %s", ds, exc)
+        return None
+
+    def _refresh_frame_controls(self, *_args) -> None:
+        """Show the axis and frame selectors when a slot holds a stack."""
+        shape = self._stack_shape()
+        self._show_frame_controls(shape is not None)
+        if shape is None:
+            return
+
+        previous_axis = self._combo_frame_axis.currentData()
+        self._combo_frame_axis.blockSignals(True)
+        self._combo_frame_axis.clear()
+        for axis in range(len(shape)):
+            self._combo_frame_axis.addItem(str(axis), axis)
+        if previous_axis is not None and 0 <= int(previous_axis) < len(shape):
+            self._combo_frame_axis.setCurrentIndex(int(previous_axis))
+        self._combo_frame_axis.blockSignals(False)
+        self._rebuild_frame_combo(shape)
+
+    def _rebuild_frame_combo(self, shape: tuple[int, ...]) -> None:
+        axis = int(self._combo_frame_axis.currentData() or 0)
+        previous = self._combo_frame.currentData()
+        self._combo_frame.blockSignals(True)
+        self._combo_frame.clear()
+        self._combo_frame.addItem("Mean", self.MEAN_OF_FRAMES)
+        for index in range(shape[axis % len(shape)]):
+            self._combo_frame.addItem(str(index), index)
+        if previous is not None:
+            found = self._combo_frame.findData(previous)
+            self._combo_frame.setCurrentIndex(max(0, found))
+        self._combo_frame.blockSignals(False)
+
+    def _on_frame_axis_changed(self, _index: int) -> None:
+        shape = self._stack_shape()
+        if shape is not None:
+            self._rebuild_frame_combo(shape)
+            self._reload_if_loaded()
+
+    def _on_frame_changed(self, _index: int) -> None:
+        self._reload_if_loaded()
+
+    def _reload_if_loaded(self) -> None:
+        """Re-read the slots so the change is visible without pressing Load."""
+        if self._data is not None:
+            self._load_data()
+
+    def _frame_selection(self) -> tuple[int, int]:
+        """``(axis, index)``; index :data:`MEAN_OF_FRAMES` means average them."""
+        if not self._combo_frame.isVisibleTo(self):
+            return 0, self.MEAN_OF_FRAMES
+        axis = self._combo_frame_axis.currentData()
+        index = self._combo_frame.currentData()
+        return (int(axis) if axis is not None else 0,
+                int(index) if index is not None else self.MEAN_OF_FRAMES)
+
     def _read_slot_2d(self, slot: str) -> np.ndarray | None:
-        """Read a slot's dataset as a 2-D image (3-D stacks averaged over frames)."""
+        """Read a slot's dataset as a 2-D image, averaging a stack of frames."""
         entry = self._combos[slot].get_entry(opened_files=self._opened_files)
         if entry is None:
             return None
@@ -319,11 +461,40 @@ class QCalibrationTool(QDialog):
             if ds not in h5 or not isinstance(h5[ds], h5py.Dataset):
                 raise KeyError(f"Dataset not found: {ds}")
             arr = np.asarray(h5[ds][()], dtype=np.float32)
-        if arr.ndim > 2:
-            arr = arr.reshape((-1,) + arr.shape[-2:]).mean(axis=0)
+        arr = self._flatten_stack(arr, slot)
         if arr.ndim != 2:
             raise ValueError(f"{slot}: expected a 2-D image but got shape {arr.shape}.")
         return arr
+
+    def _flatten_stack(self, arr: np.ndarray, slot: str) -> np.ndarray:
+        """Reduce a stack of frames to the one pattern to calibrate.
+
+        Either the mean of the frames — a reasonable default for a scattering
+        pattern, more frames meaning better statistics — or a single frame the
+        user picked. Whichever it was is recorded, because it used to happen in
+        silence: a 400-frame stack arrived, the status line said
+        "Loaded (200x46)", and nothing said that what was on screen was the
+        mean of all 400.
+
+        The axis is the one chosen beside the slots, defaulting to the first,
+        the way frames are counted everywhere else in the application. The
+        previous rule reshaped on the last two axes, which quietly produced
+        nonsense for a stack stored as ``(H, W, N)`` — a layout the 2-D viewer
+        explicitly supports.
+        """
+        if arr.ndim <= 2:
+            return arr
+
+        axis, index = self._frame_selection()
+        axis %= arr.ndim
+        frames = int(arr.shape[axis])
+        if index >= 0:
+            index = min(index, frames - 1)
+            self._stack_notes.append(f"{slot}: frame {index} of {frames} (axis {axis})")
+            return np.asarray(np.take(arr, index, axis=axis))
+
+        self._stack_notes.append(f"{slot}: mean of {frames} frames (axis {axis})")
+        return np.asarray(arr.mean(axis=axis))
 
     # Operation spec: (required slots, slots used in formula).
     _OP_REQUIRED = {
@@ -338,6 +509,7 @@ class QCalibrationTool(QDialog):
 
     def _load_data(self) -> None:
         op = self._combo_operation.currentData()
+        self._stack_notes = []
         try:
             for slot in self._OP_REQUIRED[op]:
                 if self._combos[slot].get_entry(opened_files=self._opened_files) is None:
@@ -377,8 +549,12 @@ class QCalibrationTool(QDialog):
         """Load 2D data from memory (no file dataset required)."""
         try:
             data = np.asarray(arr)
+            self._stack_notes = []
             if data.ndim > 2:
-                data = data[0]
+                # The same reduction the file path uses. It used to take frame
+                # zero here and the mean there, so the identical stack gave two
+                # different patterns depending on how it had been handed over.
+                data = self._flatten_stack(data, "Array")
             if data.ndim != 2:
                 QMessageBox.warning(
                     self,
@@ -416,8 +592,10 @@ class QCalibrationTool(QDialog):
         self._update_center_overlay()
         self._redraw_roi_overlays()
         self._incident_applied = False
-        self._q_axes_active = False
-        self._set_status(f"Loaded: {source_label} ({rows}x{cols})")
+        # Any frame averaging is named here rather than left for the user to
+        # infer from a shape that no longer matches the dataset they picked.
+        notes = "  |  " + ", ".join(self._stack_notes) if self._stack_notes else ""
+        self._set_status(f"Loaded: {source_label} ({rows}x{cols}){notes}")
 
     def _on_pick_center_toggled(self, checked: bool) -> None:
         self._pending_center_pick = checked
@@ -982,12 +1160,121 @@ class QCalibrationTool(QDialog):
         mode = roi.get("mode", "radial")
         if roi["type"] != "circle" and mode == "azimuthal":
             ay = self._apply_phase_shift(np.asarray(ay), int(roi.get("phase", 0)))
+            # An azimuthal profile is already an angle; there is nothing for a
+            # q calibration to convert it to.
             x, y, xlabel = ax, ay, "θ (deg)"
         else:
-            x, y, xlabel = rx, ry, "r (px)"
-        finite = np.isfinite(y)
+            x, xlabel = self._radial_axis(roi, np.asarray(rx, dtype=np.float64))
+            y = ry
+        finite = np.isfinite(np.asarray(y)) & np.isfinite(np.asarray(x))
         self._profile_plot.setLabel("bottom", xlabel)
         self._profile_curve.setData(np.asarray(x)[finite], np.asarray(y)[finite])
+
+    def _radial_axis(self, roi: dict, radii_px: np.ndarray) -> tuple[np.ndarray, str]:
+        """The radial profile's x axis: pixel radius, or |q| once calibrated.
+
+        The image axes switch to q when a calibration is applied, but the ROI
+        profile below them went on being drawn against a pixel radius — so the
+        two halves of the same window were in different units, and the profile
+        could not be read off against the pattern it came from.
+
+        Converted the way the line ROI does it: the q of a real pixel, sampled
+        here along the ROI's own mid-angle. That direction matters, because an
+        incidence correction makes |q| at a given radius depend on it.
+        """
+        params = getattr(self._img, "_q_calibration", None)
+        if not getattr(self._img, "_axis_linear_map_active", False) or not params:
+            return radii_px, "r (px)"
+
+        cx, cy = self._center_pixel()
+        if roi.get("type") == "circle":
+            angle = 0.0
+        else:
+            angle = np.deg2rad((float(roi.get("a_min", 0)) + float(roi.get("a_max", 0))) / 2.0)
+        dx, dy = float(np.cos(angle)), float(np.sin(angle))
+
+        q_values = []
+        for radius in radii_px:
+            comp = self._img._q_components_at_pixel_float(
+                cx + radius * dx, cy + radius * dy, params
+            )
+            q_values.append(float(np.hypot(comp[0], comp[1])) if comp else np.nan)
+
+        q_axis = np.asarray(q_values, dtype=np.float64)
+        if not np.any(np.isfinite(q_axis)):
+            # An incomplete calibration is not a reason to show nothing.
+            return radii_px, "r (px)"
+        return q_axis, "q (1/A)"
+
+    # ── Getting the profile out ───────────────────────────────────────── #
+
+    def _profile_columns(self) -> tuple[list[str], list[np.ndarray]] | None:
+        """The curve on screen as ``(headers, columns)``, or None if there is none.
+
+        Headed with the axis actually in use, so a file exported in q says q and
+        one exported in pixels says pixels. The profile had no way out at all
+        before this: the image had Copy and Save, the curve computed from it had
+        nothing.
+        """
+        x, y = self._profile_curve.getData()
+        if x is None or y is None or len(x) == 0:
+            return None
+        roi = self._selected_roi()
+        name = str(roi.get("name", "profile")) if roi else "profile"
+        x_label = self._profile_plot.getAxis("bottom").labelText or "x"
+        return [x_label, f"{name} (mean intensity)"], [np.asarray(x), np.asarray(y)]
+
+    def _export_profile(self) -> None:
+        """Write the ROI profile through the application's own export rules."""
+        columns = self._profile_columns()
+        if columns is None:
+            self._set_status("No profile to export — add a ROI first.", error=True)
+            return
+        headers, data = columns
+
+        settings = QSettings()
+        fmt = get_table_format(str(settings.value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)))
+        path, selected = QFileDialog.getSaveFileName(
+            self,
+            "Export ROI Profile",
+            suggested_save_path(self._default_save_name("profile"), extension=fmt.suffix),
+            save_dialog_filter(fmt),
+        )
+        if not path:
+            return
+
+        fmt = format_from_filter(selected) or fmt
+        out = pathlib.Path(path)
+        if not out.suffix:
+            out = out.with_suffix(fmt.suffix)
+        try:
+            write_table(out, headers, data, fmt)
+        except Exception as exc:
+            logging.error("ROI profile export failed: %s", exc)
+            QMessageBox.critical(self, "Export Failed", f"Failed to export the profile:\n{exc}")
+            return
+
+        remember_save_directory(out)
+        settings.setValue("export/table_format", fmt.key)
+        self._set_status(f"Profile exported to {out.name}")
+
+    def _plot_profile_window(self) -> None:
+        """Open the ROI profile in a Plot window."""
+        from src.gui.plot_dialog import open_plot_dialog
+        from src.gui.plot_series import Series
+
+        columns = self._profile_columns()
+        if columns is None:
+            self._set_status("No profile to plot — add a ROI first.", error=True)
+            return
+        headers, data = columns
+        dialog = open_plot_dialog(
+            self,
+            [Series(headers[1], data[1], data[0])],
+            title="Scattering Pattern Analyze",
+        )
+        if dialog is not None:
+            dialog.le_x_label.setText(headers[0])
 
     def _apply_phase_shift(self, ay: np.ndarray, phase_deg: int) -> np.ndarray:
         """Roll the azimuthal profile along θ by phase_deg (bins span 0..360)."""
@@ -1023,7 +1310,8 @@ class QCalibrationTool(QDialog):
         if not self._img.apply_q_axes_calibration(p):
             self._set_status("q calibration applied, but failed to update q axes.", error=True)
             return
-        self._q_axes_active = False
+        # The ROI profile shares these units, so it is redrawn with them.
+        self._compute_current_profiles()
         self._set_status("q calibration applied. Axes switched to q.")
 
     def _apply_incident_cali(self) -> None:
@@ -1036,7 +1324,6 @@ class QCalibrationTool(QDialog):
         corrected, sx, sy = self._resample_for_incidence(self._raw_data)
         self._data = corrected
         self._incident_applied = sx != 1.0 or sy != 1.0
-        self._q_axes_active = False
 
         # Reset any prior display transform; the data itself now carries the stretch.
         self._img.set_q_calibration(None)
@@ -1064,9 +1351,9 @@ class QCalibrationTool(QDialog):
 
     def _disable_q(self) -> None:
         self._img.set_q_calibration(None)
-        self._q_axes_active = False
         self._img.set_pixel_axes_labels_only()
         self._update_center_overlay()
+        self._compute_current_profiles()
         self._set_status("Switched to pixel axes.")
 
     def _capture_display_pixmap(self):
@@ -1124,7 +1411,11 @@ class QCalibrationTool(QDialog):
         except Exception:
             rep = max(1, int(round(fac)))
             ax = 0 if axis == "Y" else 1
-            return np.repeat(out, rep, axis=ax), (1.0 if axis == "Y" else float(rep)), (float(rep) if axis == "Y" else 1.0)
+            return (
+                np.repeat(out, rep, axis=ax),
+                (1.0 if axis == "Y" else float(rep)),
+                (float(rep) if axis == "Y" else 1.0),
+            )
 
     @staticmethod
     def _normalize_to_u8(arr: np.ndarray) -> np.ndarray:
@@ -1139,13 +1430,11 @@ class QCalibrationTool(QDialog):
         u8 = np.clip((a - lo) / (hi - lo) * 255.0, 0.0, 255.0).astype(np.uint8)
         return u8
 
-    def _default_save_name(self, suffix: str = "current") -> str:
+    def _default_save_name(self, suffix: str = "qcal") -> str:
+        """Scan and dataset, tagged so it is not mistaken for the raw frame."""
         txt = self._cl_combo.currentText().strip()
-        if "::" in txt:
-            fname = txt.split("::", 1)[0].strip()
-            stem = pathlib.Path(fname).stem
-            return f"{stem}_{suffix}.png"
-        return f"qcal_{suffix}.png"
+        stem = short_series_label(txt, fallback="qcal") if "::" in txt else "qcal"
+        return suggested_save_path(stem, suffix, extension=".png")
 
     def _save_image(self) -> None:
         """Save current image data: PNG/JPEG with colormap, TIFF as grayscale data."""
@@ -1155,11 +1444,12 @@ class QCalibrationTool(QDialog):
         path, selected = QFileDialog.getSaveFileName(
             self,
             "Save Image",
-            self._default_save_name("current"),
+            self._default_save_name(),
             "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;TIFF Image (*.tif *.tiff)",
         )
         if not path:
             return
+        remember_save_directory(path)
         out_path = pathlib.Path(path)
         if not out_path.suffix:
             selected_ext = DataExporter.get_extension_from_filter(selected)
@@ -1182,4 +1472,3 @@ class QCalibrationTool(QDialog):
             self._set_status(f"Saved image: {out_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save Image", f"Failed to save image:\n{exc}")
-

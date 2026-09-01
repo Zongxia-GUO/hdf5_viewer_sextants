@@ -17,14 +17,24 @@
 
 import logging.config
 import os
+import pathlib
 import sys
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from src.gui.main_window import MainWindow
+from src.img.img_path import img_path
 from src.logging_config import logging_config
+
+# Windows taskbar identity. It MUST match the AppUserModelID on the shortcuts
+# the installer creates (see windows/compile.iss): declaring an ID the shell
+# cannot resolve to a shortcut is what left the first-ever launch showing a
+# placeholder icon, correct only from the second run once the shell had scraped
+# the window icon and cached it. Microsoft's form is Company.Product.
+APP_USER_MODEL_ID = "Soleil.SEXTANTS.HDF5Viewer"
 
 # Performance: configure pyqtgraph for speed
 # Note: useOpenGL is NOT enabled globally because it breaks the
@@ -37,10 +47,33 @@ pg.setConfigOptions(
 )
 
 if sys.platform == "win32":
-    # Set Windows Taskbar Icon
+    # Group the taskbar button under our own identity rather than under the
+    # host executable. Must happen before the first window exists.
     import ctypes
 
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("hdf5viewer")
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:   # pragma: no cover - a missing shell32 must not stop the app
+        logging.warning("Could not set the Windows application id", exc_info=True)
+
+
+def application_icon() -> QIcon:
+    """The application icon, with its bitmaps already read from disk.
+
+    ``QIcon(path)`` is lazy: nothing is read until some pixmap is asked for. On
+    a cold start that read lands at the moment the shell wants the taskbar
+    button, competing with the ~2,900 files the frozen app is already paging
+    in. Forcing the sizes now moves that read off the critical moment.
+    """
+    icon_file = pathlib.Path(img_path(), "sextants.ico")
+    if not icon_file.exists():
+        logging.warning("Application icon not found: %s", icon_file)
+        return QIcon()
+
+    icon = QIcon(str(icon_file))
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.pixmap(QSize(size, size))
+    return icon
 
 
 def configure_light_color_scheme() -> None:
@@ -73,6 +106,9 @@ def main() -> None:
     apply_light_color_scheme(app)
     app.setOrganizationName("HDF5Viewer")
     app.setApplicationName("HDF5ViewerPython")
+    # Application-wide, so dialogs and the taskbar have an icon even before the
+    # main window exists. Only the window carried one before.
+    app.setWindowIcon(application_icon())
     main_win = MainWindow()
     main_win.show()
     sys.exit(app.exec())

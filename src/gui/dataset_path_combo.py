@@ -1,4 +1,4 @@
-﻿"""Shared dataset path combo box for drag-drop and editable dataset selection."""
+"""Shared dataset path combo box for drag-drop and editable dataset selection."""
 
 import logging
 import pathlib
@@ -229,6 +229,3 @@ class DatasetPathCombo(QComboBox):
             return
         self.add_full_key(text, select=True)
         event.acceptProposedAction()
-
-
-

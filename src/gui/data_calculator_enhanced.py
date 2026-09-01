@@ -1,4 +1,4 @@
-﻿"""Enhanced Data Calculator Dialog with drag-and-drop support."""
+"""Enhanced Data Calculator Dialog with drag-and-drop support."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -22,14 +22,13 @@ from typing import Any
 
 import h5py
 import numpy as np
-import pyqtgraph as pg
-from PyQt6.QtCore import QBuffer, QByteArray, QMimeData, QTimer, Qt
-from PyQt6.QtGui import QClipboard, QPixmap
+from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
-    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
-    QFileDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -42,7 +41,92 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from src.gui.batch_export import compact_combo, elided_label
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.gui.export_naming import (
+    pair_label,
+    remember_save_directory,
+    short_series_label,
+    suggested_save_path,
+    x_column_header,
+)
+from src.gui.table_model import CopyableTableView, DataTable
+from src.gui.x_target import (
+    read_x_dataset,
+    register_x_target,
+    remembered_x_dataset,
+    x_scope_of,
+)
+from src.img.img_path import img_path
+from src.lib_h5.table_format import (
+    DEFAULT_TABLE_FORMAT_KEY,
+    TableFormat,
+    dialog_filter,
+    format_labels,
+    get_table_format,
+)
+from src.lib_h5.table_writer import write_table
+from src.recon.expr import ExpressionError, evaluate as _evaluate_expression
+
+# The second output button reads differently for a curve and for an image:
+# a 2-D result cannot be plotted as a curve, but it can be put on the clipboard.
+PLOT_BUTTON_TEXT = "Plot"
+PLOT_BUTTON_TOOLTIP = "Plot: the operands and the result, as a table and a figure"
+COPY_BUTTON_TEXT = "Copy"
+COPY_BUTTON_TOOLTIP = "Copy: put the result image, with its colormap, on the clipboard"
+
+
+# The value a selector carries for "do not pick anything out".
+SELECT_ALL = -1
+
+# Width of the controls side of the splitter. It was widened to 440 to fit a
+# 3-D operand's two selectors; once those stopped carrying their own labels in
+# every entry the pair fits in half the room, so the result viewer gets the
+# space back.
+CONTROLS_PANEL_WIDTH = 300
+
+# The two selectors hold values, not sentences — "0 (400)" and "12" — so they
+# are sized for those plus the dropdown arrow, and capped so that a layout with
+# room to spare cannot inflate them into two mostly-empty boxes.
+AXIS_COMBO_MIN_WIDTH = 55
+AXIS_COMBO_MAX_WIDTH = 75
+PART_COMBO_MIN_WIDTH = 70
+PART_COMBO_MAX_WIDTH = 90
+
+
+def _shapes_broadcast(shape_a: tuple[int, ...], shape_b: tuple[int, ...]) -> bool:
+    """Whether numpy can pair these two shapes up element by element."""
+    try:
+        np.broadcast_shapes(tuple(shape_a), tuple(shape_b))
+    except ValueError:
+        return False
+    return True
+
+
+def operand_from_selection(data: np.ndarray, axis: int, index: int) -> np.ndarray:
+    """Cut one operand down to what the selectors ask for.
+
+    Two shapes, one idea — take a part out, or keep the whole thing:
+
+    * 2-D with a column chosen  ->  that column
+    * 3-D with a frame chosen   ->  that frame, counted along ``axis``
+    * 3-D with no frame chosen  ->  the whole stack, reoriented so the chosen
+      axis comes first
+
+    Reorienting rather than remembering the axis keeps the result an ordinary
+    frame-major stack, so the viewer, the export and the pattern tool all read
+    it the same way without being told anything.
+    """
+    arr = np.asarray(data)
+    if arr.ndim == 2:
+        return arr[:, index] if index >= 0 else arr
+    if arr.ndim < 3:
+        return arr
+
+    axis = int(axis) % arr.ndim
+    if index >= 0:
+        return np.asarray(np.take(arr, min(index, arr.shape[axis] - 1), axis=axis))
+    return np.moveaxis(arr, axis, 0) if axis else arr
 
 
 class DragDropComboBox(DatasetPathCombo):
@@ -50,6 +134,117 @@ class DragDropComboBox(DatasetPathCombo):
 
     def __init__(self, placeholder: str, parent: Any = None) -> None:
         super().__init__(placeholder=placeholder, parent=parent)
+
+
+class ResultExportDialog(QDialog):
+    """Full-export settings for a calculator result.
+
+    Shows the columns that will be written — the two operands and the result —
+    and lets an X axis be attached, the same way the batch export dialog does.
+    """
+
+    settings_changed = pyqtSignal()
+
+    def __init__(
+        self,
+        parent: Any,
+        *,
+        opened_files: tuple[pathlib.Path, ...],
+        dataset_full_keys_1d: list[str],
+        preferred_x_key: str | None,
+        expression: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export Calculation Result")
+        self.setWindowIcon(QIcon(str(pathlib.Path(img_path(), "sextants.ico"))))
+        # A plain Window, shown non-modally, so the tree stays draggable.
+        self.setWindowFlag(Qt.WindowType.Window)
+        # Square: the preview sits above the controls, so extra width buys nothing.
+        self.resize(560, 560)
+        self._opened_files = opened_files
+
+        root = QVBoxLayout(self)
+
+        self.preview_table = CopyableTableView()
+        root.addWidget(self.preview_table, stretch=1)
+
+        box = QGroupBox("Export")
+        form = QVBoxLayout(box)
+
+        # The result viewer's own X wins; failing that, the one chosen in the
+        # tree *for this tool*, so the same dataset does not have to be found
+        # twice — and so an X set in some other tool never turns up here.
+        preferred_x_key = preferred_x_key or remembered_x_dataset(x_scope_of(parent))
+
+        row_x = QHBoxLayout()
+        self.chk_export_x = QCheckBox("Export X")
+        self.chk_export_x.setChecked(bool(preferred_x_key))
+        row_x.addWidget(self.chk_export_x)
+        self.combo_x = compact_combo(DragDropComboBox("Drag or type the X dataset"), 20)
+        self.combo_x.populate_from_full_keys(list(dataset_full_keys_1d), opened_files=opened_files)
+        if preferred_x_key:
+            self.combo_x.add_full_key(preferred_x_key, select=True)
+        row_x.addWidget(self.combo_x, stretch=1)
+        form.addLayout(row_x)
+
+        row_fmt = QHBoxLayout()
+        row_fmt.addWidget(QLabel("Format:"))
+        self.combo_format = compact_combo(QComboBox())
+        self.combo_format.addItems(format_labels())
+        stored = QSettings().value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)
+        self.combo_format.setCurrentText(get_table_format(str(stored)).label)
+        row_fmt.addWidget(self.combo_format, stretch=1)
+        form.addLayout(row_fmt)
+
+        row_expr = QHBoxLayout()
+        row_expr.addWidget(QLabel("Expression:"))
+        row_expr.addWidget(elided_label(expression or "-"))
+        row_expr.addStretch()
+        form.addLayout(row_expr)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addWidget(buttons)
+
+        root.addWidget(box)
+
+        self.chk_export_x.stateChanged.connect(self._emit_refresh)
+        self.combo_x.currentTextChanged.connect(self._emit_refresh)
+        register_x_target(self)
+
+    def _emit_refresh(self, *_args: Any) -> None:
+        self.settings_changed.emit()
+
+    def set_x_dataset(self, key: str) -> bool:
+        """Take an X dataset handed over by the tree's ``Set X``."""
+        if "::" not in key:
+            return False
+        self.combo_x.add_full_key(key, select=True)
+        self.chk_export_x.setChecked(True)
+        return True
+
+    def x_key(self) -> str | None:
+        """Full ``file::dataset`` key of the chosen X, or None when X is off."""
+        if not self.chk_export_x.isChecked():
+            return None
+        entry = self.combo_x.get_entry(opened_files=self._opened_files)
+        if entry is None:
+            return None
+        return f"{entry[0]}::{entry[1]}"
+
+    def table_format(self) -> TableFormat:
+        """The tabular dialect chosen for this export."""
+        return get_table_format(self.combo_format.currentText())
+
+    def show_preview(self, headers: list[str], columns: list[Any]) -> None:
+        """Fill the preview with the columns that would be written."""
+        rows = min(200, max((len(col) for col in columns), default=0))
+        table = np.full((rows, len(columns)), np.nan, dtype=float)
+        for idx, col in enumerate(columns):
+            take = min(rows, len(col))
+            table[:take, idx] = np.asarray(col, dtype=float)[:take]
+        self.preview_table.setModel(DataTable(table, headers))
 
 
 class DataCalculatorEnhanced(QDialog):
@@ -69,6 +264,10 @@ class DataCalculatorEnhanced(QDialog):
         super().__init__(parent)
         self.opened_files = opened_files
         self.dataset_full_keys_1d = dataset_full_keys_1d or []
+        # An X chosen here belongs to this tool. Its own export and plot windows
+        # inherit it through the parent chain; nothing outside the calculator
+        # does. See src.gui.x_target.x_scope_of.
+        self.x_scope = "calculator"
         self.result_data: np.ndarray | None = None
         self.result_widget: QWidget | None = None  # Current result display widget
         self.data_a: np.ndarray | None = None  # Original dataset A
@@ -88,6 +287,10 @@ class DataCalculatorEnhanced(QDialog):
         self.resize(1200, 650)
 
         self._init_ui()
+        # Offer this window to the tree's "Set X", as the comparison tool does.
+        # Without it, closing a Plot window opened from here sent the next
+        # Set X past the calculator and into the main window's viewer.
+        register_x_target(self)
 
     def _init_ui(self) -> None:
         """Initialize the user interface with left-right split layout."""
@@ -134,16 +337,10 @@ class DataCalculatorEnhanced(QDialog):
         self.label_info_a.setStyleSheet("color: gray; font-size: 9pt;")
         selection_layout.addRow("", self.label_info_a)
 
-        # Dataset A column selection
-        col_a_layout = QHBoxLayout()
-        col_a_layout.addWidget(QLabel("Column:"))
-        self.spin_col_a = QComboBox()
-        self.spin_col_a.setEnabled(False)
-        self.spin_col_a.setMinimumWidth(150)
-        self.spin_col_a.setToolTip("Select column for multi-column datasets")
-        col_a_layout.addWidget(self.spin_col_a)
-        col_a_layout.addStretch()
-        selection_layout.addRow("", col_a_layout)
+        # Dataset A: which part of it to use.
+        self.lbl_part_a, self.combo_axis_a, self.spin_col_a = self._build_part_row(
+            selection_layout, "A"
+        )
 
         # Dataset B selection - with drag-drop support
         self.combo_dataset_b = DragDropComboBox("-- no dataset B --")
@@ -158,16 +355,10 @@ class DataCalculatorEnhanced(QDialog):
         self.label_info_b.setStyleSheet("color: gray; font-size: 9pt;")
         selection_layout.addRow("", self.label_info_b)
 
-        # Dataset B column selection
-        col_b_layout = QHBoxLayout()
-        col_b_layout.addWidget(QLabel("Column:"))
-        self.spin_col_b = QComboBox()
-        self.spin_col_b.setEnabled(False)
-        self.spin_col_b.setMinimumWidth(150)
-        self.spin_col_b.setToolTip("Select column for multi-column datasets")
-        col_b_layout.addWidget(self.spin_col_b)
-        col_b_layout.addStretch()
-        selection_layout.addRow("", col_b_layout)
+        # Dataset B: which part of it to use.
+        self.lbl_part_b, self.combo_axis_b, self.spin_col_b = self._build_part_row(
+            selection_layout, "B"
+        )
 
         selection_group.setLayout(selection_layout)
         left_layout.addWidget(selection_group)
@@ -248,7 +439,11 @@ class DataCalculatorEnhanced(QDialog):
         operation_layout.addLayout(custom_layout)
 
         # Help text
-        help_label = QLabel("<i>Available: A, optional B, +, -, *, /, **, FFT(A), np.sqrt(), np.abs(), np.log(), etc.</i>")
+        help_label = QLabel(
+            "<i>Available: A, optional B, +, -, *, /, **, FFT(A), "
+            "sqrt() abs() log() exp() mean() max() gradient() ..., np.* math functions, "
+            "pi, e. Slicing (A[:10]) works; anything else is rejected.</i>"
+        )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("color: gray; font-size: 8pt;")
         operation_layout.addWidget(help_label)
@@ -263,27 +458,27 @@ class DataCalculatorEnhanced(QDialog):
         self.btn_transfer_to_comparison.clicked.connect(self._transfer_result_to_comparison)
         left_layout.addWidget(self.btn_transfer_to_comparison)
 
-        # Export button
-        self.btn_export = QPushButton("Export Result...")
+        # The two things you do with a finished result, side by side: write it
+        # out, or draw it. Quick save/copy live as icons in the result viewer
+        # itself, like everywhere else in the app.
+        output_row = QHBoxLayout()
+        self.btn_export = QPushButton("Export")
         self.btn_export.setAutoDefault(False)  # Prevent Enter key from triggering this button
         self.btn_export.clicked.connect(self._export_result)
         self.btn_export.setEnabled(False)
-        left_layout.addWidget(self.btn_export)
+        output_row.addWidget(self.btn_export)
 
-        # Image export/copy helpers for the result display panel
-        image_ops_layout = QHBoxLayout()
-        self.btn_save_image = QPushButton("Save Image...")
-        self.btn_save_image.setAutoDefault(False)
-        self.btn_save_image.setEnabled(False)
-        self.btn_save_image.clicked.connect(self._save_result_image)
-        image_ops_layout.addWidget(self.btn_save_image)
-
-        self.btn_copy_image = QPushButton("Copy Image")
-        self.btn_copy_image.setAutoDefault(False)
-        self.btn_copy_image.setEnabled(False)
-        self.btn_copy_image.clicked.connect(self._copy_result_image)
-        image_ops_layout.addWidget(self.btn_copy_image)
-        left_layout.addLayout(image_ops_layout)
+        # One button with two jobs, because a result has two shapes and only one
+        # of them can be plotted: a curve gets Plot, an image gets Copy. The
+        # dispatch happens on click rather than by reconnecting, so there is
+        # never a moment when the label and the wiring disagree.
+        self.btn_plot = QPushButton(PLOT_BUTTON_TEXT)
+        self.btn_plot.setAutoDefault(False)
+        self.btn_plot.setToolTip(PLOT_BUTTON_TOOLTIP)
+        self.btn_plot.clicked.connect(self._on_plot_or_copy)
+        self.btn_plot.setEnabled(False)
+        output_row.addWidget(self.btn_plot)
+        left_layout.addLayout(output_row)
 
         # Add stretch to push everything to the top
         left_layout.addStretch()
@@ -301,26 +496,14 @@ class DataCalculatorEnhanced(QDialog):
         result_label = QLabel("<b>Calculation Result</b>")
         right_layout.addWidget(result_label)
 
-        # Placeholder for result display
+        # Result display. The real viewer is built straight away, empty, so its
+        # toolbar — Copy / Save / Plot, Set X, the axis switches — is there from
+        # the moment the calculator opens rather than appearing after the first
+        # calculation.
         self.result_container = QWidget()
         self.result_container_layout = QVBoxLayout()
         self.result_container_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Initial empty plot widget (like main window at startup)
-        initial_plot = pg.PlotWidget()
-        initial_plot.setLabel("bottom", "Index")
-        initial_plot.setLabel("left", "Value")
-        initial_plot.showGrid(x=True, y=True, alpha=0.3)
-        initial_plot.setBackground('k')  # Dark theme
-
-        # Set axis colors to white for dark theme
-        axis_pen = pg.mkPen(color='w', width=1)
-        for axis in ['left', 'bottom', 'right', 'top']:
-            initial_plot.getAxis(axis).setPen(axis_pen)
-            initial_plot.getAxis(axis).setTextPen(axis_pen)
-
-        initial_plot.plotItem.vb.setMenuEnabled(False)
-        self.result_container_layout.addWidget(initial_plot)
+        self._create_result_viewer()
 
         self.result_container.setLayout(self.result_container_layout)
         right_layout.addWidget(self.result_container)
@@ -328,9 +511,8 @@ class DataCalculatorEnhanced(QDialog):
         right_panel.setLayout(right_layout)
         splitter.addWidget(right_panel)
 
-        # Set initial splitter sizes to ensure result area toolbar is fully visible
-        # Left: 300px for controls, Right: 850px for result with toolbar
-        splitter.setSizes([300, 850])
+        # The result viewer takes the rest; it has a toolbar to fit.
+        splitter.setSizes([CONTROLS_PANEL_WIDTH, 1200 - CONTROLS_PANEL_WIDTH])
 
         main_layout.addWidget(splitter)
 
@@ -456,6 +638,162 @@ class DataCalculatorEnhanced(QDialog):
                 return f"{fp_str}::{ds_path}"
         return None
 
+    def _build_part_row(self, form: QFormLayout, side: str):
+        """The row that says which part of an operand to use.
+
+        One row, two shapes: a 2-D dataset offers its columns, a 3-D one offers
+        an axis and a frame along it. They are the same question — take a piece
+        out, or use the whole thing — so they share a row rather than each
+        getting one that is empty most of the time.
+        """
+        row = QHBoxLayout()
+        axis_label_widget = QLabel("Axis:")
+        axis_label_widget.setVisible(False)
+        row.addWidget(axis_label_widget)
+
+        axis_combo = QComboBox()
+        axis_combo.setToolTip("Which array axis the frames are counted along")
+        # Sized from what it holds, and never below "Axis 0 (1200)" plus the
+        # arrow: a combo's hint is otherwise settled the first time it is shown,
+        # which here is before it has any items, and the entries then come out
+        # elided to "Axis 0 (1...".
+        axis_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        axis_combo.setMinimumWidth(AXIS_COMBO_MIN_WIDTH)
+        axis_combo.setMaximumWidth(AXIS_COMBO_MAX_WIDTH)
+        axis_combo.setVisible(False)
+        axis_combo.currentIndexChanged.connect(
+            lambda _i, s=side: self._on_axis_changed(s)
+        )
+        row.addWidget(axis_combo)
+
+        label = QLabel("Column:")
+        row.addWidget(label)
+
+        part_combo = QComboBox()
+        part_combo.setEnabled(False)
+        # Sized from its entries, like the axis box beside it. The old 150px
+        # minimum was set for "All columns"; the entries are values now.
+        part_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        part_combo.setMinimumWidth(PART_COMBO_MIN_WIDTH)
+        part_combo.setMaximumWidth(PART_COMBO_MAX_WIDTH)
+        part_combo.setToolTip("Select column for multi-column datasets")
+        row.addWidget(part_combo)
+        row.addStretch()
+        form.addRow("", row)
+        # Kept together so _configure_part_row can show or hide the axis pair.
+        label.axis_label = axis_label_widget
+        return label, axis_combo, part_combo
+
+    def _configure_part_row(self, side: str, shape: tuple[int, ...]) -> None:
+        """Point one operand's row at the shape actually loaded."""
+        label = self.lbl_part_a if side == "A" else self.lbl_part_b
+        axis_combo = self.combo_axis_a if side == "A" else self.combo_axis_b
+        part_combo = self.spin_col_a if side == "A" else self.spin_col_b
+
+        previous = part_combo.currentData()
+        part_combo.clear()
+
+        # The entries carry the value only. Repeating "Slice" or "Column" in
+        # every one of them, next to a label that already says it, is what made
+        # these boxes twice as wide as anything they hold.
+        if len(shape) >= 3:
+            label.setText("Slice:")
+            label.axis_label.setVisible(True)
+            axis_combo.setVisible(True)
+            axis = self._rebuild_axis_combo(axis_combo, shape)
+            part_combo.addItem("All", SELECT_ALL)
+            for index in range(shape[axis]):
+                part_combo.addItem(str(index), index)
+            part_combo.setEnabled(True)
+            part_combo.setToolTip(
+                "One frame of the stack, or all of them.\n"
+                "A single frame against a whole stack subtracts that frame "
+                "from every one of them."
+            )
+        elif len(shape) == 2:
+            label.setText("Column:")
+            label.axis_label.setVisible(False)
+            axis_combo.setVisible(False)
+            part_combo.addItem("All", SELECT_ALL)
+            for index in range(shape[1]):
+                part_combo.addItem(str(index), index)
+            part_combo.setEnabled(True)
+            part_combo.setToolTip("Select column for multi-column datasets")
+        else:
+            label.setText("Column:")
+            label.axis_label.setVisible(False)
+            axis_combo.setVisible(False)
+            part_combo.addItem("N/A", SELECT_ALL)
+            part_combo.setEnabled(False)
+            return
+
+        if previous is not None:
+            for index in range(part_combo.count()):
+                if part_combo.itemData(index) == previous:
+                    part_combo.setCurrentIndex(index)
+                    break
+
+    @staticmethod
+    def _rebuild_axis_combo(axis_combo: QComboBox, shape: tuple[int, ...]) -> int:
+        """Fill an axis selector for ``shape`` and return the axis in force.
+
+        Bare numbers here, where the viewer and the export dialog write
+        ``0 (400)``: the shape is printed on the line directly above this row,
+        so carrying each axis's length in the entries repeats what is already
+        on screen and doubles the width of the box.
+        """
+        previous = axis_combo.currentData()
+        axis_combo.blockSignals(True)
+        axis_combo.clear()
+        for axis in range(len(shape)):
+            axis_combo.addItem(str(axis), axis)
+        if previous is not None and 0 <= int(previous) < len(shape):
+            axis_combo.setCurrentIndex(int(previous))
+        axis_combo.blockSignals(False)
+        return int(axis_combo.currentData() or 0)
+
+    def _on_axis_changed(self, side: str) -> None:
+        """Re-list the frames when the axis changes: a different axis, a
+        different number of them."""
+        if self._is_populating_combos:
+            return
+        combo = self.combo_dataset_a if side == "A" else self.combo_dataset_b
+        shape = self._dataset_shape(combo)
+        if shape is None or len(shape) < 3:
+            return
+        axis_combo = self.combo_axis_a if side == "A" else self.combo_axis_b
+        part_combo = self.spin_col_a if side == "A" else self.spin_col_b
+        axis = int(axis_combo.currentData() or 0)
+
+        part_combo.blockSignals(True)
+        part_combo.clear()
+        part_combo.addItem("All", SELECT_ALL)
+        for index in range(shape[axis]):
+            part_combo.addItem(str(index), index)
+        part_combo.blockSignals(False)
+
+    def _dataset_shape(self, combo: QComboBox) -> tuple[int, ...] | None:
+        """The shape of the dataset a combo points at, or None."""
+        resolved = self._resolve_dataset_from_combo(combo)
+        if not resolved:
+            return None
+        file_path, dataset_path = resolved
+        try:
+            with h5py.File(file_path, "r") as f:
+                return tuple(f[dataset_path].shape)
+        except Exception as exc:
+            logging.warning("Could not read the shape of %s: %s", dataset_path, exc)
+            return None
+
+    def _operand_selection(self, side: str) -> tuple[int, int]:
+        """``(axis, index)`` for one operand; index -1 means "the whole thing"."""
+        axis_combo = self.combo_axis_a if side == "A" else self.combo_axis_b
+        part_combo = self.spin_col_a if side == "A" else self.spin_col_b
+        axis = axis_combo.currentData()
+        index = part_combo.currentData()
+        return (int(axis) if axis is not None else 0,
+                int(index) if index is not None else SELECT_ALL)
+
     def _on_dataset_line_entered(self, combo: QComboBox, side: str) -> None:
         """Handle Enter in editable dataset combobox."""
         resolved = self._resolve_dataset_from_combo(combo)
@@ -471,115 +809,52 @@ class DataCalculatorEnhanced(QDialog):
         else:
             self._on_dataset_b_changed()
 
-    def _on_dataset_a_changed(self) -> None:
-        """Update dataset A info label and column selector when selection changes."""
+    def _on_dataset_changed(self, side: str) -> None:
+        """Re-describe one operand after its dataset selection changed.
+
+        A and B were two near-identical copies of this; they are one method now,
+        which is what let the 3-D case be added in a single place.
+        """
         if self._is_populating_combos:
             return
-        logging.info("_on_dataset_a_changed: START")
-        resolved = self._resolve_dataset_from_combo(self.combo_dataset_a)
-        if resolved:
-            file_path, dataset_path = resolved
-            logging.info(f"_on_dataset_a_changed: file_path={file_path}, dataset_path={dataset_path}")
-            try:
-                logging.info(f"_on_dataset_a_changed: Opening file {file_path}")
-                with h5py.File(file_path, "r") as f:
-                    logging.info(f"_on_dataset_a_changed: File opened, accessing dataset")
-                    dataset = f[dataset_path]
-                    logging.info(f"_on_dataset_a_changed: Got dataset, shape={dataset.shape}")
-                    shape = dataset.shape
-                    self.label_info_a.setText(f"Shape: {shape}, Type: {dataset.dtype}")
+        combo = self.combo_dataset_a if side == "A" else self.combo_dataset_b
+        info = self.label_info_a if side == "A" else self.label_info_b
+        part_combo = self.spin_col_a if side == "A" else self.spin_col_b
 
-                    # Store current column selection
-                    current_col = self.spin_col_a.currentData()
-                    logging.info(f"_on_dataset_a_changed: Current col={current_col}")
+        resolved = self._resolve_dataset_from_combo(combo)
+        if not resolved:
+            info.setText("Shape: -, Type: -")
+            self._configure_part_row(side, ())
+            return
 
-                    # Update column selector for A
-                    logging.info(f"_on_dataset_a_changed: Clearing column selector")
-                    self.spin_col_a.clear()
-                    if len(shape) == 2:
-                        # Multi-column dataset - enable column selection
-                        num_cols = shape[1]
-                        self.spin_col_a.addItem("All columns", -1)
-                        for i in range(num_cols):
-                            self.spin_col_a.addItem(f"Column {i}", i)
-                        self.spin_col_a.setEnabled(True)
-                        self.label_info_a.setText(
-                            f"Shape: {shape}, Type: {dataset.dtype} | <b>{num_cols} columns</b>"
-                        )
+        file_path, dataset_path = resolved
+        try:
+            with h5py.File(file_path, "r") as f:
+                dataset = f[dataset_path]
+                shape = tuple(dataset.shape)
+                dtype = dataset.dtype
+        except Exception as exc:
+            logging.error("Could not describe %s: %s", dataset_path, exc)
+            info.setText(f"Error: {exc}")
+            part_combo.clear()
+            part_combo.setEnabled(False)
+            return
 
-                        # Restore previous column selection if it was valid
-                        if current_col is not None and current_col >= -1 and current_col < num_cols:
-                            for i in range(self.spin_col_a.count()):
-                                if self.spin_col_a.itemData(i) == current_col:
-                                    self.spin_col_a.setCurrentIndex(i)
-                                    break
-                    else:
-                        # 1D dataset - disable column selection
-                        self.spin_col_a.addItem("N/A", -1)
-                        self.spin_col_a.setEnabled(False)
+        note = ""
+        if len(shape) >= 3:
+            note = f" | <b>{shape[0]} slices</b>"
+        elif len(shape) == 2:
+            note = f" | <b>{shape[1]} columns</b>"
+        info.setText(f"Shape: {shape}, Type: {dtype}{note}")
+        self._configure_part_row(side, shape)
 
-            except Exception as e:
-                logging.error(f"_on_dataset_a_changed: Error: {e}")
-                self.label_info_a.setText(f"Error: {e}")
-                self.spin_col_a.clear()
-                self.spin_col_a.setEnabled(False)
-        else:
-            self.label_info_a.setText("Shape: -, Type: -")
-            self.spin_col_a.clear()
-            self.spin_col_a.addItem("N/A", -1)
-            self.spin_col_a.setEnabled(False)
-
-        logging.info("_on_dataset_a_changed: END")
+    def _on_dataset_a_changed(self) -> None:
+        """Update dataset A info label and part selector when selection changes."""
+        self._on_dataset_changed("A")
 
     def _on_dataset_b_changed(self) -> None:
-        """Update dataset B info label and column selector when selection changes."""
-        if self._is_populating_combos:
-            return
-        resolved = self._resolve_dataset_from_combo(self.combo_dataset_b)
-        if resolved:
-            file_path, dataset_path = resolved
-            try:
-                with h5py.File(file_path, "r") as f:
-                    dataset = f[dataset_path]
-                    shape = dataset.shape
-                    self.label_info_b.setText(f"Shape: {shape}, Type: {dataset.dtype}")
-
-                    # Store current column selection
-                    current_col = self.spin_col_b.currentData()
-
-                    # Update column selector for B
-                    self.spin_col_b.clear()
-                    if len(shape) == 2:
-                        # Multi-column dataset - enable column selection
-                        num_cols = shape[1]
-                        self.spin_col_b.addItem("All columns", -1)
-                        for i in range(num_cols):
-                            self.spin_col_b.addItem(f"Column {i}", i)
-                        self.spin_col_b.setEnabled(True)
-                        self.label_info_b.setText(
-                            f"Shape: {shape}, Type: {dataset.dtype} | <b>{num_cols} columns</b>"
-                        )
-
-                        # Restore previous column selection if it was valid
-                        if current_col is not None and current_col >= -1 and current_col < num_cols:
-                            for i in range(self.spin_col_b.count()):
-                                if self.spin_col_b.itemData(i) == current_col:
-                                    self.spin_col_b.setCurrentIndex(i)
-                                    break
-                    else:
-                        # 1D dataset - disable column selection
-                        self.spin_col_b.addItem("N/A", -1)
-                        self.spin_col_b.setEnabled(False)
-
-            except Exception as e:
-                self.label_info_b.setText(f"Error: {e}")
-                self.spin_col_b.clear()
-                self.spin_col_b.setEnabled(False)
-        else:
-            self.label_info_b.setText("Shape: -, Type: -")
-            self.spin_col_b.clear()
-            self.spin_col_b.addItem("N/A", -1)
-            self.spin_col_b.setEnabled(False)
+        """Update dataset B info label and part selector when selection changes."""
+        self._on_dataset_changed("B")
 
     @staticmethod
     def _fft_magnitude(data: np.ndarray) -> np.ndarray:
@@ -618,12 +893,10 @@ class DataCalculatorEnhanced(QDialog):
                 from src.gui.main_window import load_regular_data_file
                 data_a = load_regular_data_file(file_path_a)
 
-            # Apply column selection for A
-            col_a = self.spin_col_a.currentData()
-            if col_a is not None and col_a >= 0 and data_a.ndim == 2:
-                # Select specific column
-                data_a = data_a[:, col_a]
-                logging.info(f"Dataset A: Selected column {col_a}, new shape: {data_a.shape}")
+            # Cut A down to the column, or the frame, that was asked for.
+            axis_a, index_a = self._operand_selection("A")
+            data_a = operand_from_selection(data_a, axis_a, index_a)
+            logging.info("Dataset A: axis=%s index=%s -> %s", axis_a, index_a, data_a.shape)
 
             data_b = None
             if resolved_b:
@@ -636,12 +909,9 @@ class DataCalculatorEnhanced(QDialog):
                     from src.gui.main_window import load_regular_data_file
                     data_b = load_regular_data_file(file_path_b)
 
-                # Apply column selection for B
-                col_b = self.spin_col_b.currentData()
-                if col_b is not None and col_b >= 0 and data_b.ndim == 2:
-                    # Select specific column
-                    data_b = data_b[:, col_b]
-                    logging.info(f"Dataset B: Selected column {col_b}, new shape: {data_b.shape}")
+                axis_b, index_b = self._operand_selection("B")
+                data_b = operand_from_selection(data_b, axis_b, index_b)
+                logging.info("Dataset B: axis=%s index=%s -> %s", axis_b, index_b, data_b.shape)
 
             return data_a, data_b
 
@@ -662,15 +932,17 @@ class DataCalculatorEnhanced(QDialog):
 
         data_a, data_b = datasets
 
-        # Check shape compatibility
-        if data_b is not None and data_a.shape != data_b.shape:
+        # Ask only about shapes numpy genuinely cannot pair up. Different
+        # shapes that broadcast are not a mismatch — one frame against a whole
+        # stack is a dark-frame subtraction, and asking "attempt anyway?" every
+        # time would make the most ordinary use of a stack read like a mistake.
+        if data_b is not None and not _shapes_broadcast(data_a.shape, data_b.shape):
             reply = QMessageBox.question(
                 self,
                 "Shape Mismatch",
                 f"Dataset A shape: {data_a.shape}\n"
                 f"Dataset B shape: {data_b.shape}\n\n"
-                f"Shapes don't match. Attempt operation anyway?\n"
-                f"(Broadcasting may occur)",
+                f"These shapes cannot be combined. Attempt the operation anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
@@ -682,33 +954,27 @@ class DataCalculatorEnhanced(QDialog):
             self.data_a = data_a
             self.data_b = data_b
 
-            # Create namespace for evaluation
-            # Convert to float64 to handle negative values from subtraction
-            namespace = {
-                "__builtins__": {},
-                "A": data_a.astype(np.float64),
-                "np": np,
-                "FFT": self._fft_magnitude,
-            }
+            # Bind user data by name. Convert to float64 to handle negative
+            # values from subtraction.
+            variables: dict[str, Any] = {"A": data_a.astype(np.float64)}
             if data_b is not None:
-                namespace["B"] = data_b.astype(np.float64)
+                variables["B"] = data_b.astype(np.float64)
 
-            # Evaluate expression
-            self.result_data = eval(expression, namespace)
-            self.result_data = np.asarray(self.result_data)
+            # Evaluate through the whitelisted evaluator (src.recon.expr), which
+            # rejects attribute/name escapes before compiling the expression.
+            self.result_data = np.asarray(
+                _evaluate_expression(expression, variables, {"FFT": self._fft_magnitude})
+            )
 
             # Automatically squeeze out dimensions of size 1
-            original_shape = self.result_data.shape
             self.result_data = np.squeeze(self.result_data)
-            squeezed = original_shape != self.result_data.shape
 
             # Update result display in right panel
             self._update_result_display()
 
             # Enable export button
             self.btn_export.setEnabled(True)
-            self.btn_save_image.setEnabled(True)
-            self.btn_copy_image.setEnabled(True)
+            self.btn_plot.setEnabled(True)
             can_transfer = False
             if self.result_data is not None:
                 ndim = int(getattr(self.result_data, "ndim", 0))
@@ -723,20 +989,27 @@ class DataCalculatorEnhanced(QDialog):
 
             logging.info(f"Calculation successful: {expression}")
 
+        except ExpressionError as e:
+            QMessageBox.critical(
+                self,
+                "Invalid Expression",
+                f"Cannot evaluate:\n  {expression}\n\n{e}\n\n"
+                "Allowed: A, optional B, arithmetic, FFT(), sqrt()/log()/abs()..., np.*",
+            )
+            logging.warning(f"Rejected expression '{expression}': {e}")
+
         except Exception as e:
             QMessageBox.critical(self, "Calculation Error", f"Failed to perform calculation:\n{e}")
             logging.error(f"Calculation error: {e}")
 
-    def _update_result_display(self) -> None:
-        """Update the result display panel with calculation result."""
-        # Clear current result widget
+    def _create_result_viewer(self) -> None:
+        """Build the result viewer, empty, and put it in the container."""
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
         for i in reversed(range(self.result_container_layout.count())):
             widget = self.result_container_layout.itemAt(i).widget()
             if widget:
                 widget.deleteLater()
-
-        # Use unified data viewer for automatic widget selection
-        from src.gui.unified_data_viewer import UnifiedDataViewer
 
         viewer = UnifiedDataViewer(
             parent=self,
@@ -744,22 +1017,93 @@ class DataCalculatorEnhanced(QDialog):
             dataset_full_keys_1d=self.dataset_full_keys_1d,
         )
         viewer.q_calibration_requested.connect(self._on_q_request_from_result_viewer)
-        viewer.set_data(self.result_data, source_dataset_key="Result::calculation_result")
+        # An empty curve: it draws nothing but brings the toolbar with it.
+        viewer.set_data(np.zeros(0), source_dataset_key="Result::calculation_result")
         self.result_container_layout.addWidget(viewer)
         self.result_widget = viewer
 
+    def reset_results(self) -> None:
+        """Throw away the calculated result and the arrays it was made from.
+
+        The window is kept alive between uses so that reopening is instant, but
+        that made closing it look like a reset it was not: it came back showing
+        the previous result, which reads as a result for whatever is selected
+        now. The A/B selections are left alone — they are the question, not the
+        answer, and both are re-read from the files on the next calculation.
+        """
+        self.result_data = None
+        self.data_a = None
+        self.data_b = None
+        self._last_operation_expr = ""
+
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
+        if isinstance(self.result_widget, UnifiedDataViewer):
+            self.result_widget.set_data(np.zeros(0), source_dataset_key="Result::calculation_result")
+        else:
+            self._create_result_viewer()
+
+        # Nothing to export, plot or transfer until something is calculated.
+        for button in (self.btn_export, self.btn_plot, self.btn_transfer_to_comparison):
+            button.setEnabled(False)
+        self._update_output_button()
+
+    def closeEvent(self, event) -> None:
+        """Closing the window means starting over next time."""
+        self.reset_results()
+        super().closeEvent(event)
+
+    def _update_result_display(self) -> None:
+        """Show the calculation result in the viewer.
+
+        The viewer is reused rather than rebuilt, so the toolbar does not blink
+        out of existence between calculations.
+        """
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
+        if not isinstance(self.result_widget, UnifiedDataViewer):
+            self._create_result_viewer()
+
+        viewer = self.result_widget
+        assert isinstance(viewer, UnifiedDataViewer)
+        viewer.set_data(self.result_data, source_dataset_key="Result::calculation_result")
+
+        # The axis was chosen per operand and the result reoriented to match, so
+        # the viewer's own axis selector would be a second control for a
+        # settled question. The slider stays: browsing the frames is still
+        # worth doing.
+        shown = viewer.get_current_widget()
+        if hasattr(shown, "set_axis_choice_visible"):
+            shown.set_axis_choice_visible(False)
+        # The one place a result reaches the viewer, so the one place the button
+        # has to be told what kind of result it is now offering to act on.
+        self._update_output_button()
+
     def _on_q_request_from_result_viewer(self, _source_dataset_key: object) -> None:
-        """Handle Q button from calculator result view and open Q calibration tool."""
+        """Send what the result viewer is showing to the pattern tool.
+
+        For a stack that means the frame on screen. The guard used to be
+        ``ndim == 2``, so pressing Q on a stack did nothing at all — no tool,
+        no message — and now that a calculation can produce a stack that is a
+        button that appears to be broken.
+        """
         mw = self.parent()
         try:
-            if (
-                mw is not None
-                and self.result_data is not None
-                and getattr(self.result_data, "ndim", 0) == 2
-                and hasattr(mw, "open_q_tool_for_array")
-            ):
-                mw.open_q_tool_for_array(np.asarray(self.result_data), source_label="calculator_result")
-            # Non-2D results do not expose Q button in UI; ignore silently.
+            if mw is None or self.result_data is None or not hasattr(mw, "open_q_tool_for_array"):
+                return
+
+            data = np.asarray(self.result_data)
+            label = self._result_label()
+            if data.ndim > 2:
+                widget = self._result_image_widget()
+                index = int(getattr(widget, "current_slice_index", 0)) if widget else 0
+                axis = int(getattr(widget, "current_slice_axis", 0)) if widget else 0
+                data = operand_from_selection(data, axis, min(index, data.shape[axis % data.ndim] - 1))
+                label = f"{label} [axis {axis}, slice {index}]"
+            if data.ndim != 2:
+                return
+
+            mw.open_q_tool_for_array(data, source_label=label)
         except Exception as e:
             logging.error(f"Failed to open Q calibration tool from calculator: {e}")
 
@@ -817,7 +1161,7 @@ class DataCalculatorEnhanced(QDialog):
                 msg.setWindowTitle("Transfer 2D Result")
                 msg.setText(f"Result has {arr.shape[1]} columns.")
                 msg.setInformativeText("Choose transfer mode:")
-                btn_all = msg.addButton("Transfer all columns", QMessageBox.ButtonRole.AcceptRole)
+                msg.addButton("Transfer all columns", QMessageBox.ButtonRole.AcceptRole)
                 btn_one = msg.addButton("Transfer one column", QMessageBox.ButtonRole.ActionRole)
                 btn_cancel = msg.addButton(QMessageBox.StandardButton.Cancel)
                 msg.exec()
@@ -846,129 +1190,6 @@ class DataCalculatorEnhanced(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Transfer Failed", f"Failed to transfer result:\n{e}")
 
-    def _result_capture_pixmap(self) -> QPixmap | None:
-        """Capture result image based on active viewer type."""
-        if self.result_widget is None:
-            return None
-        try:
-            from src.gui.unified_data_viewer import UnifiedDataViewer
-            from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
-            from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
-
-            target = self.result_widget
-            if isinstance(self.result_widget, UnifiedDataViewer):
-                current = self.result_widget.get_current_widget()
-                if current is not None:
-                    target = current
-
-            # 2D image view: capture the rendered image area (includes histogram/colorbar)
-            if isinstance(target, ImageView2DEnhanced):
-                return target.graphics_layout.grab()
-
-            # 1D/curve view: capture the graph display only
-            if isinstance(target, PlotWidget1DEnhanced):
-                return target.plot_widget.grab()
-
-            # Fallback for other widget types
-            return target.grab()
-        except Exception as e:
-            logging.error(f"Failed to capture result pixmap: {e}")
-            return None
-
-    def _current_result_image_view(self):
-        """Return active 2D result image viewer, if the result is image-like."""
-        if self.result_widget is None:
-            return None
-        try:
-            from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
-            from src.gui.unified_data_viewer import UnifiedDataViewer
-
-            target = self.result_widget
-            if isinstance(target, UnifiedDataViewer):
-                target = target.get_current_widget()
-            if isinstance(target, ImageView2DEnhanced):
-                return target
-        except Exception:
-            return None
-        return None
-
-    def _save_result_image(self) -> None:
-        """Save current result view as an image."""
-        image_view = self._current_result_image_view()
-        if image_view is not None:
-            image_view.save_colormapped_image_dialog(self._default_export_base_name())
-            return
-
-        pixmap = self._result_capture_pixmap()
-        if pixmap is None or pixmap.isNull():
-            QMessageBox.warning(self, "No Image", "No result image available to save.")
-            return
-
-        from src.gui.image_view_2d_enhanced import IMAGE_SAVE_FILTER, ImageView2DEnhanced
-        from PyQt6.QtCore import QSettings
-
-        settings = QSettings()
-        saved_dir = settings.value("paths/last_export_directory", defaultValue=str(pathlib.Path.home()))
-        default_dir = pathlib.Path(str(saved_dir)) if saved_dir else pathlib.Path.home()
-        if not default_dir.exists():
-            default_dir = pathlib.Path.home()
-        base = self._default_export_base_name()
-        default_name = str(default_dir / f"{base}.png")
-        file_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Save Result Image",
-            default_name,
-            IMAGE_SAVE_FILTER,
-        )
-        if not file_path:
-            return
-
-        export_path = pathlib.Path(file_path)
-        if not export_path.suffix:
-            export_path = export_path.with_suffix(ImageView2DEnhanced.image_extension_from_filter(selected_filter))
-            file_path = str(export_path)
-
-        settings.setValue("paths/last_export_directory", str(export_path.parent))
-        fmt = ImageView2DEnhanced.image_format_from_path(file_path, selected_filter)
-        ok = pixmap.save(file_path, fmt, 95 if fmt == "JPEG" else -1)
-        if ok:
-            logging.info(f"Saved result image to: {file_path}")
-        else:
-            QMessageBox.critical(self, "Save Failed", f"Failed to save image:\n{file_path}")
-
-    def _copy_result_image(self) -> None:
-        """Copy current result image to system clipboard."""
-        image_view = self._current_result_image_view()
-        if image_view is not None:
-            image_view.copy_colormapped_image_to_clipboard()
-            return
-
-        pixmap = self._result_capture_pixmap()
-        if pixmap is None or pixmap.isNull():
-            QMessageBox.warning(self, "No Image", "No result image available to copy.")
-            return
-
-        clipboard: QClipboard = QApplication.clipboard()
-        clipboard.setPixmap(pixmap)
-
-        # Also attach JPEG bytes so image-focused apps can paste as JPEG when supported.
-        try:
-            jpeg_bytes = QByteArray()
-            buf = QBuffer(jpeg_bytes)
-            buf.open(QBuffer.OpenModeFlag.WriteOnly)
-            pixmap.toImage().save(buf, "JPEG", 95)
-            buf.close()
-
-            mime = QMimeData()
-            mime.setImageData(pixmap.toImage())
-            if not jpeg_bytes.isEmpty():
-                mime.setData("image/jpeg", jpeg_bytes)
-            clipboard.setMimeData(mime)
-        except Exception as e:
-            logging.debug(f"Failed to add JPEG mime payload: {e}")
-
-        logging.info("Copied result image to clipboard")
-
     @staticmethod
     def _scan_head_and_number(file_path: str) -> tuple[str, str]:
         """Extract (head, scan_number) from file stem, e.g. scanx_0035 -> (scanx, 0035)."""
@@ -996,22 +1217,330 @@ class DataCalculatorEnhanced(QDialog):
         }
         return mapping.get(key, "calcu")
 
-    def _default_export_base_name(self) -> str:
-        """Build default filename: head_numA_numB_suffix."""
-        entry_a = self.combo_dataset_a.get_entry(opened_files=self.opened_files)
-        entry_b = self.combo_dataset_b.get_entry(opened_files=self.opened_files)
-        if entry_a and entry_b:
-            head_a, n1 = self._scan_head_and_number(str(entry_a[0]))
-            head_b, n2 = self._scan_head_and_number(str(entry_b[0]))
-            head = head_a if head_a else (head_b if head_b else "scan")
-        elif entry_a:
-            head, n1 = self._scan_head_and_number(str(entry_a[0]))
-            n2 = "single"
-        else:
-            head, n1, n2 = "scan", "0000", "0000"
-        suffix = self._suffix_from_expression(self._last_operation_expr)
-        return f"{head}_{n1}_{n2}_{suffix}"
+    def _operand_key(self, combo) -> str | None:
+        """The ``file::dataset`` an operand combo currently points at."""
+        entry = combo.get_entry(opened_files=self.opened_files)
+        return f"{entry[0]}::{entry[1]}" if entry else None
 
+    def _operand_label(self, combo, col_combo, fallback: str) -> str:
+        """Name an operand the way every other curve in the application is named.
+
+        ``scanx_0083_data_04_col2`` — scan, dataset, and the column when one was
+        picked out. ``Data_A`` said only which side of the expression it was on,
+        which is no help at all once the figure leaves the calculator.
+        """
+        key = self._operand_key(combo)
+        if not key:
+            return fallback
+        column = col_combo.currentData()
+        if column is not None and column >= 0:
+            # The suffix short_series_label reads a column out of.
+            key = f"{key} [Col {column}]"
+        return short_series_label(key, fallback=fallback)
+
+    def _result_label(self) -> str:
+        """Name the result after what was done, not after the word "result".
+
+        With the operands carrying their scan and dataset names, the one thing
+        the third curve still has to say is which operation it came from.
+        """
+        expression = " ".join((self._last_operation_expr or "").split())
+        return expression or "Result"
+
+    def _default_export_base_name(self) -> str:
+        """Name the result after the two operands and what was done to them.
+
+        Whatever distinguishes A from B is what goes in the name — two scans,
+        two datasets of one scan, or two columns of one dataset. See
+        :func:`src.gui.export_naming.pair_label`.
+        """
+        base = pair_label(
+            self._operand_key(self.combo_dataset_a),
+            self._operand_key(self.combo_dataset_b),
+        )
+        suffix = self._suffix_from_expression(self._last_operation_expr)
+        return f"{base}_{suffix}"
+
+    def _result_plot_widget(self):
+        """The 1-D curve widget inside the result viewer, or None."""
+        from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
+        widget = self.result_widget
+        if isinstance(widget, UnifiedDataViewer):
+            widget = widget.get_current_widget()
+        return widget if isinstance(widget, PlotWidget1DEnhanced) else None
+
+    def _result_image_widget(self):
+        """The 2-D image widget inside the result viewer, or None."""
+        from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
+        widget = self.result_widget
+        if isinstance(widget, UnifiedDataViewer):
+            widget = widget.get_current_widget()
+        return widget if isinstance(widget, ImageView2DEnhanced) else None
+
+    def result_is_image(self) -> bool:
+        """Whether the result is being *shown* as an image rather than a curve.
+
+        Asked of the viewer, not of the array's shape: a 2-D result with a few
+        columns is drawn as several curves, and going by ``ndim`` would offer
+        Copy for something the user is looking at as a plot.
+        """
+        return self._result_image_widget() is not None
+
+    def _update_output_button(self) -> None:
+        """Point the second output button at whatever this result can do.
+
+        Plotting an image would flatten it into one very long curve, which is
+        not a picture of anything; copying it is the useful thing there.
+        """
+        image = self.result_is_image()
+        self.btn_plot.setText(COPY_BUTTON_TEXT if image else PLOT_BUTTON_TEXT)
+        self.btn_plot.setToolTip(COPY_BUTTON_TOOLTIP if image else PLOT_BUTTON_TOOLTIP)
+
+    def _on_plot_or_copy(self) -> None:
+        """Whichever of the two the button is currently offering."""
+        if self.result_is_image():
+            self.copy_result_image()
+        else:
+            self.open_plot()
+
+    def copy_result_image(self) -> None:
+        """Put the result image on the clipboard, colormap and all."""
+        widget = self._result_image_widget()
+        if widget is None:
+            QMessageBox.information(self, "No Image", "Calculate a 2-D result first.")
+            return
+        widget.quick_copy()
+
+    def _displayed_result(self) -> np.ndarray | None:
+        """The result as the viewer is showing it, despiked if its filter is on.
+
+        The viewer's Despike button is where a glitch in a calculated curve gets
+        removed, so the plot and the export have to follow it. Reading
+        ``result_data`` directly would put the spike back in both, which is the
+        worst outcome: the filter would look like it had worked.
+        """
+        widget = self._result_plot_widget()
+        displayed = getattr(widget, "display_y", None) if widget is not None else None
+        if displayed is None or self.result_data is None:
+            return self.result_data
+        # A shape mismatch means the viewer is showing something else entirely.
+        if np.shape(displayed) != np.shape(self.result_data):
+            return self.result_data
+        return displayed
+
+    def _despike_comment(self) -> list[str]:
+        """The line the export carries when the result was filtered."""
+        widget = self._result_plot_widget()
+        if widget is None:
+            return []
+        return widget._despike_comment()
+
+    def _viewer_x_dataset_key(self) -> str | None:
+        """The X dataset the result viewer is currently using, if any."""
+        widget = self._result_plot_widget()
+        return getattr(widget, "x_dataset_path", None) if widget is not None else None
+
+    def can_take_x(self) -> bool:
+        """Whether there is a result for an X axis to go against.
+
+        Being the window in front is a claim on ``Set X``. With nothing
+        calculated the claim has to be dropped, or the choice is swallowed here
+        and never reaches the viewer in the main window — which is what closing
+        the calculator, and so clearing its result, started causing.
+        """
+        widget = self._result_plot_widget()
+        y_data = getattr(widget, "y_data", None) if widget is not None else None
+        return y_data is not None and bool(len(y_data))
+
+    def set_x_dataset(self, key: str) -> bool:
+        """Take an X dataset handed over by the tree's ``Set X``.
+
+        Applied to the result viewer, which is where the export and the plot
+        both read their X from — the same place the viewer's own ``Set X``
+        button writes it.
+        """
+        widget = self._result_plot_widget()
+        if widget is None or getattr(widget, "y_data", None) is None or not len(widget.y_data):
+            QMessageBox.information(self, "No Result", "Run a calculation first.")
+            return False
+
+        try:
+            x_data = read_x_dataset(key)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Use As X", str(exc))
+            return False
+        except Exception as exc:
+            logging.warning("Could not read %s as X: %s", key, exc)
+            QMessageBox.warning(self, "Cannot Use As X", f"Could not read the dataset:\n{exc}")
+            return False
+
+        if len(x_data) != len(widget.y_data):
+            QMessageBox.warning(
+                self,
+                "Length Mismatch",
+                f"The X dataset is {len(x_data)} long and the result is "
+                f"{len(widget.y_data)}, so nothing was changed.",
+            )
+            return False
+
+        widget._on_x_data_selected(x_data, key)
+        return True
+
+    def _result_export_columns(self, x_key: str | None) -> tuple[list[str], list[Any]]:
+        """Build the columns a full export would write: optional X, A, B, Result."""
+        headers: list[str] = []
+        columns: list[Any] = []
+
+        if x_key:
+            x_data = self._load_full_key_1d(x_key)
+            if x_data is not None:
+                headers.append(x_column_header(x_key))
+                columns.append(x_data)
+
+        if self.data_a is not None:
+            headers.append(self._operand_label(self.combo_dataset_a, self.spin_col_a, "Data_A"))
+            columns.append(np.ravel(self.data_a))
+        if self.data_b is not None:
+            headers.append(self._operand_label(self.combo_dataset_b, self.spin_col_b, "Data_B"))
+            columns.append(np.ravel(self.data_b))
+
+        # The result goes last, and everything downstream relies on that rather
+        # than on matching its name — which is no longer a fixed word.
+        headers.append(self._result_label())
+        columns.append(np.ravel(self._displayed_result()))
+        return headers, columns
+
+    def plot_series(self) -> list:
+        """The operands and the result as plot Series, against the chosen X.
+
+        Same source as the export columns, so the figure cannot disagree with
+        the file.
+        """
+        from src.gui.plot_series import series_from_table
+
+        if self.result_data is None:
+            return []
+        headers, columns = self._result_export_columns(self._viewer_x_dataset_key())
+        return series_from_table(headers, columns)
+
+    def plot_axes_series(self) -> tuple[list, list]:
+        """The curves split by axis: ``(operands, result)``.
+
+        A calculator result rarely shares a scale with its operands — a ratio
+        against raw counts, an FFT against a sweep — so putting them on one axis
+        flattens whichever is smaller into the baseline. The operands go on the
+        left, the result on its own axis to the right.
+        """
+        series = self.plot_series()
+        if not series:
+            return ([], [])
+        # By position, not by name: the result curve is now labelled with the
+        # expression, so there is no fixed word left to match on.
+        operands, result = series[:-1], series[-1:]
+        # With no operands to compare against, a second axis buys nothing.
+        return (operands, result) if operands else (result, [])
+
+    def open_plot(self) -> None:
+        """Open a Plot window on the result: the Export button's twin."""
+        from src.gui.plot_dialog import open_plot_dialog
+
+        operands, result = self.plot_axes_series()
+        if not operands and not result:
+            QMessageBox.information(self, "No Result", "Run a calculation first.")
+            return
+        open_plot_dialog(
+            self,
+            operands,
+            right_series=result,
+            title="Calculator",
+            # The right axis carries the result, so it is labelled with the same
+            # expression its curve is.
+            right_label=self._result_label(),
+        )
+
+    def _load_full_key_1d(self, full_key: str) -> np.ndarray | None:
+        """Read a 1-D dataset given a ``file::dataset`` key."""
+        try:
+            file_part, ds_path = full_key.split("::", 1)
+            with h5py.File(file_part, "r") as f:
+                if ds_path not in f:
+                    return None
+                arr = np.asarray(f[ds_path][()]).squeeze()
+            return arr if arr.ndim == 1 else None
+        except Exception as exc:
+            logging.warning("Could not read X dataset %s: %s", full_key, exc)
+            return None
+
+    def _export_result_full(self) -> None:
+        """Open the full-export dialog for a 1-D result.
+
+        Shown non-modally so a dataset can still be dragged out of the main
+        window's tree into the dialog's X field.
+        """
+        dialog = ResultExportDialog(
+            self,
+            opened_files=self.opened_files,
+            dataset_full_keys_1d=self.dataset_full_keys_1d,
+            preferred_x_key=self._viewer_x_dataset_key(),
+            expression=self._last_operation_expr,
+        )
+
+        def refresh() -> None:
+            headers, columns = self._result_export_columns(dialog.x_key())
+            dialog.show_preview(headers, columns)
+
+        dialog.settings_changed.connect(refresh)
+        dialog.accepted.connect(lambda d=dialog: self._finish_result_export(d))
+        dialog.rejected.connect(dialog.deleteLater)
+        refresh()
+
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setModal(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._export_dialog = dialog
+
+    def _finish_result_export(self, dialog: "ResultExportDialog") -> None:
+        """Write the file once the non-modal settings dialog is accepted."""
+        fmt = dialog.table_format()
+        headers, columns = self._result_export_columns(dialog.x_key())
+        dialog.deleteLater()
+
+        from PyQt6.QtWidgets import QFileDialog
+
+        file_path, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Export Calculation Result",
+            suggested_save_path(self._default_export_base_name(), extension=fmt.suffix),
+            dialog_filter(fmt),
+        )
+        if not file_path:
+            return
+
+        export_path = pathlib.Path(file_path)
+        if not export_path.suffix:
+            export_path = export_path.with_suffix(fmt.suffix)
+        remember_save_directory(export_path)
+        QSettings().setValue("export/table_format", fmt.key)
+
+        try:
+            write_table(export_path, headers, columns, fmt, comments=self._despike_comment())
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Failed to export result:\n{exc}")
+            logging.error("Calculator export failed: %s", exc)
+            return
+
+        QMessageBox.information(
+            self,
+            "Export Successful",
+            f"Result exported to:\n{export_path}\n\nColumns: {', '.join(headers)}",
+        )
+        logging.info("Exported calculator result to %s", export_path)
 
     def _export_result(self) -> None:
         """Export the result to a file."""
@@ -1022,7 +1551,6 @@ class DataCalculatorEnhanced(QDialog):
             from PyQt6.QtWidgets import QFileDialog
             from src.lib_h5.data_exporter import DataExporter
             from src.lib_h5.dataset_types import H5DatasetType
-            from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
 
             # Log shape for debugging
             logging.info(f"Exporting result - Shape: {self.result_data.shape}, Dims: {len(self.result_data.shape)}")
@@ -1030,38 +1558,12 @@ class DataCalculatorEnhanced(QDialog):
             # Determine data type based on dimensions and size
             ndim = len(self.result_data.shape)
 
-            # For 1D data with original datasets, export all together
-            if ndim == 1 and self.data_a is not None and self.data_b is not None:
-                # Check if result viewer has custom X data and q conversion
-                from src.gui.unified_data_viewer import UnifiedDataViewer
-
-                has_custom_x = False
-                has_q_conversion = False
-                x_data = None
-                q_data = None
-                plot_widget = None
-
-                # Get the actual plot widget from UnifiedDataViewer
-                if isinstance(self.result_widget, UnifiedDataViewer):
-                    current_widget = self.result_widget.get_current_widget()
-                    if isinstance(current_widget, PlotWidget1DEnhanced):
-                        plot_widget = current_widget
-                        has_custom_x = plot_widget.x_data is not None
-                        has_q_conversion = plot_widget.chk_convert_to_q.isChecked()
-                        if has_custom_x:
-                            if has_q_conversion and plot_widget.x_data_original is not None:
-                                x_data = plot_widget.x_data_original
-                                q_data = plot_widget.x_data
-                            else:
-                                x_data = plot_widget.x_data
-
-                self._export_1d_with_datasets(x_data, q_data, has_custom_x, has_q_conversion)
+            # 1D results get the full dialog: operands + result, with an optional X.
+            if ndim == 1:
+                self._export_result_full()
                 return
 
-            if ndim == 1:
-                # 1D array - export as CSV or text
-                data_type = H5DatasetType.Array1D
-            elif ndim == 2:
+            if ndim == 2:
                 # 2D array - decide between table and image
                 if self.result_data.size < 10000:
                     # Small 2D array - can be table or image
@@ -1082,12 +1584,13 @@ class DataCalculatorEnhanced(QDialog):
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
                 "Export Calculation Result",
-                f"{self._default_export_base_name()}{default_ext}",
+                suggested_save_path(self._default_export_base_name(), extension=default_ext),
                 file_filter,
             )
 
             if not file_path:
                 return
+            remember_save_directory(file_path)
 
             # Export
             success = DataExporter.export_data(self.result_data, pathlib.Path(file_path), data_type)
@@ -1108,108 +1611,12 @@ class DataCalculatorEnhanced(QDialog):
                 )
 
         except Exception as e:
-            error_msg = f"Failed to export result:\n{e}\n\nShape: {self.result_data.shape}, Type: {self.result_data.dtype}"
+            error_msg = (
+                f"Failed to export result:\n{e}\n\n"
+                f"Shape: {self.result_data.shape}, Type: {self.result_data.dtype}"
+            )
             QMessageBox.critical(self, "Export Error", error_msg)
             logging.error(f"Export error: {e}, shape: {self.result_data.shape}")
-
-    def _export_1d_with_datasets(self, x_data: np.ndarray | None, q_data: np.ndarray | None,
-                                  has_custom_x: bool, has_q_conversion: bool) -> None:
-        """Export 1D data with original datasets A and B, and result (with or without X and q axes)."""
-        try:
-            from PyQt6.QtWidgets import QFileDialog
-            from PyQt6.QtCore import QSettings
-            import csv
-
-            settings = QSettings()
-            last_dir = settings.value("paths/last_export_directory", pathlib.Path.home())
-
-            file_path, selected_filter = QFileDialog.getSaveFileName(
-                self,
-                "Export Calculation Result",
-                str(pathlib.Path(last_dir) / f"{self._default_export_base_name()}.csv"),
-                "CSV Files (*.csv);;Text Files (*.txt);;All Files (*.*)"
-            )
-
-            if not file_path:
-                return  # User cancelled
-
-            # Save directory for next time
-            settings.setValue("paths/last_export_directory", pathlib.Path(file_path).parent)
-
-            # Determine delimiter based on file extension
-            file_ext = pathlib.Path(file_path).suffix.lower()
-            delimiter = "\t" if file_ext == ".txt" else ","
-
-            # Determine the length to iterate
-            max_len = max(len(self.data_a), len(self.data_b), len(self.result_data))
-
-            # Write data file with UTF-8 BOM for better Excel compatibility
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f, delimiter=delimiter)
-
-                # Write header based on whether we have X data and q conversion
-                header = []
-                if has_custom_x and x_data is not None:
-                    header.append("X")
-                    max_len = max(max_len, len(x_data))
-                    if has_q_conversion and q_data is not None:
-                        header.append("q")
-                        max_len = max(max_len, len(q_data))
-                else:
-                    header.append("Index")
-
-                header.extend(["Data_A", "Data_B", "Result"])
-                writer.writerow(header)
-
-                # Write data rows
-                for i in range(max_len):
-                    row = []
-
-                    # First column: X, q, or Index
-                    if has_custom_x and x_data is not None:
-                        # With X data
-                        row.append(f"{x_data[i]:.10g}" if i < len(x_data) else "")
-                        # Add q column if conversion is enabled
-                        if has_q_conversion and q_data is not None:
-                            row.append(f"{q_data[i]:.10g}" if i < len(q_data) else "")
-                    else:
-                        # Without X data, use index
-                        row.append(str(i))
-
-                    # Data columns
-                    row.extend([
-                        f"{self.data_a[i]:.10g}" if i < len(self.data_a) else "",
-                        f"{self.data_b[i]:.10g}" if i < len(self.data_b) else "",
-                        f"{self.result_data[i]:.10g}" if i < len(self.result_data) else ""
-                    ])
-
-                    writer.writerow(row)
-
-            logging.info(f"Exported calculation result to: {file_path}")
-
-            # Build columns info string
-            if has_custom_x:
-                if has_q_conversion:
-                    columns_info = "X, q, Data_A, Data_B, Result"
-                else:
-                    columns_info = "X, Data_A, Data_B, Result"
-            else:
-                columns_info = "Index, Data_A, Data_B, Result"
-
-            QMessageBox.information(
-                self,
-                "Export Successful",
-                f"Calculation data exported successfully to:\n{file_path}\n\n"
-                f"Columns: {columns_info}"
-            )
-
-        except Exception as e:
-            logging.error(f"Failed to export calculation with X-axis: {e}")
-            QMessageBox.critical(
-                self,
-                "Export Failed",
-                f"Failed to export data:\n{str(e)}"
-            )
 
     def add_to_dataset_a(self, dataset_path: str) -> None:
         """
@@ -1242,7 +1649,7 @@ class DataCalculatorEnhanced(QDialog):
             return
 
         logging.warning(f"Dataset not found in combo box A: {dataset_path}")
-        logging.info(f"add_to_dataset_a: END (not found)")
+        logging.info("add_to_dataset_a: END (not found)")
         QMessageBox.warning(
             self,
             "Dataset Not Found",
@@ -1284,6 +1691,3 @@ class DataCalculatorEnhanced(QDialog):
             f"Could not find dataset in the list:\n{dataset_path}\n\n"
             "Make sure the file is opened in the main window."
         )
-
-
-

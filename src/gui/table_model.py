@@ -1,4 +1,4 @@
-﻿"""Children of QAbstractTableModel."""
+"""Children of QAbstractTableModel."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -230,7 +230,8 @@ class DataTable(QAbstractTableModel):
                     value = self._data[col_name][index.row()]
                 else:
                     value = (
-                        self._data[index.row()][index.column()] if len(self._data.shape) > 1 else self._data[index.row()]
+                        self._data[index.row()][index.column()] if len(self._data.shape) > 1
+                        else self._data[index.row()]
                     )
 
                 if isinstance(value, (int, float, complex)) or self._is_numeric_type(value):
@@ -316,6 +317,3 @@ class DataTable(QAbstractTableModel):
             return isinstance(value, (int, float, complex, np.number))
         except Exception:
             return isinstance(value, (int, float, complex))
-
-
-

@@ -1,4 +1,4 @@
-﻿"""Data Comparison Tool for comparing multiple 1D datasets."""
+"""Data Comparison Tool for comparing multiple 1D datasets."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -15,24 +15,28 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import csv
 import logging
 import pathlib
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import h5py
 import numpy as np
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -42,6 +46,187 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from src.gui._shared import quick_icon_button
+from src.gui.export_naming import (
+    pair_label,
+    remember_save_directory,
+    short_series_label,
+    suggested_save_path,
+    x_column_header,
+)
+from src.gui.batch_export import compact_combo
+from src.gui.table_model import CopyableTableView, DataTable
+from src.gui.plot_context_menu import attach_plot_menu
+from src.gui.x_target import (
+    read_x_dataset,
+    register_x_target,
+    remembered_x_dataset,
+    x_scope_of,
+)
+from src.lib_h5.table_format import (
+    DEFAULT_TABLE_FORMAT_KEY,
+    TableFormat,
+    dialog_filter,
+    format_from_filter,
+    format_labels,
+    get_table_format,
+    save_dialog_filter,
+)
+from src.lib_h5.table_writer import write_table
+from src.recon.expr import ExpressionError, evaluate_series
+
+# Table column layout. The order matches the toggle buttons above the table.
+COL_NAME = 0
+COL_POINTS = 1
+COL_ENERGY = 2
+COL_FY = 3
+COL_XAXIS = 4
+COL_FX = 5
+COLUMN_COUNT = 6
+
+# Columns holding a Curve Transform expression.
+EXPR_COLUMNS = (COL_FY, COL_FX)
+
+FX_PLACEHOLDER = "x"
+FY_PLACEHOLDER = "y"
+
+EXPR_HELP = (
+    "Variables: y (this curve), x (its X axis), i (index), n (points), E (eV).\n"
+    "Functions: sqrt log log10 exp abs sin cos gradient cumsum diff mean max min "
+    "std sum clip where interp ..., plus np.*\n"
+    "Examples:  y/max(y)   y-mean(y[:20])   log10(y)   gradient(y, x)   x*2+1\n"
+    "Empty means no transform. f(X) is applied first, so f(Y) sees the new x."
+)
+
+
+class ComparisonExportDialog(QDialog):
+    """Full-export settings for the comparison plot.
+
+    Shows the exact columns that will be written. The X control mirrors the batch
+    export dialog: an ``Export X`` switch plus a field a dataset can be dragged
+    into. Left empty, the X shown in the table is used as-is.
+
+    The dialog is used non-modally so the tree stays reachable for that drag —
+    a modal dialog blocks input to the main window, which is exactly what stopped
+    dragging from working.
+    """
+
+    settings_changed = pyqtSignal()
+
+    def __init__(self, parent: Any = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export Comparison Data")
+        self.setWindowFlag(Qt.WindowType.Window)
+        # Square: the preview sits above the controls, so extra width buys nothing.
+        self.resize(560, 560)
+
+        root = QVBoxLayout(self)
+
+        self.preview_table = CopyableTableView()
+        root.addWidget(self.preview_table, stretch=1)
+
+        box = QGroupBox("Export")
+        form = QVBoxLayout(box)
+
+        row_x = QHBoxLayout()
+        self.chk_export_x = QCheckBox("Export X")
+        self.chk_export_x.setChecked(True)
+        row_x.addWidget(self.chk_export_x)
+        # Starts from the X already chosen in the tree *for this tool*, so the
+        # same dataset does not have to be found twice — while an X set in some
+        # other tool, over a different set of files, never leaks in here.
+        self.le_x_path = QLineEdit(remembered_x_dataset(x_scope_of(parent)))
+        self.le_x_path.setPlaceholderText("Drag or type X dataset (blank = X as displayed)")
+        self.le_x_path.setAcceptDrops(True)
+        self.le_x_path.dragEnterEvent = self._x_path_drag_enter
+        self.le_x_path.dropEvent = self._x_path_drop
+        row_x.addWidget(self.le_x_path, stretch=1)
+        form.addLayout(row_x)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Format:"))
+        self.combo_format = compact_combo(QComboBox())
+        self.combo_format.addItems(format_labels())
+        stored = QSettings().value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)
+        self.combo_format.setCurrentText(get_table_format(str(stored)).label)
+        row.addWidget(self.combo_format, stretch=1)
+        form.addLayout(row)
+
+        self.chk_comments = QCheckBox("Include metadata header")
+        self.chk_comments.setChecked(True)
+        self.chk_comments.setToolTip("Write the '#' lines describing energy and f(X)/f(Y) per curve")
+        form.addWidget(self.chk_comments)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addWidget(buttons)
+        root.addWidget(box)
+
+        self.chk_export_x.stateChanged.connect(lambda _s: self.settings_changed.emit())
+        self.le_x_path.textChanged.connect(lambda _t: self.settings_changed.emit())
+        register_x_target(self)
+
+    def set_x_dataset(self, key: str) -> bool:
+        """Take an X dataset handed over by the tree's ``Set X``."""
+        self.le_x_path.setText(key)
+        self.chk_export_x.setChecked(True)
+        return True
+
+    def _x_path_drag_enter(self, event: QDragEnterEvent | None) -> None:
+        if event is not None and event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def _x_path_drop(self, event: QDropEvent | None) -> None:
+        """Accept a dataset dragged from the tree, keeping the full file::path key."""
+        if event is None or not event.mimeData().hasText():
+            return
+        text = event.mimeData().text().strip().splitlines()[0].strip()
+        if text:
+            self.le_x_path.setText(text)
+            self.chk_export_x.setChecked(True)
+        event.acceptProposedAction()
+
+    def export_x(self) -> bool:
+        """Whether any X column is written at all."""
+        return self.chk_export_x.isChecked()
+
+    def x_key(self) -> str | None:
+        """Explicit X dataset key, or None to use the X shown in the table."""
+        if not self.chk_export_x.isChecked():
+            return None
+        return self.le_x_path.text().strip() or None
+
+    def table_format(self) -> TableFormat:
+        """Chosen tabular dialect."""
+        return get_table_format(self.combo_format.currentText())
+
+    def include_comments(self) -> bool:
+        """Whether the '#' metadata lines are written."""
+        return self.chk_comments.isChecked()
+
+    def show_preview(self, headers: list[str], columns: list[Any]) -> None:
+        """Fill the preview with the columns that would be written."""
+        rows = min(200, max((len(col) for col in columns), default=0))
+        table = np.full((rows, len(columns)), np.nan, dtype=float)
+        for idx, col in enumerate(columns):
+            take = min(rows, len(col))
+            table[:take, idx] = np.asarray(col, dtype=float)[:take]
+        self.preview_table.setModel(DataTable(table, headers))
+
+
+@dataclass
+class CurveEntry:
+    """One row of the comparison table: a curve plus its per-row transform state."""
+
+    name: str
+    data: np.ndarray
+    energy: float = 0.0
+    y_expr: str = ""
+    x_expr: str = ""
+    x_data: np.ndarray | None = None
+    x_path: str | None = None
 
 
 class DatasetTableWidget(QTableWidget):
@@ -55,8 +240,8 @@ class DatasetTableWidget(QTableWidget):
         self.comparison_tool = None  # Will be set by DataComparisonTool
 
         # Setup table
-        self.setColumnCount(7)
-        self.setHorizontalHeaderLabels(["Dataset", "Points", "E(eV)", "Offset X", "Offset Y", "Scale Y", "X Axis"])
+        self.setColumnCount(COLUMN_COUNT)
+        self.setHorizontalHeaderLabels(["Dataset", "Points", "E(eV)", "f(Y)", "X Axis", "f(X)"])
 
         # Configure columns
         header = self.horizontalHeader()
@@ -69,13 +254,12 @@ class DatasetTableWidget(QTableWidget):
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
 
             # Set default widths for all columns
-            self.setColumnWidth(0, 200)  # Dataset name
-            self.setColumnWidth(1, 70)   # Points
-            self.setColumnWidth(2, 70)   # E(eV)
-            self.setColumnWidth(3, 80)   # Offset X
-            self.setColumnWidth(4, 80)   # Offset Y
-            self.setColumnWidth(5, 80)   # Scale Y
-            self.setColumnWidth(6, 130)  # X Axis
+            self.setColumnWidth(COL_NAME, 200)
+            self.setColumnWidth(COL_POINTS, 70)
+            self.setColumnWidth(COL_ENERGY, 70)
+            self.setColumnWidth(COL_FY, 140)
+            self.setColumnWidth(COL_XAXIS, 130)
+            self.setColumnWidth(COL_FX, 140)
 
         # Enable horizontal scrollbar when needed
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -144,6 +328,10 @@ class DataComparisonTool(QDialog):
         # This prevents the dialog from staying on top of all applications
         self.setWindowFlags(Qt.WindowType.Window)
 
+        # An X chosen here belongs to this tool; its export dialog inherits it
+        # through the parent chain, and nothing outside does. See x_scope_of.
+        self.x_scope = "comparison"
+
         self.opened_files = opened_files
         self.dataset_full_keys_1d = dataset_full_keys_1d or []
         self._opened_by_name = {p.name: p for p in self.opened_files}
@@ -157,7 +345,7 @@ class DataComparisonTool(QDialog):
             file_name = pathlib.Path(file_part).name
             self._shared_by_file_name.setdefault(file_name, set()).add(ds_path)
             self._shared_by_file_full.setdefault(file_part, set()).add(ds_path)
-        self.datasets = []  # List of (name, data, energy, offset_x, offset_y, scale_y, x_data, x_path) tuples
+        self.datasets: list[CurveEntry] = []
         self._x_selection_target_row: int | None = None  # None = apply to all rows
         self.selected_point = None  # (x, y) of selected point
         self.selected_marker = None  # Circle marker for selected point
@@ -180,6 +368,7 @@ class DataComparisonTool(QDialog):
 
         self._init_ui()
         self._populate_available_datasets()
+        register_x_target(self)
 
     def _init_ui(self) -> None:
         """Initialize the user interface."""
@@ -211,6 +400,9 @@ class DataComparisonTool(QDialog):
         from PyQt6.QtWidgets import QSizePolicy
         left_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         left_layout = QVBoxLayout()
+        # Zero margins inside the splitter panels, as in the calculator; the
+        # dialog's own margin is the only inset.
+        left_layout.setContentsMargins(0, 0, 0, 0)
 
         # Header with label and column toggle buttons
         header_layout = QHBoxLayout()
@@ -221,40 +413,32 @@ class DataComparisonTool(QDialog):
         self.btn_toggle_energy.setChecked(False)  # Hide by default
         self.btn_toggle_energy.setMaximumWidth(60)
         self.btn_toggle_energy.setToolTip("Toggle Energy column")
-        self.btn_toggle_energy.clicked.connect(lambda: self._toggle_column(2, self.btn_toggle_energy))
+        self.btn_toggle_energy.clicked.connect(lambda: self._toggle_column(COL_ENERGY, self.btn_toggle_energy))
         header_layout.addWidget(self.btn_toggle_energy)
 
-        self.btn_toggle_offset_x = QPushButton("Offset X")
-        self.btn_toggle_offset_x.setCheckable(True)
-        self.btn_toggle_offset_x.setChecked(False)  # Hide by default
-        self.btn_toggle_offset_x.setMaximumWidth(70)
-        self.btn_toggle_offset_x.setToolTip("Toggle Offset X column")
-        self.btn_toggle_offset_x.clicked.connect(lambda: self._toggle_column(3, self.btn_toggle_offset_x))
-        header_layout.addWidget(self.btn_toggle_offset_x)
-
-        self.btn_toggle_offset_y = QPushButton("Offset Y")
-        self.btn_toggle_offset_y.setCheckable(True)
-        self.btn_toggle_offset_y.setChecked(False)  # Hide by default
-        self.btn_toggle_offset_y.setMaximumWidth(70)
-        self.btn_toggle_offset_y.setToolTip("Toggle Offset Y column")
-        self.btn_toggle_offset_y.clicked.connect(lambda: self._toggle_column(4, self.btn_toggle_offset_y))
-        header_layout.addWidget(self.btn_toggle_offset_y)
-
-        self.btn_toggle_scale_y = QPushButton("Scale Y")
-        self.btn_toggle_scale_y.setCheckable(True)
-        self.btn_toggle_scale_y.setChecked(False)  # Hide by default
-        self.btn_toggle_scale_y.setMaximumWidth(70)
-        self.btn_toggle_scale_y.setToolTip("Toggle Scale Y column")
-        self.btn_toggle_scale_y.clicked.connect(lambda: self._toggle_column(5, self.btn_toggle_scale_y))
-        header_layout.addWidget(self.btn_toggle_scale_y)
+        self.btn_toggle_fy = QPushButton("f(Y)")
+        self.btn_toggle_fy.setCheckable(True)
+        self.btn_toggle_fy.setChecked(False)  # Hide by default
+        self.btn_toggle_fy.setMaximumWidth(60)
+        self.btn_toggle_fy.setToolTip("Toggle f(Y) column — per-curve Y formula\n\n" + EXPR_HELP)
+        self.btn_toggle_fy.clicked.connect(lambda: self._toggle_column(COL_FY, self.btn_toggle_fy))
+        header_layout.addWidget(self.btn_toggle_fy)
 
         self.btn_toggle_xaxis = QPushButton("X Axis")
         self.btn_toggle_xaxis.setCheckable(True)
         self.btn_toggle_xaxis.setChecked(False)  # Hide by default
         self.btn_toggle_xaxis.setMaximumWidth(65)
         self.btn_toggle_xaxis.setToolTip("Toggle X Axis column (per-row custom X)")
-        self.btn_toggle_xaxis.clicked.connect(lambda: self._toggle_column(6, self.btn_toggle_xaxis))
+        self.btn_toggle_xaxis.clicked.connect(lambda: self._toggle_column(COL_XAXIS, self.btn_toggle_xaxis))
         header_layout.addWidget(self.btn_toggle_xaxis)
+
+        self.btn_toggle_fx = QPushButton("f(X)")
+        self.btn_toggle_fx.setCheckable(True)
+        self.btn_toggle_fx.setChecked(False)  # Hide by default
+        self.btn_toggle_fx.setMaximumWidth(60)
+        self.btn_toggle_fx.setToolTip("Toggle f(X) column — per-curve X formula\n\n" + EXPR_HELP)
+        self.btn_toggle_fx.clicked.connect(lambda: self._toggle_column(COL_FX, self.btn_toggle_fx))
+        header_layout.addWidget(self.btn_toggle_fx)
 
         header_layout.addStretch()
 
@@ -267,13 +451,12 @@ class DataComparisonTool(QDialog):
         left_layout.addWidget(self.dataset_table)
 
         # Initialize column visibility based on button states
-        self.dataset_table.setColumnHidden(2, not self.btn_toggle_energy.isChecked())    # E(eV)
-        self.dataset_table.setColumnHidden(3, not self.btn_toggle_offset_x.isChecked())  # Offset X
-        self.dataset_table.setColumnHidden(4, not self.btn_toggle_offset_y.isChecked())  # Offset Y
-        self.dataset_table.setColumnHidden(5, not self.btn_toggle_scale_y.isChecked())   # Scale Y
-        self.dataset_table.setColumnHidden(6, not self.btn_toggle_xaxis.isChecked())     # X Axis
+        self.dataset_table.setColumnHidden(COL_ENERGY, not self.btn_toggle_energy.isChecked())
+        self.dataset_table.setColumnHidden(COL_FY, not self.btn_toggle_fy.isChecked())
+        self.dataset_table.setColumnHidden(COL_XAXIS, not self.btn_toggle_xaxis.isChecked())
+        self.dataset_table.setColumnHidden(COL_FX, not self.btn_toggle_fx.isChecked())
 
-        # Connect double-click (col 6 → set X for row) and right-click context menu
+        # Connect double-click (X Axis column → set X for row) and right-click context menu
         self.dataset_table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.dataset_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.dataset_table.customContextMenuRequested.connect(self._on_table_context_menu)
@@ -299,22 +482,20 @@ class DataComparisonTool(QDialog):
 
         left_layout.addLayout(button_row1_layout)
 
-        # Export/figure actions (row 2)
+        # Full export (settings dialog). Quick save/copy of the figure are icons
+        # in the plot toolbar on the right, as in every other viewer.
         button_row2_layout = QHBoxLayout()
-        self.btn_export = QPushButton("Export...")
+        self.btn_export = QPushButton("Export")
         self.btn_export.setAutoDefault(False)  # Prevent Enter key from triggering this button
-        self.btn_export.clicked.connect(self._export_to_csv)
+        self.btn_export.setToolTip("Full export: choose the column layout, dialect and header")
+        self.btn_export.clicked.connect(self._export_full)
         button_row2_layout.addWidget(self.btn_export)
 
-        self.btn_save_image = QPushButton("Save Image...")
-        self.btn_save_image.setAutoDefault(False)
-        self.btn_save_image.clicked.connect(self._save_plot_image)
-        button_row2_layout.addWidget(self.btn_save_image)
-
-        self.btn_copy_image = QPushButton("Copy Image")
-        self.btn_copy_image.setAutoDefault(False)
-        self.btn_copy_image.clicked.connect(self._copy_plot_image)
-        button_row2_layout.addWidget(self.btn_copy_image)
+        self.btn_plot = QPushButton("Plot")
+        self.btn_plot.setAutoDefault(False)
+        self.btn_plot.setToolTip("Plot: the exported table and a matplotlib figure of it")
+        self.btn_plot.clicked.connect(self.open_plot)
+        button_row2_layout.addWidget(self.btn_plot)
 
         left_layout.addLayout(button_row2_layout)
 
@@ -326,12 +507,33 @@ class DataComparisonTool(QDialog):
         # Set size policy for right panel to allow free resizing
         right_panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
 
         plot_label = QLabel("<b>Comparison Plot</b>")
         right_layout.addWidget(plot_label)
 
         # Axis scale controls
         control_layout = QHBoxLayout()
+        control_layout.setSpacing(5)
+
+        # Quick actions live here, matching the icon pair in every other viewer.
+        self.btn_copy_image = quick_icon_button("copy.ico", "Quick copy: put the plot on the clipboard")
+        self.btn_copy_image.clicked.connect(self._copy_plot_image)
+        control_layout.addWidget(self.btn_copy_image)
+
+        self.btn_save_data = quick_icon_button(
+            "save.ico", "Quick export: save the plotted curves as displayed"
+        )
+        self.btn_save_data.clicked.connect(self.quick_export)
+        control_layout.addWidget(self.btn_save_data)
+
+        self.btn_open_plot = quick_icon_button(
+            "plot.ico", "Plot: draw the compared curves in a Plot window"
+        )
+        self.btn_open_plot.clicked.connect(self.open_plot)
+        control_layout.addWidget(self.btn_open_plot)
+
+        control_layout.addSpacing(10)
 
         scale_label = QLabel("Axis Scale:")
         control_layout.addWidget(scale_label)
@@ -346,15 +548,13 @@ class DataComparisonTool(QDialog):
 
         control_layout.addSpacing(20)
 
-        # Custom X data control (applies to all matching rows)
-        x_label = QLabel("X Axis:")
-        control_layout.addWidget(x_label)
-
-        self.btn_select_x = QPushButton("Set All")
+        # Custom X data control. Named and behaving like the data viewer's and
+        # the tree's "Set X"; the per-row nuance lives in the tooltip.
+        self.btn_select_x = QPushButton("Set X")
         self.btn_select_x.setAutoDefault(False)
         self.btn_select_x.setMinimumWidth(0)
         self.btn_select_x.setMaximumWidth(65)
-        self.btn_select_x.setToolTip("Set X axis dataset for all rows with matching length")
+        self.btn_select_x.setToolTip("Set the X axis for every row of matching length")
         self.btn_select_x.clicked.connect(self._select_custom_x)
         control_layout.addWidget(self.btn_select_x)
 
@@ -416,8 +616,12 @@ class DataComparisonTool(QDialog):
             self.plot_widget.getAxis(axis).setPen(axis_pen)
             self.plot_widget.getAxis(axis).setTextPen(axis_pen)
 
-        # Disable right-click menu for consistent UI
-        self.plot_widget.plotItem.vb.setMenuEnabled(False)
+        # Right-click reaches the same Export and Plot as the buttons below.
+        attach_plot_menu(
+            self.plot_widget,
+            on_export=self.quick_export,
+            on_plot=self.open_plot,
+        )
 
         # Connect mouse click event for data point selection
         self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
@@ -493,7 +697,7 @@ class DataComparisonTool(QDialog):
         if data.ndim == 1:
             dataset_name = f"{filename_token}::{h5_path}"
             self._add_dataset_to_table(
-                dataset_name, data, energy=0.0, offset_x=0.0, offset_y=0.0, scale_y=1.0, update_plot=False
+                dataset_name, data, energy=0.0, update_plot=False
             )
             logging.info(f"Added 1D dataset: {dataset_name}, shape: {data.shape}")
         elif data.ndim == 2:
@@ -520,7 +724,7 @@ class DataComparisonTool(QDialog):
                 col_data = data[:, forced_col]
                 dataset_name = f"{filename_token}::{h5_path} [Col {forced_col}]"
                 self._add_dataset_to_table(
-                    dataset_name, col_data, energy=0.0, offset_x=0.0, offset_y=0.0, scale_y=1.0, update_plot=False
+                    dataset_name, col_data, energy=0.0, update_plot=False
                 )
                 logging.info(
                     f"Added forced column {forced_col} from 2D dataset: {dataset_name}, shape: {col_data.shape}"
@@ -551,7 +755,7 @@ class DataComparisonTool(QDialog):
                     col_data = data[:, col_idx]
                     dataset_name = f"{filename_token}::{h5_path} [Col {col_idx}]"
                     self._add_dataset_to_table(
-                        dataset_name, col_data, energy=0.0, offset_x=0.0, offset_y=0.0, scale_y=1.0, update_plot=False
+                        dataset_name, col_data, energy=0.0, update_plot=False
                     )
                     logging.info(
                         f"Added column {col_idx} from 2D dataset: {dataset_name}, shape: {col_data.shape}"
@@ -561,7 +765,7 @@ class DataComparisonTool(QDialog):
                 col_data = data[:, column]
                 dataset_name = f"{filename_token}::{h5_path} [Col {column}]"
                 self._add_dataset_to_table(
-                    dataset_name, col_data, energy=0.0, offset_x=0.0, offset_y=0.0, scale_y=1.0, update_plot=False
+                    dataset_name, col_data, energy=0.0, update_plot=False
                 )
                 logging.info(
                     f"Added column {column} from 2D dataset: {dataset_name}, shape: {col_data.shape}"
@@ -677,9 +881,8 @@ class DataComparisonTool(QDialog):
         name: str,
         data: np.ndarray,
         energy: float = 0.0,
-        offset_x: float = 0.0,
-        offset_y: float = 0.0,
-        scale_y: float = 1.0,
+        y_expr: str = "",
+        x_expr: str = "",
     ) -> None:
         """Add an in-memory 1D/2D result array into comparison list."""
         try:
@@ -689,9 +892,8 @@ class DataComparisonTool(QDialog):
                     name,
                     arr,
                     energy=energy,
-                    offset_x=offset_x,
-                    offset_y=offset_y,
-                    scale_y=scale_y,
+                    y_expr=y_expr,
+                    x_expr=x_expr,
                     update_plot=False,
                 )
                 if not self._defer_plot_update:
@@ -712,9 +914,8 @@ class DataComparisonTool(QDialog):
                         f"{name} [Col {col_idx}]",
                         arr[:, col_idx],
                         energy=energy,
-                        offset_x=offset_x,
-                        offset_y=offset_y,
-                        scale_y=scale_y,
+                        y_expr=y_expr,
+                        x_expr=x_expr,
                         update_plot=False,
                     )
                 if not self._defer_plot_update:
@@ -735,51 +936,55 @@ class DataComparisonTool(QDialog):
         name: str,
         data: np.ndarray,
         energy: float = 0.0,
-        offset_x: float = 0.0,
-        offset_y: float = 0.0,
-        scale_y: float = 1.0,
+        y_expr: str = "",
+        x_expr: str = "",
         update_plot: bool = True,
         x_data: np.ndarray | None = None,
         x_path: str | None = None,
     ) -> None:
         """Add a dataset to the table and internal list."""
-        self.datasets.append((name, data, energy, offset_x, offset_y, scale_y, x_data, x_path))
+        self.datasets.append(
+            CurveEntry(
+                name=name,
+                data=data,
+                energy=energy,
+                y_expr=y_expr,
+                x_expr=x_expr,
+                x_data=x_data,
+                x_path=x_path,
+            )
+        )
 
         row = self.dataset_table.rowCount()
         prev_block = self.dataset_table.blockSignals(True)
         self.dataset_table.insertRow(row)
 
-        # Column 0: Dataset name
+        # Dataset name
         display_name = self._compact_dataset_name(name)
         name_item = QTableWidgetItem(display_name)
         name_item.setToolTip(name)
         name_item.setData(Qt.ItemDataRole.UserRole, name)
-        self.dataset_table.setItem(row, 0, name_item)
+        self.dataset_table.setItem(row, COL_NAME, name_item)
 
-        # Column 1: Number of points (read-only)
+        # Number of points (read-only)
         points_item = QTableWidgetItem(str(len(data)))
         points_item.setFlags(points_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.dataset_table.setItem(row, 1, points_item)
+        self.dataset_table.setItem(row, COL_POINTS, points_item)
 
-        # Column 2: Energy in eV (editable)
-        self.dataset_table.setItem(row, 2, QTableWidgetItem(str(energy)))
+        # Energy in eV (editable)
+        self.dataset_table.setItem(row, COL_ENERGY, QTableWidgetItem(str(energy)))
 
-        # Column 3: Offset X (editable)
-        self.dataset_table.setItem(row, 3, QTableWidgetItem(str(offset_x)))
+        # Curve Transform expressions (editable); empty means no transform.
+        self.dataset_table.setItem(row, COL_FY, self._make_expr_item(y_expr, FY_PLACEHOLDER))
+        self.dataset_table.setItem(row, COL_FX, self._make_expr_item(x_expr, FX_PLACEHOLDER))
 
-        # Column 4: Offset Y (editable)
-        self.dataset_table.setItem(row, 4, QTableWidgetItem(str(offset_y)))
-
-        # Column 5: Scale Y (editable)
-        self.dataset_table.setItem(row, 5, QTableWidgetItem(str(scale_y)))
-
-        # Column 6: X Axis (read-only, set via double-click or right-click)
+        # X Axis (read-only, set via double-click or right-click)
         x_label = self._short_key_label(x_path) if x_path else "—"
         x_item = QTableWidgetItem(x_label)
         x_item.setFlags(x_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         if x_path:
             x_item.setToolTip(x_path)
-        self.dataset_table.setItem(row, 6, x_item)
+        self.dataset_table.setItem(row, COL_XAXIS, x_item)
 
         self.dataset_table.blockSignals(prev_block)
 
@@ -810,6 +1015,90 @@ class DataComparisonTool(QDialog):
             compact = f"{compact} {col_suffix}"
         return compact
 
+    # ------------------------------------------------------------------
+    # Curve Transform (per-row f(X) / f(Y) expressions)
+    # ------------------------------------------------------------------
+
+    def _make_expr_item(self, expression: str, placeholder: str) -> QTableWidgetItem:
+        """Build an editable expression cell showing a hint when it is empty."""
+        item = QTableWidgetItem(expression)
+        self._style_expr_item(item, placeholder, error=None)
+        return item
+
+    @staticmethod
+    def _style_expr_item(item: QTableWidgetItem, placeholder: str, error: str | None) -> None:
+        """Color an expression cell: red on error, grey hint when empty."""
+        from PyQt6.QtGui import QBrush, QColor
+
+        if error:
+            item.setBackground(QBrush(QColor("#ffe0e0")))
+            item.setForeground(QBrush(QColor("#b00000")))
+            item.setToolTip(f"{error}\n\n{EXPR_HELP}")
+            return
+
+        item.setBackground(QBrush(QColor("#ffffff")))
+        if item.text().strip():
+            item.setForeground(QBrush(QColor("#111111")))
+            item.setToolTip(EXPR_HELP)
+        else:
+            item.setForeground(QBrush(QColor("#111111")))
+            item.setToolTip(f"Empty = no transform (result is '{placeholder}').\n\n{EXPR_HELP}")
+
+    def _mark_expr_error(self, row: int, column: int, error: str | None) -> None:
+        """Flag or clear the error state of an expression cell without re-plotting."""
+        item = self.dataset_table.item(row, column)
+        if item is None:
+            return
+        placeholder = FY_PLACEHOLDER if column == COL_FY else FX_PLACEHOLDER
+        prev_block = self.dataset_table.blockSignals(True)
+        self._style_expr_item(item, placeholder, error)
+        self.dataset_table.blockSignals(prev_block)
+
+    def _base_x_values(self, entry: CurveEntry) -> np.ndarray:
+        """X samples before f(X): the row's X dataset (q-converted if enabled), else the index."""
+        if entry.x_data is not None and len(entry.x_data) == len(entry.data):
+            if self.chk_convert_to_q.isChecked():
+                return np.array([self._convert_angle_to_q(a, entry.energy) for a in entry.x_data], dtype=float)
+            return np.asarray(entry.x_data, dtype=float)
+        return np.arange(len(entry.data), dtype=float)
+
+    def _transform_entry(self, entry: CurveEntry) -> tuple[np.ndarray, np.ndarray, str | None, str | None]:
+        """Apply the row's Curve Transform.
+
+        f(X) runs first so that f(Y) can refer to the transformed ``x``
+        (``gradient(y, x)`` then means what the user sees on the axis).
+
+        :return: ``(x_values, y_values, x_error, y_error)``. On error the offending
+            axis falls back to its untransformed values so the curve still plots.
+        """
+        x_values = self._base_x_values(entry)
+        y_values = np.asarray(entry.data, dtype=float)
+        x_error: str | None = None
+        y_error: str | None = None
+
+        if entry.x_expr.strip():
+            try:
+                x_values = evaluate_series(entry.x_expr, y_values, x_values, entry.energy)
+            except ExpressionError as exc:
+                x_error = str(exc)
+                logging.warning("f(X) failed for '%s': %s", entry.name, exc)
+
+        if entry.y_expr.strip():
+            try:
+                y_values = evaluate_series(entry.y_expr, y_values, x_values, entry.energy)
+            except ExpressionError as exc:
+                y_error = str(exc)
+                logging.warning("f(Y) failed for '%s': %s", entry.name, exc)
+
+        return x_values, y_values, x_error, y_error
+
+    def _transform_row(self, row: int, entry: CurveEntry) -> tuple[np.ndarray, np.ndarray]:
+        """Transform one row and reflect any expression error in its cells."""
+        x_values, y_values, x_error, y_error = self._transform_entry(entry)
+        self._mark_expr_error(row, COL_FX, x_error)
+        self._mark_expr_error(row, COL_FY, y_error)
+        return x_values, y_values
+
     def _toggle_column(self, column_index: int, button: QPushButton) -> None:
         """
         Toggle visibility of a table column.
@@ -823,12 +1112,12 @@ class DataComparisonTool(QDialog):
         logging.info(f"Column {column_index} visibility: {is_visible}")
 
         # If toggling E(eV) column, also update X->q checkbox availability
-        if column_index == 2:  # E(eV) column
+        if column_index == COL_ENERGY:
             self._update_q_conversion_availability()
 
     def _update_q_conversion_availability(self) -> None:
         """Update X->q checkbox: enabled when at least one row has x_data AND E(eV) column is visible."""
-        has_x_data = any(d[6] is not None for d in self.datasets)
+        has_x_data = any(entry.x_data is not None for entry in self.datasets)
         energy_column_visible = self.btn_toggle_energy.isChecked()
         should_enable = has_x_data and energy_column_visible
         self.chk_convert_to_q.setEnabled(should_enable)
@@ -838,13 +1127,13 @@ class DataComparisonTool(QDialog):
 
     def _on_cell_changed(self, row: int, column: int) -> None:
         """
-        Handle cell changes in the table (for energy, offset and scale editing).
+        Handle cell changes in the table (energy and Curve Transform expressions).
 
         Args:
             row: Row index
             column: Column index
         """
-        if column == 0:
+        if column == COL_NAME:
             edited_item = self.dataset_table.item(row, 0)
             if edited_item is None:
                 return
@@ -872,57 +1161,45 @@ class DataComparisonTool(QDialog):
             self._update_plot()
             return
 
-        if column not in (2, 3, 4, 5):  # Only handle Energy (2), Offset X (3), Offset Y (4), Scale Y (5)
+        if column not in (COL_ENERGY, COL_FY, COL_FX):
             return
 
         if row < 0 or row >= len(self.datasets):
             return
 
-        # Get the changed item
         changed_item = self.dataset_table.item(row, column)
         if changed_item is None:
             return
 
-        try:
-            new_value = float(changed_item.text())
+        entry = self.datasets[row]
 
-            # Update internal dataset list (preserve x_data, x_path at indices 6,7)
-            name, data, old_energy, old_offset_x, old_offset_y, old_scale_y, x_data, x_path = self.datasets[row]
-
-            if column == 2:  # Energy changed
-                self.datasets[row] = (name, data, new_value, old_offset_x, old_offset_y, old_scale_y, x_data, x_path)
-                logging.info(f"Updated Energy for '{name}': {old_energy} -> {new_value} eV")
-            elif column == 3:  # Offset X changed
-                self.datasets[row] = (name, data, old_energy, new_value, old_offset_y, old_scale_y, x_data, x_path)
-                logging.info(f"Updated Offset X for '{name}': {old_offset_x} -> {new_value}")
-            elif column == 4:  # Offset Y changed
-                self.datasets[row] = (name, data, old_energy, old_offset_x, new_value, old_scale_y, x_data, x_path)
-                logging.info(f"Updated Offset Y for '{name}': {old_offset_y} -> {new_value}")
-            elif column == 5:  # Scale Y changed
-                self.datasets[row] = (name, data, old_energy, old_offset_x, old_offset_y, new_value, x_data, x_path)
-                logging.info(f"Updated Scale Y for '{name}': {old_scale_y} -> {new_value}")
-
-            # Update plot
+        if column in EXPR_COLUMNS:
+            # Expressions are free text: store as typed and let _update_plot
+            # report a bad formula by coloring the cell. Popping a dialog here
+            # would fire on every partially-typed edit.
+            expression = changed_item.text().strip()
+            if column == COL_FY:
+                entry.y_expr = expression
+                logging.info("f(Y) for '%s': %r", entry.name, expression)
+            else:
+                entry.x_expr = expression
+                logging.info("f(X) for '%s': %r", entry.name, expression)
             self._update_plot()
+            return
 
+        # Energy: numeric, revert on garbage.
+        try:
+            new_energy = float(changed_item.text())
         except ValueError:
-            # Invalid number, reset to previous value
-            if row < len(self.datasets):
-                _, _, old_energy, old_offset_x, old_offset_y, old_scale_y, _, _ = self.datasets[row]
-                if column == 2:
-                    old_value = old_energy
-                elif column == 3:
-                    old_value = old_offset_x
-                elif column == 4:
-                    old_value = old_offset_y
-                else:  # column == 5
-                    old_value = old_scale_y
-                changed_item.setText(str(old_value))
-            QMessageBox.warning(
-                self,
-                "Invalid Value",
-                f"Invalid value. Please enter a valid number."
-            )
+            prev_block = self.dataset_table.blockSignals(True)
+            changed_item.setText(str(entry.energy))
+            self.dataset_table.blockSignals(prev_block)
+            QMessageBox.warning(self, "Invalid Value", "Invalid value. Please enter a valid number.")
+            return
+
+        logging.info(f"Updated Energy for '{entry.name}': {entry.energy} -> {new_energy} eV")
+        entry.energy = new_energy
+        self._update_plot()
 
     def _add_input_row(self) -> None:
         """Insert an editable input row for manual/paste dataset path import."""
@@ -933,9 +1210,9 @@ class DataComparisonTool(QDialog):
         path_item = QTableWidgetItem("")
         path_item.setToolTip("Type or paste: file::/dataset/path , then press Enter")
         path_item.setData(self._ROLE_INPUT_ROW, True)
-        self.dataset_table.setItem(row, 0, path_item)
+        self.dataset_table.setItem(row, COL_NAME, path_item)
 
-        for col in (1, 2, 3, 4, 5, 6):
+        for col in range(1, COLUMN_COUNT):
             item = QTableWidgetItem("")
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.dataset_table.setItem(row, col, item)
@@ -977,7 +1254,7 @@ class DataComparisonTool(QDialog):
             self.dataset_table.removeRow(row)
             if 0 <= row < len(self.datasets):
                 removed = self.datasets.pop(row)
-                logging.info(f"Removed dataset: {removed[0]}")
+                logging.info(f"Removed dataset: {removed.name}")
 
         # Unblock signals
         self.dataset_table.blockSignals(False)
@@ -1032,7 +1309,7 @@ class DataComparisonTool(QDialog):
             super().closeEvent(event)
 
     def _update_plot(self) -> None:
-        """Update the plot with current datasets, applying offsets and scale."""
+        """Update the plot with current datasets, applying each row's Curve Transform."""
         # Clear existing plot
         self.plot_widget.clear()
 
@@ -1050,52 +1327,43 @@ class DataComparisonTool(QDialog):
         if self.chk_convert_to_q.isChecked():
             self.plot_widget.setLabel("bottom", "q (A^-1)")
         else:
-            first_x_path = next((d[7] for d in self.datasets if d[7] is not None), None)
+            first_x_path = next((e.x_path for e in self.datasets if e.x_path is not None), None)
             if first_x_path:
                 self.plot_widget.setLabel("bottom", self._short_key_label(first_x_path) or "Custom X")
             else:
                 self.plot_widget.setLabel("bottom", "Index")
 
         import pyqtgraph as pg
-        for i, (name, data, energy, offset_x, offset_y, scale_y, row_x_data, _row_x_path) in enumerate(self.datasets):
+        # The legend names the curves exactly as the export headers do.
+        labels = self._unique_series_labels()
+        for i, entry in enumerate(self.datasets):
             color = self.colors[i % len(self.colors)]
             pen = pg.mkPen(color=color, width=self.line_width)
-            data_transformed = (data * scale_y) + offset_y
 
-            if row_x_data is not None and len(row_x_data) == len(data):
-                if self.chk_convert_to_q.isChecked():
-                    x_array = np.array([self._convert_angle_to_q(angle, energy) for angle in row_x_data])
-                    x_with_offset = x_array + offset_x
-                else:
-                    x_with_offset = row_x_data + offset_x
-            else:
-                x_with_offset = np.arange(len(data), dtype=float) + offset_x
+            x_values, y_values = self._transform_row(i, entry)
 
             self.plot_widget.plot(
-                x_with_offset, data_transformed,
+                x_values, y_values,
                 pen=pen,
-                name=self._format_name_with_transforms(name, energy, offset_x, offset_y, scale_y),
+                name=self._format_name_with_transforms(entry, labels[i] if i < len(labels) else None),
             )
 
         logging.info(f"Updated plot with {len(self.datasets)} datasets")
 
-    def _format_name_with_transforms(self, name: str, energy: float, offset_x: float, offset_y: float, scale_y: float) -> str:
-        """Format dataset name with transformation information."""
-        name = self._legend_short_label(name)
+    def _format_name_with_transforms(self, entry: CurveEntry, label: str | None = None) -> str:
+        """Format dataset name with its energy and Curve Transform expressions."""
+        name = label or self._legend_short_label(entry.name)
         transforms = []
 
         # Show energy if q conversion is enabled
         if self.chk_convert_to_q.isChecked():
-            transforms.append(f"{energy:.0f}eV")
+            transforms.append(f"{entry.energy:.0f}eV")
 
-        if offset_x != 0:
-            transforms.append(f"X: {offset_x:+g}")
+        if entry.x_expr.strip():
+            transforms.append(f"X={entry.x_expr.strip()}")
 
-        if scale_y != 1.0:
-            transforms.append(f"Y*{scale_y:g}")
-
-        if offset_y != 0:
-            transforms.append(f"Y: {offset_y:+g}")
+        if entry.y_expr.strip():
+            transforms.append(f"Y={entry.y_expr.strip()}")
 
         if transforms:
             return f"{name} ({', '.join(transforms)})"
@@ -1120,20 +1388,23 @@ class DataComparisonTool(QDialog):
             return str(full_key)
 
     def _legend_short_label(self, full_name: str) -> str:
-        """Format legend label as file::dataset::colN when applicable."""
-        if "::" not in full_name:
-            return pathlib.Path(full_name).name
-        file_part, dataset_part = full_name.split("::", 1)
-        file_name = pathlib.Path(file_part).name
+        """Name a curve the way the export headers do — see :mod:`export_naming`."""
+        return short_series_label(full_name)
 
-        # Preserve optional column suffix, e.g. [Col 3]
-        match = re.search(r"\s*\[Col\s+(\d+)\]\s*$", dataset_part)
-        col_suffix = f"::col{match.group(1)}" if match else ""
-        dataset_core = dataset_part[:match.start()].strip() if match else dataset_part.strip()
-        dataset_leaf = dataset_core.rstrip("/").split("/")[-1] if dataset_core else dataset_core
+    def _unique_series_labels(self) -> list[str]:
+        """Short labels for every row, with collisions numbered apart.
 
-        base = f"{file_name}::{dataset_leaf}" if dataset_leaf else file_name
-        return f"{base}{col_suffix}"
+        Shortening can make two rows agree — the same dataset added twice, or
+        two files whose stems match. A repeated column header would make the
+        exported table ambiguous, so the later ones get a counter.
+        """
+        labels: list[str] = []
+        seen: dict[str, int] = {}
+        for entry in self.datasets:
+            label = self._legend_short_label(entry.name)
+            seen[label] = seen.get(label, 0) + 1
+            labels.append(label if seen[label] == 1 else f"{label}_{seen[label]}")
+        return labels
 
     def _update_axis_scale(self) -> None:
         """Update axis scale (linear/log) based on checkboxes."""
@@ -1207,7 +1478,7 @@ class DataComparisonTool(QDialog):
 
     def _on_q_conversion_changed(self, state: int) -> None:
         """Handle X->q conversion checkbox state change."""
-        if state and not any(d[6] is not None for d in self.datasets):
+        if state and not any(entry.x_data is not None for entry in self.datasets):
             QMessageBox.information(
                 self,
                 "No X Axis",
@@ -1230,6 +1501,39 @@ class DataComparisonTool(QDialog):
         self._x_selection_target_row = None
         self._open_x_selection_dialog()
 
+    def set_x_dataset(self, key: str) -> bool:
+        """Take an X dataset handed over by the tree's ``Set X``.
+
+        Same outcome as the ``Set X`` button, minus the picker: every row of
+        matching length is re-based, and the rest keep the X they had.
+        """
+        if not self.datasets:
+            QMessageBox.information(self, "No Data", "Add datasets to the comparison list first.")
+            return False
+
+        try:
+            x_data = read_x_dataset(key)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Use As X", str(exc))
+            return False
+        except Exception as exc:
+            logging.warning("Could not read %s as X: %s", key, exc)
+            QMessageBox.warning(self, "Cannot Use As X", f"Could not read the dataset:\n{exc}")
+            return False
+
+        if not any(len(entry.data) == len(x_data) for entry in self.datasets):
+            QMessageBox.warning(
+                self,
+                "Length Mismatch",
+                f"The X dataset is {len(x_data)} long and no row here has that many "
+                "points, so nothing was changed.",
+            )
+            return False
+
+        self._x_selection_target_row = None
+        self._on_x_data_selected(x_data, key)
+        return True
+
     def _open_x_selection_dialog(self) -> None:
         from src.gui.plot_widget_1d_enhanced import XDataSelectionDialog
         dialog = XDataSelectionDialog(
@@ -1249,8 +1553,9 @@ class DataComparisonTool(QDialog):
         """Clear per-row X axis assignment."""
         if 0 <= row < len(self.datasets):
             entry = self.datasets[row]
-            self.datasets[row] = (entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], None, None)
-            x_item = self.dataset_table.item(row, 6)
+            entry.x_data = None
+            entry.x_path = None
+            x_item = self.dataset_table.item(row, COL_XAXIS)
             if x_item is not None:
                 x_item.setText("—")
                 x_item.setToolTip("")
@@ -1258,26 +1563,75 @@ class DataComparisonTool(QDialog):
             self._update_plot()
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
-        """Double-click on col 6 opens X axis selection for that row."""
-        if col == 6 and 0 <= row < len(self.datasets):
+        """Double-click on the X Axis column opens X axis selection for that row."""
+        if col == COL_XAXIS and 0 <= row < len(self.datasets):
             self._set_x_axis_for_row(row)
 
+    def _apply_expression_to_all(self, column: int, expression: str) -> None:
+        """Copy one row's expression into every row."""
+        prev_block = self.dataset_table.blockSignals(True)
+        for row_idx, entry in enumerate(self.datasets):
+            if column == COL_FY:
+                entry.y_expr = expression
+            else:
+                entry.x_expr = expression
+            item = self.dataset_table.item(row_idx, column)
+            if item is not None:
+                item.setText(expression)
+        self.dataset_table.blockSignals(prev_block)
+        logging.info("Applied %s to all rows: %r", "f(Y)" if column == COL_FY else "f(X)", expression)
+        self._update_plot()
+
+    def _clear_expression_for_row(self, row: int, column: int) -> None:
+        """Reset a single row's expression to empty (no transform)."""
+        entry = self.datasets[row]
+        if column == COL_FY:
+            entry.y_expr = ""
+        else:
+            entry.x_expr = ""
+        item = self.dataset_table.item(row, column)
+        if item is not None:
+            prev_block = self.dataset_table.blockSignals(True)
+            item.setText("")
+            self.dataset_table.blockSignals(prev_block)
+        self._update_plot()
+
     def _on_table_context_menu(self, pos) -> None:
-        """Right-click context menu: col 6 exposes Set/Clear X Axis actions."""
+        """Right-click menu: X Axis column sets/clears X, expression columns apply to all rows."""
         index = self.dataset_table.indexAt(pos)
         if not index.isValid():
             return
         row, col = index.row(), index.column()
-        if col != 6 or row < 0 or row >= len(self.datasets):
+        if row < 0 or row >= len(self.datasets):
             return
+
         menu = QMenu(self)
-        act_set = QAction("Set X Axis...", self)
-        act_set.triggered.connect(lambda: self._set_x_axis_for_row(row))
-        menu.addAction(act_set)
-        act_clear = QAction("Clear X Axis", self)
-        act_clear.setEnabled(self.datasets[row][6] is not None)
-        act_clear.triggered.connect(lambda: self._clear_x_axis_for_row(row))
-        menu.addAction(act_clear)
+        if col == COL_XAXIS:
+            act_set = QAction("Set X Axis...", self)
+            act_set.triggered.connect(lambda: self._set_x_axis_for_row(row))
+            menu.addAction(act_set)
+            act_clear = QAction("Clear X Axis", self)
+            act_clear.setEnabled(self.datasets[row].x_data is not None)
+            act_clear.triggered.connect(lambda: self._clear_x_axis_for_row(row))
+            menu.addAction(act_clear)
+        elif col in EXPR_COLUMNS:
+            label = "f(Y)" if col == COL_FY else "f(X)"
+            entry = self.datasets[row]
+            expression = (entry.y_expr if col == COL_FY else entry.x_expr).strip()
+            act_all = QAction(f"Apply this {label} to all rows", self)
+            act_all.setEnabled(bool(expression))
+            act_all.triggered.connect(lambda: self._apply_expression_to_all(col, expression))
+            menu.addAction(act_all)
+            act_clear_expr = QAction(f"Clear {label}", self)
+            act_clear_expr.setEnabled(bool(expression))
+            act_clear_expr.triggered.connect(lambda: self._clear_expression_for_row(row, col))
+            menu.addAction(act_clear_expr)
+            act_clear_all = QAction(f"Clear {label} in all rows", self)
+            act_clear_all.triggered.connect(lambda: self._apply_expression_to_all(col, ""))
+            menu.addAction(act_clear_all)
+        else:
+            return
+
         vp = self.dataset_table.viewport()
         if vp is not None:
             menu.popup(vp.mapToGlobal(pos))
@@ -1289,11 +1643,9 @@ class DataComparisonTool(QDialog):
 
         def _update_row(row_idx: int) -> None:
             entry = self.datasets[row_idx]
-            self.datasets[row_idx] = (
-                entry[0], entry[1], entry[2], entry[3], entry[4], entry[5],
-                x_data, x_path,
-            )
-            x_item = self.dataset_table.item(row_idx, 6)
+            entry.x_data = x_data
+            entry.x_path = x_path
+            x_item = self.dataset_table.item(row_idx, COL_XAXIS)
             if x_item is not None:
                 x_item.setText(self._short_key_label(x_path) or "Custom X")
                 x_item.setToolTip(x_path)
@@ -1305,7 +1657,7 @@ class DataComparisonTool(QDialog):
         else:
             skipped = 0
             for row_idx, entry in enumerate(self.datasets):
-                if len(entry[1]) == len(x_data):
+                if len(entry.data) == len(x_data):
                     _update_row(row_idx)
                 else:
                     skipped += 1
@@ -1317,91 +1669,81 @@ class DataComparisonTool(QDialog):
         logging.info("Set X data: %s", x_path)
         self._update_plot()
 
+    def _display_space(self, x_values: np.ndarray, y_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Convert a curve to the coordinates the view actually draws in.
+
+        :return: ``(display_x, display_y, valid)``. ``valid`` excludes NaN/inf
+            samples, and in log mode also the non-positive ones.
+        """
+        x_arr = np.asarray(x_values, dtype=float)
+        y_arr = np.asarray(y_values, dtype=float)
+
+        if self.chk_log_x.isChecked():
+            valid_x = x_arr > 0
+            display_x = np.zeros_like(x_arr)
+            np.log10(x_arr, out=display_x, where=valid_x)
+        else:
+            valid_x = np.isfinite(x_arr)
+            display_x = x_arr
+
+        if self.chk_log_y.isChecked():
+            valid_y = y_arr > 0
+            display_y = np.zeros_like(y_arr)
+            np.log10(y_arr, out=display_y, where=valid_y)
+        else:
+            valid_y = np.isfinite(y_arr)
+            display_y = y_arr
+
+        return display_x, display_y, valid_x & valid_y
+
+    def _closest_point_to_click(self, click_pos) -> tuple[float, float, str] | None:
+        """Find the sample nearest to a click, measured in screen pixels.
+
+        Every finite sample is a candidate, including ones drawn outside the
+        current view: with the Y axis zoomed in, a curve's peaks leave the
+        viewport while their X position stays perfectly clickable, and filtering
+        by the view rectangle made those points unselectable.
+
+        The view-to-scene mapping is affine, so the distance is computed
+        vectorised via ``viewPixelSize`` instead of mapping each point through Qt.
+        """
+        vb = self.plot_widget.plotItem.vb
+        view_pt = vb.mapSceneToView(click_pos)
+        click_x, click_y = float(view_pt.x()), float(view_pt.y())
+
+        pixel_w, pixel_h = (float(v) for v in vb.viewPixelSize())
+        if not pixel_w or not pixel_h:
+            return None
+
+        best: tuple[float, float, str] | None = None
+        best_distance = float("inf")
+
+        for entry in self.datasets:
+            # Same transform the plot used; errors already surfaced by _update_plot.
+            x_values, y_values, _x_err, _y_err = self._transform_entry(entry)
+            display_x, display_y, valid = self._display_space(x_values, y_values)
+            if not valid.any():
+                continue
+
+            dx = (display_x - click_x) / pixel_w
+            dy = (display_y - click_y) / pixel_h
+            distance = np.where(valid, dx * dx + dy * dy, np.inf)
+
+            idx = int(np.argmin(distance))
+            if distance[idx] < best_distance:
+                best_distance = float(distance[idx])
+                best = (float(x_values[idx]), float(y_values[idx]), entry.name)
+
+        return best
+
     def _on_plot_clicked(self, event) -> None:
         """Handle mouse click on plot to select data point."""
         if not self.datasets:
             return
 
-        import pyqtgraph as pg
-
-        # Get mouse position in scene (pixel) coordinates
-        click_pos = event.scenePos()
-        vb = self.plot_widget.plotItem.vb
-        (x0, x1), (y0, y1) = vb.viewRange()
-        x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
-        y_min, y_max = (y0, y1) if y0 <= y1 else (y1, y0)
-
-        # Find closest point across all datasets using pixel distance
-        min_distance = float('inf')
-        closest_x = None
-        closest_y = None
-        closest_dataset_name = None
-
-        for name, data, energy, offset_x, offset_y, scale_y, row_x_data, _row_x_path in self.datasets:
-            if row_x_data is not None and len(row_x_data) == len(data):
-                if self.chk_convert_to_q.isChecked():
-                    x_converted = np.array([self._convert_angle_to_q(angle, energy) for angle in row_x_data])
-                    x_values = x_converted + offset_x
-                else:
-                    x_values = row_x_data + offset_x
-            else:
-                x_values = np.arange(len(data), dtype=float) + offset_x
-
-            # Apply transformations
-            y_values = data * scale_y + offset_y
-
-            # Build display-space arrays (same coordinates used by the view)
-            if self.chk_log_x.isChecked():
-                valid_x = x_values > 0
-                display_x_all = np.zeros_like(x_values, dtype=float)
-                display_x_all[valid_x] = np.log10(x_values[valid_x])
-            else:
-                valid_x = np.ones_like(x_values, dtype=bool)
-                display_x_all = x_values.astype(float, copy=False)
-
-            if self.chk_log_y.isChecked():
-                valid_y = y_values > 0
-                display_y_all = np.zeros_like(y_values, dtype=float)
-                display_y_all[valid_y] = np.log10(y_values[valid_y])
-            else:
-                valid_y = np.ones_like(y_values, dtype=bool)
-                display_y_all = y_values.astype(float, copy=False)
-
-            valid_mask = valid_x & valid_y
-            visible_mask = (
-                (display_x_all >= x_min) & (display_x_all <= x_max) &
-                (display_y_all >= y_min) & (display_y_all <= y_max)
-            )
-
-            # Performance: only scan points currently visible in the viewport.
-            candidate_idx = np.flatnonzero(valid_mask & visible_mask)
-            if candidate_idx.size == 0:
-                candidate_idx = np.flatnonzero(valid_mask)
-
-            # Find closest point in this dataset using pixel distance
-            for i in candidate_idx:
-                x_val = x_values[i]
-                y_val = y_values[i]
-                display_x = display_x_all[i]
-                display_y = display_y_all[i]
-
-                # Map data coordinates to scene coordinates
-                point_in_view = self.plot_widget.plotItem.vb.mapViewToScene(
-                    pg.Point(display_x, display_y)
-                )
-
-                # Calculate pixel distance
-                dx_pixels = point_in_view.x() - click_pos.x()
-                dy_pixels = point_in_view.y() - click_pos.y()
-                distance = dx_pixels**2 + dy_pixels**2
-
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_x = x_val
-                    closest_y = y_val
-                    closest_dataset_name = name
-
-        if closest_x is not None and closest_y is not None:
+        closest = self._closest_point_to_click(event.scenePos())
+        if closest is not None:
+            closest_x, closest_y, closest_dataset_name = closest
             # Store selected point
             self.selected_point = (closest_x, closest_y)
 
@@ -1439,42 +1781,25 @@ class DataComparisonTool(QDialog):
         if not self.datasets:
             return True, ""
 
-        first_energy = self.datasets[0][2]
-        first_offset_x = self.datasets[0][3]
-        first_x_path = self.datasets[0][7]
-        first_x_data = self.datasets[0][6]
+        first = self.datasets[0]
 
-        for name, data, energy, offset_x, _oy, _sy, row_x_data, row_x_path in self.datasets:
-            if abs(offset_x - first_offset_x) > 1e-12:
-                return False, f"Offset X differs ({name}: {offset_x:g}, first: {first_offset_x:g})."
-            if self.chk_convert_to_q.isChecked() and abs(energy - first_energy) > 1e-12:
-                return False, f"Energy differs in q mode ({name}: {energy:g} eV, first: {first_energy:g} eV)."
-            if row_x_path != first_x_path:
+        for entry in self.datasets:
+            name = entry.name
+            if entry.x_expr.strip() != first.x_expr.strip():
+                return False, f"f(X) differs ({name}: '{entry.x_expr}', first: '{first.x_expr}')."
+            if self.chk_convert_to_q.isChecked() and abs(entry.energy - first.energy) > 1e-12:
+                return False, f"Energy differs in q mode ({name}: {entry.energy:g} eV, first: {first.energy:g} eV)."
+            if entry.x_path != first.x_path:
                 return False, f"X Axis dataset differs ({name})."
-            if row_x_data is not None and first_x_data is not None and len(row_x_data) != len(first_x_data):
+            if entry.x_data is not None and first.x_data is not None and len(entry.x_data) != len(first.x_data):
                 return False, f"X Axis length differs ({name})."
-            if (row_x_data is None) != (first_x_data is None):
+            if (entry.x_data is None) != (first.x_data is None):
                 return False, f"Mixed X Axis assignment ({name})."
         return True, ""
 
-    def _build_export_series(
-        self,
-        data: np.ndarray,
-        energy: float,
-        offset_x: float,
-        offset_y: float,
-        scale_y: float,
-        row_x_data: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def _build_export_series(self, entry: CurveEntry) -> tuple[np.ndarray, np.ndarray]:
         """Build transformed x/y series exactly matching current plot logic."""
-        if row_x_data is not None and len(row_x_data) == len(data):
-            if self.chk_convert_to_q.isChecked():
-                x_values = np.array([self._convert_angle_to_q(a, energy) for a in row_x_data]) + offset_x
-            else:
-                x_values = row_x_data + offset_x
-        else:
-            x_values = np.arange(len(data), dtype=float) + offset_x
-        y_values = data * scale_y + offset_y
+        x_values, y_values, _x_err, _y_err = self._transform_entry(entry)
         return x_values, y_values
 
     @staticmethod
@@ -1489,19 +1814,17 @@ class DataComparisonTool(QDialog):
         return stem.rstrip("_- ") or "scan", "0000"
 
     def _default_export_base_name(self) -> str:
-        """Build default comparison export name: head_firstNum_lastNum_compar."""
+        """Name the comparison after the range it spans: first and last row.
+
+        Whatever distinguishes them is what appears — two scans, two datasets
+        or two columns. See :func:`src.gui.export_naming.pair_label`.
+        """
         if not self.datasets:
-            return "scan_0000_0000_compar"
+            return "comparison_compar"
 
-        def _file_part(name: str) -> str:
-            return name.split("::", 1)[0].strip() if "::" in name else name.strip()
-
-        name1 = self.datasets[0][0]
-        name2 = self.datasets[-1][0] if len(self.datasets) > 1 else self.datasets[0][0]
-        head1, n1 = self._scan_head_and_number(_file_part(name1))
-        head2, n2 = self._scan_head_and_number(_file_part(name2))
-        head = head1 if head1 else (head2 if head2 else "scan")
-        return f"{head}_{n1}_{n2}_compar"
+        first = self.datasets[0].name
+        last = self.datasets[-1].name if len(self.datasets) > 1 else None
+        return f"{pair_label(first, last)}_compar"
 
     def _capture_plot_pixmap(self):
         """Capture comparison plot area as pixmap."""
@@ -1510,37 +1833,6 @@ class DataComparisonTool(QDialog):
         except Exception as e:
             logging.error(f"Failed to capture comparison plot: {e}")
             return None
-
-    def _save_plot_image(self) -> None:
-        """Save comparison plot screenshot."""
-        pixmap = self._capture_plot_pixmap()
-        if pixmap is None or pixmap.isNull():
-            QMessageBox.warning(self, "No Image", "No plot image available to save.")
-            return
-
-        from PyQt6.QtCore import QSettings
-        settings = QSettings()
-        last_dir = settings.value("paths/last_export_directory", pathlib.Path.home())
-        file_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Save Plot Image",
-            str(pathlib.Path(last_dir) / "comparison_plot.png"),
-            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;BMP Image (*.bmp)",
-        )
-        if not file_path:
-            return
-
-        settings.setValue("paths/last_export_directory", pathlib.Path(file_path).parent)
-
-        fmt = "PNG"
-        if "JPEG" in selected_filter or file_path.lower().endswith((".jpg", ".jpeg")):
-            fmt = "JPG"
-        elif "BMP" in selected_filter or file_path.lower().endswith(".bmp"):
-            fmt = "BMP"
-
-        ok = pixmap.save(file_path, fmt, 95 if fmt == "JPG" else -1)
-        if not ok:
-            QMessageBox.critical(self, "Save Failed", f"Failed to save image:\n{file_path}")
 
     def _copy_plot_image(self) -> None:
         """Copy comparison plot screenshot to clipboard."""
@@ -1551,8 +1843,132 @@ class DataComparisonTool(QDialog):
         QApplication.clipboard().setPixmap(pixmap)
         logging.info("Copied comparison plot image to clipboard")
 
-    def _export_to_csv(self) -> None:
-        """Export comparison data with automatic X-column strategy."""
+    def _load_x_dataset(self, x_key: str) -> np.ndarray | None:
+        """Read a 1-D X dataset from a ``file::dataset`` key."""
+        try:
+            if "::" not in x_key:
+                return None
+            file_part, ds_path = x_key.split("::", 1)
+            resolved = pathlib.Path(file_part.strip())
+            if not resolved.exists():
+                match = next((p for p in self.opened_files if p.name == resolved.name), None)
+                if match is None:
+                    return None
+                resolved = match
+            with h5py.File(resolved, "r") as f:
+                if ds_path.strip() not in f:
+                    return None
+                arr = np.asarray(f[ds_path.strip()][()]).squeeze()
+            return arr if arr.ndim == 1 else None
+        except Exception as exc:
+            logging.warning("Could not read X dataset %s: %s", x_key, exc)
+            return None
+
+    def build_export_table(
+        self,
+        export_x: bool = True,
+        x_key: str | None = None,
+    ) -> tuple[list[str], list[Any], list[str]]:
+        """Build the table an export would write, as displayed.
+
+        :param export_x: when false, only Y columns are written.
+        :param x_key: an explicit ``file::dataset`` X to use for every curve; when
+            None the X shown in the table is used, shared across curves when they
+            agree on one and per-curve otherwise.
+        :return: ``(headers, columns, comments)``.
+        """
+        transformed = []
+        for entry in self.datasets:
+            x_values, y_values = self._build_export_series(entry)
+            transformed.append((entry, x_values, y_values))
+
+        override_x = self._load_x_dataset(x_key) if (export_x and x_key) else None
+        has_custom_x = any(entry.x_data is not None for entry in self.datasets)
+        compatible, reason = self._is_shared_xq_compatible()
+        # An explicit X is by definition shared by every curve.
+        use_shared_mode = True if override_x is not None else compatible
+
+        comments = [
+            f"# Export mode: {'Aligned table' if use_shared_mode else 'Per-dataset columns'}",
+            f"# q conversion: {'ON' if self.chk_convert_to_q.isChecked() else 'OFF'}",
+        ]
+        if export_x and x_key:
+            state = "not readable, using the displayed X" if override_x is None else "applied to all curves"
+            comments.append(f"# X dataset: {x_key} ({state})")
+        if not use_shared_mode and reason:
+            comments.append(f"# auto-switch reason: {reason}")
+        comments.extend(
+            f"# {entry.name}: E={entry.energy:g} eV, "
+            f"fX={entry.x_expr.strip() or 'x'}, fY={entry.y_expr.strip() or 'y'}"
+            for entry, _x, _y in transformed
+        )
+
+        headers: list[str] = []
+        columns: list[Any] = []
+        # The same short name the legend shows, so a figure and the table
+        # behind it call one curve by one name.
+        labels = self._unique_series_labels()
+        as_q = self.chk_convert_to_q.isChecked()
+        if use_shared_mode:
+            # One shared X/q column, then one Y column per curve. The X is named
+            # after the dataset it came from, not after any of the Y curves.
+            if export_x and (override_x is not None or has_custom_x):
+                source = x_key if override_x is not None else next(
+                    (e.x_path for e in self.datasets if e.x_path), None
+                )
+                headers.append(x_column_header(source, as_q))
+                columns.append(override_x if override_x is not None else transformed[0][1])
+            for (entry, _x_values, y_values), label in zip(transformed, labels):
+                headers.append(f"{label}_Y")
+                columns.append(y_values)
+        else:
+            # The curves do not share an axis, so each gets its own X/Y pair.
+            for (entry, x_values, y_values), label in zip(transformed, labels):
+                if export_x:
+                    # Falls back to the Y's name only when this row has no X
+                    # dataset of its own — then the column really is "that
+                    # curve's axis" and nothing better can be said about it.
+                    headers.append(
+                        x_column_header(entry.x_path, as_q) if entry.x_path
+                        else f"{label}_{'q' if as_q else 'X'}"
+                    )
+                    columns.append(x_values)
+                headers.append(f"{label}_Y")
+                columns.append(y_values)
+
+        return headers, columns, comments
+
+    def _ask_export_path(
+        self,
+        fmt: TableFormat,
+        ask_dialect: bool,
+    ) -> tuple[pathlib.Path, TableFormat] | None:
+        """Ask where to write, remembering the folder and dialect.
+
+        :param ask_dialect: quick export lets the dialect be picked here; the
+            full export already chose it in its settings dialog.
+        :return: ``(path, dialect)`` or ``None`` when cancelled.
+        """
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Comparison Data",
+            suggested_save_path(self._default_export_base_name(), extension=fmt.suffix),
+            save_dialog_filter(fmt) if ask_dialect else dialog_filter(fmt),
+        )
+        if not file_path:
+            return None
+
+        chosen = format_from_filter(selected_filter) if ask_dialect else fmt
+        export_path = pathlib.Path(file_path)
+        if not export_path.suffix:
+            export_path = export_path.with_suffix(chosen.suffix)
+
+        remember_save_directory(export_path)
+        QSettings().setValue("export/table_format", chosen.key)
+        return export_path, chosen
+
+    def quick_export(self) -> None:
+        """Quick export: write the plotted curves straight to a chosen file."""
         if not self.datasets:
             QMessageBox.information(
                 self,
@@ -1561,88 +1977,110 @@ class DataComparisonTool(QDialog):
             )
             return
 
-        # Open file save dialog
-        from PyQt6.QtWidgets import QFileDialog
-        from PyQt6.QtCore import QSettings
+        settings_fmt = get_table_format(str(QSettings().value("export/table_format", DEFAULT_TABLE_FORMAT_KEY)))
+        asked = self._ask_export_path(settings_fmt, ask_dialect=True)
+        if asked is None:
+            return
+        export_path, fmt = asked
 
-        settings = QSettings()
-        last_dir = settings.value("paths/last_export_directory", pathlib.Path.home())
+        headers, columns, comments = self.build_export_table()
+        self._write_export(export_path, headers, columns, comments, fmt)
 
-        file_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Export Comparison Data",
-            str(pathlib.Path(last_dir) / f"{self._default_export_base_name()}.csv"),
-            "CSV Files (*.csv);;Text Files (*.txt);;All Files (*.*)"
+    def plot_series(self) -> list:
+        """The compared curves as plot Series.
+
+        Built from the export table so the figure and the file always show the
+        same numbers, formulas and X choice included.
+        """
+        from src.gui.plot_series import series_from_table
+
+        headers, columns, _comments = self.build_export_table()
+        return series_from_table(headers, columns)
+
+    def open_plot(self) -> None:
+        """Open a Plot window on the compared curves.
+
+        The log switches follow the tool's own, so the figure opens looking like
+        the plot it was asked for.
+        """
+        from src.gui.plot_dialog import open_plot_dialog
+
+        if not self.datasets:
+            QMessageBox.information(self, "No Data", "Add datasets to the comparison list first.")
+            return
+
+        dialog = open_plot_dialog(self, self.plot_series(), title="Comparison")
+        if dialog is None:
+            return
+        if self.chk_log_x.isChecked() and dialog.chk_log_x.isEnabled():
+            dialog.chk_log_x.setChecked(True)
+        if self.chk_log_y.isChecked() and dialog.chk_log_y.isEnabled():
+            dialog.chk_log_y.setChecked(True)
+
+    def _export_full(self) -> None:
+        """Full export: settings dialog first, then write.
+
+        Shown non-modally so a dataset can still be dragged out of the main
+        window's tree into the dialog's X field.
+        """
+        if not self.datasets:
+            QMessageBox.information(
+                self,
+                "No Data",
+                "No datasets to export. Please add datasets to the comparison list first."
+            )
+            return
+
+        dialog = ComparisonExportDialog(self)
+
+        def refresh() -> None:
+            headers, columns, _comments = self.build_export_table(dialog.export_x(), dialog.x_key())
+            dialog.show_preview(headers, columns)
+
+        dialog.settings_changed.connect(refresh)
+        dialog.accepted.connect(lambda d=dialog: self._finish_full_export(d))
+        dialog.rejected.connect(dialog.deleteLater)
+        refresh()
+
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setModal(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._export_dialog = dialog
+
+    def _finish_full_export(self, dialog: "ComparisonExportDialog") -> None:
+        """Write the file once the non-modal settings dialog is accepted."""
+        asked = self._ask_export_path(dialog.table_format(), ask_dialect=False)
+        if asked is None:
+            dialog.deleteLater()
+            return
+        export_path, fmt = asked
+
+        headers, columns, comments = self.build_export_table(dialog.export_x(), dialog.x_key())
+        include_comments = dialog.include_comments()
+        dialog.deleteLater()
+
+        self._write_export(
+            export_path,
+            headers,
+            columns,
+            comments if include_comments else [],
+            fmt,
         )
 
-        if not file_path:
-            return  # User cancelled
-
-        # Save directory for next time
-        settings.setValue("paths/last_export_directory", pathlib.Path(file_path).parent)
-
+    def _write_export(
+        self,
+        export_path: pathlib.Path,
+        headers: list[str],
+        columns: list[Any],
+        comments: list[str],
+        fmt: TableFormat,
+    ) -> None:
+        """Write the built table and report the outcome."""
+        file_path = str(export_path)
         try:
-            # Determine delimiter based on file extension
-            file_ext = pathlib.Path(file_path).suffix.lower()
-            delimiter = "\t" if file_ext == ".txt" else ","
-
-            max_length = max(len(data) for _, data, *_ in self.datasets)
-            has_custom_x = any(d[6] is not None for d in self.datasets)
-            compatible, reason = self._is_shared_xq_compatible()
-            use_shared_mode = compatible
-
-            transformed = []
-            for name, data, energy, offset_x, offset_y, scale_y, row_x_data, _row_x_path in self.datasets:
-                x_values, y_values = self._build_export_series(
-                    data, energy, offset_x, offset_y, scale_y, row_x_data
-                )
-                transformed.append((name, x_values, y_values, energy, offset_x, offset_y, scale_y))
-
-            # Write data file with UTF-8 BOM for better Excel compatibility
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f, delimiter=delimiter)
-
-                # Metadata rows
-                writer.writerow([f"# Export mode: {'Aligned table' if use_shared_mode else 'Per-dataset columns'}"])
-                writer.writerow([f"# q conversion: {'ON' if self.chk_convert_to_q.isChecked() else 'OFF'}"])
-                if not use_shared_mode and reason:
-                    writer.writerow([f"# auto-switch reason: {reason}"])
-                for name, _x_values, _y_values, energy, offset_x, offset_y, scale_y in transformed:
-                    writer.writerow([f"# {name}: E={energy:g} eV, OffsetX={offset_x:g}, OffsetY={offset_y:g}, ScaleY={scale_y:g}"])
-
-                if use_shared_mode:
-                    # Shared X/q columns + per-dataset Y columns
-                    header = []
-                    shared_x = None
-                    if has_custom_x:
-                        first_name, first_x, _first_y, _e, _ox, _oy, _sy = transformed[0]
-                        shared_x = first_x
-                        header.append("q" if self.chk_convert_to_q.isChecked() else "X")
-                    for name, _x_values, _y_values, _e, _ox, _oy, _sy in transformed:
-                        header.append(f"{name}_Y")
-                    writer.writerow(header)
-
-                    for row_idx in range(max_length):
-                        row = []
-                        if shared_x is not None:
-                            row.append(f"{shared_x[row_idx]:.10g}" if row_idx < len(shared_x) else "")
-                        for _name, _x_values, y_values, _e, _ox, _oy, _sy in transformed:
-                            row.append(f"{y_values[row_idx]:.10g}" if row_idx < len(y_values) else "")
-                        writer.writerow(row)
-                else:
-                    # Per-dataset X/q and Y columns
-                    header = []
-                    for name, _x_values, _y_values, _e, _ox, _oy, _sy in transformed:
-                        x_label = f"{name}_q" if self.chk_convert_to_q.isChecked() else f"{name}_X"
-                        header.extend([x_label, f"{name}_Y"])
-                    writer.writerow(header)
-
-                    for row_idx in range(max_length):
-                        row = []
-                        for _name, x_values, y_values, _e, _ox, _oy, _sy in transformed:
-                            row.append(f"{x_values[row_idx]:.10g}" if row_idx < len(x_values) else "")
-                            row.append(f"{y_values[row_idx]:.10g}" if row_idx < len(y_values) else "")
-                        writer.writerow(row)
+            write_table(export_path, headers, columns, fmt, comments=comments)
 
             logging.info(f"Exported comparison data to: {file_path}")
             QMessageBox.information(
@@ -1658,7 +2096,3 @@ class DataComparisonTool(QDialog):
                 "Export Failed",
                 f"Failed to export data:\n{str(e)}"
             )
-
-
-
-

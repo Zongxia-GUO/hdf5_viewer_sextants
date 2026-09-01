@@ -1,4 +1,4 @@
-﻿"""Unified data viewer that automatically selects appropriate display widget."""
+"""Unified data viewer that automatically selects appropriate display widget."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -158,6 +158,7 @@ class UnifiedDataViewer(QWidget):
                 # 2D/3D+ data - image viewer (slice slider appears automatically for 3D)
                 logging.info(f"UnifiedDataViewer: Displaying as image (ndim={ndim})")
                 if isinstance(self.current_widget, ImageView2DEnhanced):
+                    self.current_widget.set_source_dataset_key(self.source_dataset_key)
                     self.current_widget.set_data(data)
                     return
                 self._clear_current_widget()
@@ -223,6 +224,7 @@ class UnifiedDataViewer(QWidget):
 
         image_view = ImageView2DEnhanced(parent=self)
         image_view.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        image_view.set_source_dataset_key(self.source_dataset_key)
         image_view.q_calibration_requested.connect(self._on_image_q_requested)
         self._swap_widget(image_view)
         image_view.set_data(data)
@@ -329,7 +331,5 @@ class UnifiedDataViewer(QWidget):
     def clear(self) -> None:
         """Clear all displayed data and widgets."""
         self._clear_current_widget()
-
-
 
     q_calibration_requested = pyqtSignal(object)

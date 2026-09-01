@@ -6,9 +6,9 @@ src_paths = ["src", "main.py"]
 [tool.black]
 line-length = 120
 
-[tool.flake8]
-max-line-length = 120
-ignore = "D401"
+# NOTE: flake8 does not read pyproject.toml — its configuration lives in
+# setup.cfg under [flake8]. A [tool.flake8] section here would be silently
+# ignored, which is what used to happen to the D401 exemption.
 
 [tool.mypy]
 mypy_path = "src"

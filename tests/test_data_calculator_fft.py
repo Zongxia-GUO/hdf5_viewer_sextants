@@ -2,6 +2,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+from PyQt6.QtWidgets import QMessageBox
 
 from src.gui.data_calculator_enhanced import DataCalculatorEnhanced
 
@@ -22,6 +23,24 @@ def test_calculator_custom_expression_can_use_dataset_a_only(qapp, tmp_path: Pat
 
     np.testing.assert_allclose(tool.result_data, data * 2)
     assert tool.data_b is None
+
+
+def test_calculator_rejects_sandbox_escape(qapp, tmp_path: Path, monkeypatch):
+    """An attribute-traversal escape is refused instead of evaluated."""
+    h5_path = tmp_path / "scanx_0003.h5"
+    _write_h5(h5_path, "curve", np.arange(8, dtype=float))
+
+    shown: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "critical", staticmethod(lambda *args, **kwargs: shown.append(args[1]))
+    )
+
+    tool = DataCalculatorEnhanced((h5_path,))
+    tool.add_to_dataset_a(f"{h5_path}::curve")
+    tool._perform_operation("A.__class__.__mro__[0].__subclasses__()")
+
+    assert shown == ["Invalid Expression"]
+    assert tool.result_data is None
 
 
 def test_calculator_fft_function_uses_centered_magnitude(qapp, tmp_path: Path):

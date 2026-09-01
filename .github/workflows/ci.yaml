@@ -1,12 +1,12 @@
-# Continuous Integration: run the test suite and report lint/type status.
+# Continuous Integration: run the test suite and the linters.
 #
 # Strategy:
-#   - The `test` job is a hard gate: pytest must pass for the build to be green.
-#   - The `lint` job (flake8 + mypy) is advisory for now (continue-on-error),
-#     because the codebase currently carries a large pre-existing backlog
-#     (hundreds of flake8/mypy findings). It surfaces the signal without
-#     blocking PRs. Once the backlog is paid down, drop `continue-on-error`
-#     to make it a hard gate.
+#   - `test` is a hard gate: pytest must pass for the build to be green.
+#   - `flake8` is a hard gate too. The tree is clean under the policy in
+#     setup.cfg, so any new finding is a genuine regression.
+#   - `mypy` stays advisory (continue-on-error): the annotation backlog is still
+#     large, and tightening it is a per-module effort. Drop the flag once a
+#     module set is clean.
 name: CI
 
 on:
@@ -60,7 +60,7 @@ jobs:
         run: pytest -q
 
   lint:
-    name: Lint & type-check (advisory)
+    name: Lint (flake8 gate) & type-check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -79,9 +79,8 @@ jobs:
           pip install -r requirements_dev.txt
 
       - name: flake8
-        continue-on-error: true
         run: flake8 .
 
-      - name: mypy
+      - name: mypy (advisory)
         continue-on-error: true
         run: mypy src main.py

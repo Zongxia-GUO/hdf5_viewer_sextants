@@ -1,4 +1,4 @@
-﻿"""Dataset type classification."""
+"""Dataset type classification."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -109,6 +109,3 @@ class H5DatasetType(Enum):
 
         # Fallback: display as string
         return cls.String
-
-
-

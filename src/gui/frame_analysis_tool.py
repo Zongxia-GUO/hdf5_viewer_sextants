@@ -28,6 +28,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.gui.export_naming import (
+    remember_save_directory,
+    short_series_label,
+    suggested_save_path,
+)
 from src.recon import profiles as _profiles
 
 
@@ -143,9 +148,11 @@ class _ProfileFitPanel(QWidget):
         default_p0: list[float] | None = None,
         default_fit_lo: float = 0.0,
         default_fit_hi: float = 100.0,
+        source_key: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
+        self._source_key = source_key
         self._mode = mode
         self._n_frames = n_frames
         self._data3d = data3d
@@ -276,7 +283,7 @@ class _ProfileFitPanel(QWidget):
         self._lbl_status.setFont(mono)
         cl.addWidget(self._lbl_status)
 
-        self._btn_export = QPushButton("Exporter CSV")
+        self._btn_export = QPushButton("Export")
         self._btn_export.setAutoDefault(False)
         self._btn_export.setDefault(False)
         self._btn_export.setEnabled(False)
@@ -334,9 +341,8 @@ class _ProfileFitPanel(QWidget):
         self._progress.setValue(0)
         self._btn_export.setEnabled(False)
 
-        unit = "°" if self._mode == "angular" else "px"
-        x_label = f"θ ({unit})" if self._mode == "angular" else f"r ({unit})"
-
+        # These plots are parameter-vs-frame, so the bottom axis is "Frame";
+        # the profile's own unit label belongs to the profile plot, not here.
         for i, pname in enumerate(self._param_names):
             plot = self._glw.addPlot(row=i, col=0)
             plot.showGrid(x=True, y=True, alpha=0.25)
@@ -483,15 +489,21 @@ class _ProfileFitPanel(QWidget):
     # Export                                                             #
     # ---------------------------------------------------------------- #
 
+    def _default_export_name(self) -> str:
+        """Scan and dataset the frames came from, else the profile kind."""
+        return short_series_label(self._source_key, fallback=f"frames_{self._mode}")
+
     def _on_export(self) -> None:
         if not self._results:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Exporter les résultats", "",
+            self, "Export fit results",
+            suggested_save_path(self._default_export_name(), "frames", extension=".csv"),
             "CSV files (*.csv);;All files (*)"
         )
         if not path:
             return
+        remember_save_directory(path)
         model_name = self._combo_model.currentText()
         pnames = [n for n, _ in self._fit_models[model_name]["params"]]
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -526,10 +538,13 @@ class FrameAnalysisTool(QDialog):
         p0: list[float] | None = None,
         fit_lo: float = 0.0,
         fit_hi: float = 100.0,
+        source_key: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._data3d = data3d
+        # Where the frames came from, so an exported fit can be traced back.
+        self._source_key = source_key
         n = data3d.shape[0]
 
         self.setWindowTitle(f"Analyse frame par frame — {n} frames")
@@ -574,6 +589,7 @@ class FrameAnalysisTool(QDialog):
             default_p0=p0_r,
             default_fit_lo=lo_r,
             default_fit_hi=hi_r,
+            source_key=source_key,
         )
         tabs.addTab(panel_r, "I(r) — Profil radial")
 
@@ -589,6 +605,7 @@ class FrameAnalysisTool(QDialog):
             default_p0=p0_a,
             default_fit_lo=lo_a,
             default_fit_hi=hi_a,
+            source_key=source_key,
         )
         tabs.addTab(panel_a, "I(θ) — Profil angulaire")
 

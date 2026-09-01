@@ -1,4 +1,4 @@
-﻿"""H5 File related functions and types."""
+"""H5 File related functions and types."""
 
 # Copyright (C) 2023 Dennis Leonard
 #
@@ -14,6 +14,3 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-
-
