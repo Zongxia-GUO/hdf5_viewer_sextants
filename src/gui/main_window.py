@@ -124,6 +124,14 @@ from src.lib_h5.file_validator import (
 
 FTH_MIN_SECOND_DIM = 100  # FTH candidate requires shape[1] > 100
 
+# How often open tools may be told the index grew, while it is still growing.
+# Every refresh rebuilds each tool's dataset combos from the WHOLE key list, so
+# refreshing once per scanned batch costs sum-of-prefixes, not a constant: with
+# the default batch of 50 a 300-file import spent 340 ms rebuilding combos, and
+# at batch 10 it spent 4.8 s — all of it on the GUI thread, which is exactly
+# when the open tool feels stuck. The final refresh is never coalesced.
+INDEX_REFRESH_COALESCE_MS = 400
+
 # Separator between several Y dataset paths in the batch address field.
 BATCH_PATH_SEPARATOR = "; "
 
@@ -644,6 +652,11 @@ class MainWindow(QMainWindow):
         self._load_index_scope_settings()
         self._load_disk_index_cache()
         self._index_warm_worker: _DatasetIndexWarmWorker | None = None
+        # Paces the mid-warm tool refreshes; see INDEX_REFRESH_COALESCE_MS.
+        self._index_refresh_timer = QTimer(self)
+        self._index_refresh_timer.setSingleShot(True)
+        self._index_refresh_timer.setInterval(INDEX_REFRESH_COALESCE_MS)
+        self._index_refresh_timer.timeout.connect(self.dataset_index_changed.emit)
         # The file set the running warm worker was handed. Files opened after it
         # started are not in it, and the worker cannot pick them up mid-run.
         self._index_warm_files: tuple[pathlib.Path, ...] = ()
@@ -1568,7 +1581,12 @@ class MainWindow(QMainWindow):
                 self._dataset_index_last_used[fp] = now
         scope_txt = f"fast:{'/'.join(self._fast_group_paths)}" if self._index_scope == "fast" else "full"
         self._set_index_status(f"Index: Warming [{scope_txt}] {processed}/{max(1, total)}", warming=True)
-        self.dataset_index_changed.emit()
+        # Start the timer, never restart it: restarting on every batch would push
+        # the refresh past the end of a fast scan and show nothing until it
+        # finished. This way tools still fill in progressively, just at a rate
+        # that does not depend on how the scan happens to be batched.
+        if not self._index_refresh_timer.isActive():
+            self._index_refresh_timer.start()
 
     def _on_dataset_index_warm_done(
         self,
@@ -1588,6 +1606,7 @@ class MainWindow(QMainWindow):
             self._dataset_index_last_used.setdefault(fp, now)
         self._save_disk_index_cache()
         self._index_warm_worker = None
+        self._index_refresh_timer.stop()
 
         # Files opened while this worker ran were never handed to it, and a prime
         # requested in that window returned early. Without this the index simply

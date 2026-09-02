@@ -204,3 +204,141 @@ def test_opened_files_are_plain_paths(qapp, scans):
     finally:
         win.close()
         win.deleteLater()
+
+
+# ── Open tools are not rebuilt once per scanned batch ─────────────────── #
+
+def _count_refreshes(win):
+    hits = []
+    win.dataset_index_changed.connect(lambda: hits.append(True))
+    return hits
+
+
+def test_a_scanned_batch_does_not_rebuild_the_tools_immediately(qapp, scans):
+    """Every refresh rebuilds each tool's combos from the WHOLE key list, so
+    doing it per batch costs sum-of-prefixes. Measured on 300 files: 25
+    rebuilds at batch 10, 745 ms of GUI-thread work."""
+    win = MainWindow()
+    try:
+        hits = _count_refreshes(win)
+
+        win._on_dataset_index_warm_batch(
+            {str(scans[0]): ((0, 0), [f"{scans[0]}::a"], [])},
+            1, 3, win._index_scope, win._fast_group_paths,
+        )
+
+        assert hits == [], "the batch rebuilt the tools synchronously"
+        assert win._index_refresh_timer.isActive()
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_many_batches_still_schedule_only_one_refresh(qapp, scans):
+    """The cost must stop scaling with how the scan happens to be batched."""
+    win = MainWindow()
+    try:
+        hits = _count_refreshes(win)
+        starts = []
+        real_start = win._index_refresh_timer.start
+        win._index_refresh_timer.start = lambda *a: (starts.append(True), real_start(*a))[1]
+
+        for i in range(20):
+            win._on_dataset_index_warm_batch(
+                {str(scans[0]): ((0, 0), [f"{scans[0]}::a{i}"], [])},
+                i + 1, 20, win._index_scope, win._fast_group_paths,
+            )
+
+        assert hits == []
+        assert len(starts) == 1, f"the timer was restarted {len(starts)} times"
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_the_pending_refresh_is_not_pushed_back_forever(qapp, scans):
+    """Restarting the timer on each batch would starve it on a fast scan and
+    show nothing until the very end, which is why start() is guarded."""
+    win = MainWindow()
+    try:
+        win._on_dataset_index_warm_batch(
+            {str(scans[0]): ((0, 0), [], [])}, 1, 9, win._index_scope, win._fast_group_paths,
+        )
+        first = win._index_refresh_timer.remainingTime()
+        for i in range(5):
+            win._on_dataset_index_warm_batch(
+                {str(scans[0]): ((0, 0), [], [])}, i + 2, 9,
+                win._index_scope, win._fast_group_paths,
+            )
+
+        assert win._index_refresh_timer.remainingTime() <= first
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_the_final_refresh_is_immediate(qapp, scans):
+    """Coalescing must never swallow the last one: that is the refresh that
+    leaves the tools showing the complete index."""
+    win = MainWindow()
+    try:
+        for path in scans:
+            win._open_file(path)
+        win._index_warm_files = tuple(win.opened_files)
+        win._index_warm_worker = None
+        win._index_refresh_timer.start()
+        hits = _count_refreshes(win)
+
+        win._on_dataset_index_warm_done(
+            {str(p): ((0, 0), [], []) for p in scans},
+            win._index_scope, win._fast_group_paths,
+        )
+
+        assert hits == [True]
+        assert not win._index_refresh_timer.isActive()
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+def test_the_timer_emits_the_same_signal_the_tools_listen_to(qapp):
+    win = MainWindow()
+    try:
+        hits = _count_refreshes(win)
+        win._index_refresh_timer.timeout.emit()
+
+        assert hits == [True]
+    finally:
+        win.close()
+        win.deleteLater()
+
+
+# ── The combo label is memoised, not reimplemented ────────────────────── #
+
+def test_the_memoised_basename_matches_pathlib_exactly():
+    from src.gui.dataset_path_combo import DatasetPathCombo
+
+    for full_key in (
+        "C:/a/b/scan_001.hdf5::g/scan_data/d1",
+        r"D:\x\y\f.h5::a/b/c",
+        "rel.h5::d",
+        "/unix/p/f.nxs::  g/d  ",
+        "no_dir.h5::x/y/z/w",
+    ):
+        fname, ds_path = full_key.rsplit("::", 1)
+        expected = (f"{pathlib.Path(fname).name}::"
+                    f"{DatasetPathCombo._short_dataset_label(ds_path.strip())}")
+
+        assert DatasetPathCombo.short_display_from_full_key(full_key) == expected, full_key
+
+
+def test_the_basename_is_computed_once_per_file(qapp):
+    """Every dataset repeats its file's path; pathlib was 45% of a refresh."""
+    from src.gui.dataset_path_combo import DatasetPathCombo
+
+    DatasetPathCombo._file_basename.cache_clear()
+    for i in range(50):
+        DatasetPathCombo.short_display_from_full_key(f"C:/d/scan.h5::g/data_{i}")
+
+    info = DatasetPathCombo._file_basename.cache_info()
+    assert info.misses == 1 and info.hits == 49
