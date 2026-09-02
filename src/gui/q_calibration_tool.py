@@ -39,7 +39,7 @@ from src.gui.export_naming import (
     suggested_save_path,
 )
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
-from src.gui._shared import roi_pen, set_axis_label
+from src.gui._shared import profile_pen, roi_pen, set_axis_label
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
 from src.lib_h5.table_format import (
@@ -303,7 +303,7 @@ class QCalibrationTool(QDialog):
             self._profile_plot.getAxis(axis).setTextPen(pg.mkPen("w"))
         set_axis_label(self._profile_plot, "bottom", "r (px)")
         set_axis_label(self._profile_plot, "left", "Mean intensity")
-        self._profile_curve = self._profile_plot.plot([], [], pen=pg.mkPen((0, 200, 255), width=2))
+        self._profile_curve = self._profile_plot.plot([], [], pen=profile_pen())
         # The only way to get this curve out of the tool; it has no buttons of
         # its own, and pyqtgraph's own Export bypasses the naming and dialect
         # rules every other export in the application follows.

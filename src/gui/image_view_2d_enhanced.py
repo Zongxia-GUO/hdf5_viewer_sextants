@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.gui._shared import quick_icon_button, roi_pen, set_axis_label
+from src.gui._shared import profile_pen, quick_icon_button, roi_pen, set_axis_label
 from src.gui.plot_context_menu import attach_plot_menu
 from src.gui.export_naming import (
     export_stem,
@@ -1822,10 +1822,7 @@ class ImageView2DEnhanced(QWidget):
                         radii = radii * self._roi_distance_scale_for_direction("radial")
 
                         # Plot the radial profile
-                        pen = pg.mkPen(color='c', width=2)
-                        self.roi_plot_widget.plot(
-                            radii, intensities, pen=pen, symbol='o', symbolSize=4, symbolBrush='c'
-                        )
+                        self.roi_plot_widget.plot(radii, intensities, pen=profile_pen())
 
                         # Set labels
                         set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')
@@ -1939,9 +1936,8 @@ class ImageView2DEnhanced(QWidget):
                     x_label_text = "Index"
                     x_label_unit = ""
 
-                # Plot the profile (cyan color for dark theme)
-                pen = pg.mkPen(color='c', width=2)
-                self.roi_plot_widget.plot(x_values, profile, pen=pen, symbol='o', symbolSize=4, symbolBrush='c')
+                # One curve style for every profile; see _shared.profile_pen.
+                self.roi_plot_widget.plot(x_values, profile, pen=profile_pen())
 
                 # Set labels
                 set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')
@@ -2001,9 +1997,8 @@ class ImageView2DEnhanced(QWidget):
                 )
                 x_values = np.linspace(0.0, length_px * scale_dir, n)
 
-                # Plot the profile (cyan color for dark theme)
-                pen = pg.mkPen(color='c', width=2)
-                self.roi_plot_widget.plot(x_values, profile, pen=pen, symbol='o', symbolSize=4, symbolBrush='c')
+                # One curve style for every profile; see _shared.profile_pen.
+                self.roi_plot_widget.plot(x_values, profile, pen=profile_pen())
 
                 # Set labels
                 set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')

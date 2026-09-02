@@ -121,11 +121,24 @@ def set_axis_label(plot_widget: object, axis: str, text: str, unit: str = "") ->
     try:
         axis_item = item.getAxis(axis)
         axis_item.enableAutoSIPrefix(False)
+        # Switching the feature off does not undo a prefix already chosen.
+        # pyqtgraph recomputes autoSIPrefixScale on the way out and then keeps
+        # it, so an axis that had once shown "qx (m1/A)" loses the "m" from its
+        # label and goes on multiplying its ticks by 1000 — the label then reads
+        # 1/A over ticks of 18 where the value is 0.018. Clear the prefix, the
+        # scale and the stale unit by hand, before the label is written.
+        axis_item.labelUnits = ""
+        axis_item.labelUnitPrefix = ""
+        axis_item.autoSIPrefixScale = 1.0
     except Exception as exc:                       # pragma: no cover - defensive
         log.debug("Could not configure the %s axis: %s", axis, exc)
         return
     label = f"{text} ({unit})" if unit else text
     item.setLabel(axis, label)
+    # The ticks are cached in a QPicture; without this the old numbers stay up
+    # until something else happens to invalidate them.
+    axis_item.picture = None
+    axis_item.update()
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +154,27 @@ ROI_IDLE_RGB = (90, 160, 200)
 
 def roi_pen(selected: bool = True, width: float | None = None):
     """The pen for a region drawn over an image."""
-    import pyqtgraph as pg_local
-
-    return pg_local.mkPen(
+    return pg.mkPen(
         ROI_SELECTED_RGB if selected else ROI_IDLE_RGB,
         width=width if width is not None else (2.0 if selected else 1.5),
     )
+
+
+# ---------------------------------------------------------------------------
+# Profile curves
+# ---------------------------------------------------------------------------
+
+# The curve a 1-D profile is drawn with, whichever ROI produced it. The line
+# and rectangle profiles carried a marker on every sample, which on a profile
+# hundreds of points long merges into a band twice the width of the line and
+# hides the shape it was drawn to show; the ring and sector profiles were a
+# plain line. This is the plain line.
+PROFILE_CURVE_RGB = (0, 200, 255)
+
+
+def profile_pen(width: float = 2.0):
+    """The pen every 1-D profile curve is drawn with."""
+    return pg.mkPen(PROFILE_CURVE_RGB, width=width)
 
 
 # ---------------------------------------------------------------------------
