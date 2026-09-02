@@ -119,6 +119,7 @@ from src.lib_h5.file_validator import (
     has_supported_extension,
     is_hdf5_file,
     is_supported_data_file,
+    looks_like_hdf5,
 )
 
 FTH_MIN_SECOND_DIM = 100  # FTH candidate requires shape[1] > 100
@@ -488,7 +489,14 @@ class _DatasetIndexWarmWorker(QThread):
         keys_1d: list[str] = []
         keys_2d_fth: list[str] = []
 
-        if not is_hdf5_file(path_str):
+        # One open, not two. This used to call is_hdf5_file() — which opens the
+        # file in full and throws the handle away — and then open it again.
+        try:
+            handle = h5py.File(path_str, "r")
+        except (OSError, ValueError):
+            handle = None
+
+        if handle is None:
             arr = np.asarray(load_regular_data_file(path_str))
             full_key = f"{path_str}::data"
             if arr.ndim >= 1:
@@ -512,19 +520,28 @@ class _DatasetIndexWarmWorker(QThread):
                     return True
             return False
 
-        with h5py.File(path_str, "r") as f:
-            def _visit(name, obj, _fp=path_str):
-                if not isinstance(obj, h5py.Dataset):
-                    return
+        # Names first, objects second. visititems() instantiates an h5py object
+        # for every node in the file and only then were most of them thrown away
+        # by _in_fast_scope — so limiting the scope saved almost nothing (measured
+        # on 300 SEXTANTS scans: fast 1570 ms vs full 1607 ms, a 2% difference for
+        # a setting that reads as if it halves the work). visit() yields names
+        # without building anything, so the scope filter now runs before the cost
+        # instead of after it, and only the datasets that survive are opened.
+        with handle as f:
+            names: list[str] = []
+            f.visit(names.append)
+            for name in names:
                 if not _in_fast_scope(name):
-                    return
+                    continue
+                obj = f[name]
+                if not isinstance(obj, h5py.Dataset):
+                    continue
                 shp = obj.shape
                 if len(shp) >= 1:
-                    full_key = f"{_fp}::{name}"
+                    full_key = f"{path_str}::{name}"
                     keys_1d.append(full_key)
                     if len(shp) >= 2 and shp[1] > FTH_MIN_SECOND_DIM:
                         keys_2d_fth.append(full_key)
-            f.visititems(_visit)
         return keys_1d, keys_2d_fth
 
     def _update_cache(
@@ -627,6 +644,9 @@ class MainWindow(QMainWindow):
         self._load_index_scope_settings()
         self._load_disk_index_cache()
         self._index_warm_worker: _DatasetIndexWarmWorker | None = None
+        # The file set the running warm worker was handed. Files opened after it
+        # started are not in it, and the worker cannot pick them up mid-run.
+        self._index_warm_files: tuple[pathlib.Path, ...] = ()
         self.dataset_index_changed.connect(self._refresh_open_tools_dataset_index)
 
         # Appearance
@@ -1509,6 +1529,10 @@ class MainWindow(QMainWindow):
             return
 
         if self._index_warm_worker is not None and self._index_warm_worker.isRunning():
+            # Nothing is queued here on purpose: the worker is already scanning a
+            # fixed list, and _on_dataset_index_warm_done compares that list with
+            # what is open when it finishes, so a request that lands now is picked
+            # up there rather than being tracked twice.
             return
 
         scope_txt = f"fast:{'/'.join(self._fast_group_paths)}" if self._index_scope == "fast" else "full"
@@ -1521,6 +1545,7 @@ class MainWindow(QMainWindow):
             batch_size=self._index_batch_size,
             parent=self,
         )
+        self._index_warm_files = tuple(opened)
         self._index_warm_worker.batch.connect(self._on_dataset_index_warm_batch)
         self._index_warm_worker.done.connect(self._on_dataset_index_warm_done)
         self._index_warm_worker.start()
@@ -1563,6 +1588,18 @@ class MainWindow(QMainWindow):
             self._dataset_index_last_used.setdefault(fp, now)
         self._save_disk_index_cache()
         self._index_warm_worker = None
+
+        # Files opened while this worker ran were never handed to it, and a prime
+        # requested in that window returned early. Without this the index simply
+        # ends up missing them: they stay invisible to every tool's dataset picker
+        # until an unrelated event happens to trigger another warm. The rescan is
+        # cheap because the per-file signature check reuses everything already
+        # scanned, so only the new files are read.
+        if tuple(self.opened_files) != self._index_warm_files:
+            self.dataset_index_changed.emit()
+            self._prime_dataset_index_async()
+            return
+
         keys_1d = self._aggregate_cached_keys(min_ndim=1, min_second_dim=0)
         keys_2d_fth = self._aggregate_cached_keys(min_ndim=2, min_second_dim=FTH_MIN_SECOND_DIM)
         scope_txt = f"fast:{'/'.join(self._fast_group_paths)}" if self._index_scope == "fast" else "full"
@@ -1647,7 +1684,11 @@ class MainWindow(QMainWindow):
         parent_folder.setToolTip(str(file_path))
 
         self.tree_model_file.appendRow([parent_name, parent_text, parent_shape, parent_folder])
-        if not is_hdf5_file(file_path):
+        # The signature, not a full open: this runs on the GUI thread once per
+        # file, and opening every file to decide which icon to draw was a third
+        # of the cost of adding them. _load_tree_children already reports a file
+        # that turns out to be unreadable when it is expanded.
+        if not looks_like_hdf5(file_path):
             parent_text.setText(_regular_file_kind(file_path))
             parent_name.setData(True, _ROLE_CHILDREN_LOADED)
             child_name = QStandardItem("data")

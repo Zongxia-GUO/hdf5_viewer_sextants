@@ -56,6 +56,25 @@ def is_hdf5_file(file_path: Union[str, pathlib.Path]) -> bool:
         return False
 
 
+def looks_like_hdf5(file_path: Union[str, pathlib.Path]) -> bool:
+    """Check the HDF5 signature without opening the file.
+
+    :func:`is_hdf5_file` answers the stronger question — can h5py open this —
+    by opening it in full and throwing the handle away, which is roughly twice
+    the cost and is more than a caller needs when it is only choosing how to
+    show the file. Reading the 8-byte signature is enough for that, and a file
+    that has the signature but is truncated inside fails later where the error
+    can actually be reported, rather than being silently filed as a text file.
+
+    :param file_path: Path to the file to check
+    :return: True if the file starts with the HDF5 signature
+    """
+    try:
+        return bool(h5py.is_hdf5(file_path))
+    except (OSError, ValueError, IOError):
+        return False
+
+
 def has_hdf5_extension(file_path: Union[str, pathlib.Path]) -> bool:
     """
     Check if a file has a known HDF5 extension.
