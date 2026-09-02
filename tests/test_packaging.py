@@ -80,7 +80,7 @@ def test_every_icon_the_code_asks_for_exists():
 
 
 def test_the_installer_launches_the_exe_the_build_produces():
-    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8", errors="replace")
+    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8-sig")
 
     assert 'define MyAppExeName "HDF5-Viewer.exe"' in iss
     assert "APP_NAME = \"HDF5-Viewer\"" in BUILD
@@ -92,7 +92,7 @@ def test_the_installer_fallback_version_matches_the_source_of_truth():
     number would go unnoticed."""
     from src.version import __version__
 
-    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8", errors="replace")
+    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8-sig")
 
     assert f'#define MyAppVersion "{__version__}"' in iss
 
@@ -109,7 +109,7 @@ def test_the_changelog_has_an_entry_for_this_version():
 def test_the_taskbar_identity_matches_the_shortcut():
     """Windows groups a window under its shortcut only when the two agree; a
     mismatch is why the first launch showed a placeholder icon."""
-    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8", errors="replace")
+    iss = (ROOT / "windows" / "compile.iss").read_text(encoding="utf-8-sig")
     main = (ROOT / "main.py").read_text(encoding="utf-8")
 
     assert 'MyAppUserModelID "Soleil.SEXTANTS.HDF5Viewer"' in iss
@@ -157,3 +157,19 @@ def test_running_from_source_is_unaffected():
 
     assert img_path() == (ROOT / "src" / "img")
     assert (img_path() / "sextants.ico").exists()
+
+
+def test_the_installer_script_survives_a_non_ascii_publisher():
+    """Inno Setup 6 reads a BOM-less .iss as the system ANSI codepage, so a
+    non-ASCII publisher name only reaches Add/Remove Programs intact with one.
+
+    The name had in fact already been destroyed — the o-umlaut replaced by
+    U+FFFD by some decode-with-replace round trip — and every test in this file
+    read the script with errors="replace", which decodes that happily and sees
+    nothing wrong. This one reads the bytes."""
+    raw = (ROOT / "windows" / "compile.iss").read_bytes()
+
+    assert raw[:3] == b"\xef\xbb\xbf", "the .iss lost its UTF-8 BOM"
+    text = raw.decode("utf-8-sig")                     # strict, no errors=
+    assert "�" not in text, "the .iss contains a replacement character"
+    assert 'MyAppPublisher "Dennis Lönard"' in text
