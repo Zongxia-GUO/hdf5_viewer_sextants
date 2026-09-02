@@ -50,6 +50,7 @@ from src.gui._shared import (
     RAW_TIFF_SUFFIXES as _RAW_TIFF_SUFFIXES,
     apply_colormap as _apply_colormap,
     array_to_qimage as _array_to_qimage,
+    clear_tool_displays,
     extension_for_filter as _extension_for_filter,
     set_combo_light_palette as _set_combo_light_palette,
     set_widget_light_palette as _set_widget_light_palette,
@@ -3519,6 +3520,67 @@ class CDIReconstructionTool(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Support FFT Seed Error", str(exc))
             return False
+
+    #: Every array loaded or computed here. tests/test_tool_reset.py fails if an
+    #: array attribute is added to __init__ without being listed.
+    _DATA_ATTRS = (
+        "_amp_cl",
+        "_amp_cr",
+        "_int_cl",
+        "_int_cr",
+        "_amp_meas",
+        "_pixel_mask",
+        "_bad_pixel_mask_source",
+        "_bad_pixel_mask",
+        "_support",
+        "_support_source_mask",
+        "_result_obj",
+        "_result_cl",
+        "_result_cr",
+        "_result_diff",
+    )
+
+    def reset_results(self) -> None:
+        """Throw away the loaded data, the masks and every reconstruction.
+
+        The window is kept alive between uses so that reopening is instant, but
+        that made a closed tool come back showing the previous run — which
+        reads as a reconstruction of whatever is selected now. The dataset
+        selections and the parameters are left alone: they are the question,
+        not the answer.
+        """
+        self._stop_reconstruction()
+        for worker in (self._load_worker, self._recon_worker, self._seq_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait(1000)
+        self._load_worker = None
+        self._recon_worker = None
+        self._seq_worker = None
+
+        # Masks own scene items and three overlays; _clear_shapes already takes
+        # all of that down in the right order, so it runs before the plain
+        # attribute reset rather than being duplicated here.
+        self._clear_shapes()
+        for name in self._DATA_ATTRS:
+            setattr(self, name, None)
+        self._bad_pixel_mask_source_meta = None
+        self._last_hist_shape = None
+        self._result_errs = []
+        self._result_errs_cr = []
+        self._single_dataset_mode = False
+        self._bad_pixel_shift_y = 0
+        self._bad_pixel_shift_x = 0
+        clear_tool_displays(self)
+
+    def closeEvent(self, event) -> None:
+        """Closing the window means starting over next time."""
+        try:
+            self.reset_results()
+        except Exception as exc:
+            # A window must always be closable; a failed tidy-up is not a reason
+            # to trap the user in it.
+            logging.warning("Could not reset the CDI tool on close: %s", exc)
+        super().closeEvent(event)
 
     def _stop_reconstruction(self) -> None:
         if self._recon_worker:

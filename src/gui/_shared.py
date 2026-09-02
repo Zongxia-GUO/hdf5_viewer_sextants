@@ -178,6 +178,39 @@ def profile_pen(width: float = 2.0):
 
 
 # ---------------------------------------------------------------------------
+# Clearing a tool between uses
+# ---------------------------------------------------------------------------
+
+def clear_tool_displays(owner: object) -> int:
+    """Blank every image and curve the tool holds. Returns how many it blanked.
+
+    Tool windows are kept alive between uses so that reopening is instant, so
+    each one needs to put itself back to a blank state when it closes. Listing
+    the views by hand goes stale silently: a view added later keeps showing the
+    previous scan, and nothing says so. Walking the attributes instead means a
+    new view is covered the day it is added.
+
+    Only the *contents* are cleared, never the items themselves —
+    ``PlotWidget.clear()`` would remove curves the tool keeps a handle on and
+    reuses, leaving it drawing into an item no longer in the scene.
+    """
+    cleared = 0
+    for value in list(vars(owner).values()):
+        try:
+            if isinstance(value, pg.ImageItem):
+                value.clear()
+            elif isinstance(value, pg.PlotDataItem):
+                value.setData([], [])
+            else:
+                continue
+        except Exception as exc:                   # pragma: no cover - defensive
+            log.debug("Could not clear a display item: %s", exc)
+            continue
+        cleared += 1
+    return cleared
+
+
+# ---------------------------------------------------------------------------
 # Colormap helpers
 # ---------------------------------------------------------------------------
 

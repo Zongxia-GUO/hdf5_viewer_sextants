@@ -55,6 +55,7 @@ from src.gui._shared import (
     RAW_TIFF_SUFFIXES as _RAW_TIFF_SUFFIXES,
     apply_hist_colormap as _apply_hist_colormap,
     array_to_qimage as _array_to_qimage,
+    clear_tool_displays,
     extension_for_filter as _extension_for_filter,
 )
 from src.gui.export_naming import remember_save_directory, suggested_save_path
@@ -3376,8 +3377,53 @@ class FTHReconstructionTool(QMainWindow):
         else:
             logging.info("FTH: %s", msg)
 
-    def closeEvent(self, event) -> None:
+    #: Every array loaded or computed here. tests/test_tool_reset.py fails if an
+    #: array attribute is added to __init__ without being listed.
+    _DATA_ATTRS = (
+        "_CL",
+        "_CR",
+        "_dark",
+        "_CL_c",
+        "_CR_c",
+        "_CL_smooth",
+        "_CR_smooth",
+        "_bs_mask",
+        "_slit_mask",
+        "_Holo_S1",
+        "_Holo_S2",
+        "_Holo2_S1",
+        "_Holo2_S2",
+        "_FTH_S1",
+        "_FTH_S2",
+        "_xmat",
+        "_ymat",
+        "_t1_value_data",
+        "_t3_holo_disp_data",
+        "_t3_fth_disp_data",
+    )
+
+    def reset_results(self) -> None:
+        """Throw away the loaded holograms and everything computed from them.
+
+        The window is kept alive between uses so that reopening is instant, but
+        that made a closed tool come back showing the previous scan — which
+        reads as a reconstruction of whatever is selected now. The dataset
+        selections and the parameters are left alone: they are the question,
+        not the answer.
+        """
         if self._worker and self._worker.isRunning():
             self._worker.requestInterruption()
             self._worker.wait(500)
+        for name in self._DATA_ATTRS:
+            setattr(self, name, None)
+        clear_tool_displays(self)
+
+    def closeEvent(self, event) -> None:
+        """Closing the window means starting over next time."""
+        try:
+            self.reset_results()
+        except Exception as exc:
+            # A window must always be closable; a failed tidy-up is not a reason
+            # to trap the user in it.
+            logging.warning("Could not reset the FTH tool on close: %s", exc)
         super().closeEvent(event)

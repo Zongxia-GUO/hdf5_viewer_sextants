@@ -870,6 +870,46 @@ class QCalibrationTool(QDialog):
         self._profile_curve.setData([], [])
         self._update_profile_visibility()
 
+    #: Everything derived from a loaded image, cleared together on close.
+    _DATA_ATTRS = ("_data", "_raw_data", "_grid_cache", "_polar_cache")
+
+    def reset_results(self) -> None:
+        """Throw away the loaded image and everything derived from it.
+
+        The window is kept alive between uses so that reopening is instant, but
+        that made a closed tool come back showing the previous scan's image,
+        its ROIs and its profile — which reads as data for whatever is selected
+        now. The dataset selections are left alone: they are the question, not
+        the answer, and Load Data re-reads them from the file anyway.
+        """
+        self._clear_all_rois()
+        self._roi_counter = {"ring": 0, "sector": 0, "circle": 0}
+        for name in self._DATA_ATTRS:
+            setattr(self, name, None)
+        self._stack_notes = []
+        self._incident_applied = False
+        self._pending_center_pick = False
+        self._btn_pick_center.setChecked(False)
+
+        self._img.set_q_calibration(None)
+        self._img.set_data(np.zeros((1, 1), dtype=np.float32))
+        self._img.set_pixel_axes_labels_only()
+        self._center_cross.setData([], [])
+        self._center_circle.setData([], [])
+        self._profile_curve.setData([], [])
+        self._show_frame_controls(False)
+        self._set_status("Ready")
+
+    def closeEvent(self, event) -> None:
+        """Closing the window means starting over next time."""
+        try:
+            self.reset_results()
+        except Exception as exc:
+            # A window must always be closable; a failed tidy-up is not a reason
+            # to trap the user in it.
+            logging.warning("Could not reset the Q tool on close: %s", exc)
+        super().closeEvent(event)
+
     def _on_roi_combo_changed(self, _idx: int = -1) -> None:
         roi = self._selected_roi()
         if roi is None:
