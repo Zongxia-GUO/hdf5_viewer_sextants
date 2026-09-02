@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -104,6 +105,12 @@ class QCalibrationTool(QDialog):
 
         # Left panel
         left = QWidget()
+        # Ignored horizontally, as the calculator's controls panel is: the
+        # splitter's own sizes then decide the width, and nothing inside — a
+        # long dataset path, a status message, the frame selectors appearing —
+        # can push it wider on its own. Without this the panel is whatever its
+        # widest child happens to want, which changes as data is loaded.
+        left.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         left_lay = QVBoxLayout(left)
         # Zero inside the splitter panels; the dialog's own margin is the only
         # inset, matching the calculator and comparison windows.
@@ -382,14 +389,44 @@ class QCalibrationTool(QDialog):
         self._opened_files = opened_files
 
     def load_dataset_full_key(self, full_key: str, auto_load: bool = True, slot: str = "CL") -> bool:
-        """Select a dataset by full key into a slot (default CL) and optionally load."""
+        """Select a dataset by full key into a slot (default CL) and optionally load.
+
+        The key usually comes from whatever is selected in the tree, which is
+        often a *group* — opening the tool then greeted the user with "Dataset
+        not found" about a path that plainly exists. The selection is still
+        filled in either way, because it is a useful starting point; only the
+        automatic load is held back, and the reason goes on the status line
+        rather than into a message box the user did not ask for.
+        """
         if not full_key or "::" not in full_key:
             return False
         combo = self._combos.get(slot, self._cl_combo)
         combo.add_full_key(full_key, select=True)
+
         if auto_load:
+            problem = self._why_not_an_image(full_key)
+            if problem:
+                self._set_status(problem, error=True)
+                return False
             self._load_data()
         return True
+
+    def _why_not_an_image(self, full_key: str) -> str:
+        """Say why a key cannot be loaded as a pattern, or "" when it can."""
+        try:
+            file_part, ds_path = str(full_key).split("::", 1)
+            ds_path = ds_path.strip("/")
+            with h5py.File(file_part, "r") as h5:
+                if ds_path not in h5:
+                    return f"No such dataset: {ds_path}"
+                obj = h5[ds_path]
+                if not isinstance(obj, h5py.Dataset):
+                    return f"{ds_path} is a group — pick a dataset inside it."
+                if len(obj.shape) < 2:
+                    return f"{ds_path} is {len(obj.shape)}-D; this tool needs an image."
+        except Exception as exc:
+            return f"Could not read {full_key}: {exc}"
+        return ""
 
     # ── Frame selection for a stack ───────────────────────────────────── #
 
@@ -483,8 +520,13 @@ class QCalibrationTool(QDialog):
             return None
         fp, ds = entry
         with h5py.File(fp, "r") as h5:
-            if ds not in h5 or not isinstance(h5[ds], h5py.Dataset):
-                raise KeyError(f"Dataset not found: {ds}")
+            if ds not in h5:
+                raise KeyError(f"{slot}: no such dataset: {ds}")
+            # A group exists but is not readable as an image; saying "not found"
+            # about a path the user can see in the tree sends them looking for
+            # the wrong problem.
+            if not isinstance(h5[ds], h5py.Dataset):
+                raise KeyError(f"{slot}: {ds} is a group — pick a dataset inside it.")
             arr = np.asarray(h5[ds][()], dtype=np.float32)
         arr = self._flatten_stack(arr, slot)
         if arr.ndim != 2:

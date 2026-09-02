@@ -101,6 +101,64 @@ def test_a_two_dimensional_array_is_untouched(tool):
 
 
 # ---------------------------------------------------------------------------
+# Opening the tool on whatever the tree had selected
+# ---------------------------------------------------------------------------
+
+def test_a_group_is_not_loaded_and_does_not_raise_a_dialog(tool, scan):
+    """The key comes from the tree selection, which is often a group. The tool
+    used to try it anyway and open with "Dataset not found" about a path the
+    user can plainly see."""
+    ok = tool.load_dataset_full_key(f"{scan}::entry", auto_load=True, slot="CL")
+
+    assert ok is False
+    assert tool._data is None
+    assert "is a group" in tool._status.toolTip()
+
+
+def test_the_selection_is_still_filled_in(tool, scan):
+    """It is a useful starting point even when it cannot be loaded; only the
+    automatic load is held back."""
+    tool.load_dataset_full_key(f"{scan}::entry", auto_load=True, slot="CL")
+
+    assert tool._cl_combo.currentText() != ""
+
+
+def test_a_one_dimensional_dataset_is_refused_with_a_reason(tool, scan, tmp_path):
+    import h5py as _h5py
+
+    path = tmp_path / "curve.h5"
+    with _h5py.File(path, "w") as f:
+        f.create_dataset("curve", data=np.arange(50.0))
+
+    ok = tool.load_dataset_full_key(f"{path}::curve", auto_load=True, slot="CL")
+
+    assert ok is False
+    assert "needs an image" in tool._status.toolTip()
+
+
+def test_a_missing_path_says_so(tool, scan):
+    ok = tool.load_dataset_full_key(f"{scan}::no/such/thing", auto_load=True, slot="CL")
+
+    assert ok is False
+    assert "No such dataset" in tool._status.toolTip()
+
+
+def test_a_real_image_still_loads(tool, scan):
+    ok = tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
+
+    assert ok is True
+    assert tool._data is not None
+
+
+def test_a_group_reached_through_load_data_says_what_it_is(tool, scan):
+    """Choosing a group by hand in the combo goes down a different path."""
+    tool._cl_combo.add_full_key(f"{scan}::entry", select=True)
+
+    with pytest.raises(KeyError, match="is a group"):
+        tool._read_slot_2d("CL")
+
+
+# ---------------------------------------------------------------------------
 # The status line must not resize the window
 # ---------------------------------------------------------------------------
 
@@ -127,6 +185,30 @@ def test_loading_a_stack_does_not_widen_the_settings_panel(qapp, scan):
 
         assert "mean of 400 frames" in tool._status.toolTip(), "the message really is long"
         assert splitter.sizes()[0] == before
+    finally:
+        tool.close()
+        tool.deleteLater()
+
+
+def test_the_settings_panel_is_sized_by_the_splitter_not_its_contents(qapp, scan):
+    """Whatever grows inside — a long dataset path, a status message, the frame
+    selectors appearing — the panel keeps the width the splitter gave it."""
+    from PyQt6.QtWidgets import QApplication, QSizePolicy, QSplitter
+
+    from src.gui.q_calibration_tool import QCalibrationTool
+
+    tool = QCalibrationTool(opened_files=(scan,), dataset_full_keys_2d=[])
+    tool.resize(1320, 820)
+    tool.show()
+    QApplication.processEvents()
+    try:
+        splitter = tool.findChild(QSplitter)
+        panel = splitter.widget(0)
+
+        assert panel.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+        assert panel.width() < panel.minimumSizeHint().width(), (
+            "the panel is narrower than its contents ask for, which is the point"
+        )
     finally:
         tool.close()
         tool.deleteLater()
