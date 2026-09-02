@@ -250,7 +250,6 @@ class FTHReconstructionTool(QMainWindow):
         self._rs_scale_base:   float = 1.0   # auto-detected from FTH amplitude
         self._phase_scale:     float = 0.0  # phase rotation (rad) applied to complex FTH data
         self._cmap_name:       str   = "Jet"
-        self._last_roi_phase_fit: float = 0.0
         self._t4_autoleveled_key: tuple | None = None  # (slit, roi_idx) last auto-leveled
         self._t4_rs_base:         float = 1.0          # auto-detected FT amplitude base
         # False while the Reconstruction page's phase / FT amplitude still
@@ -1026,22 +1025,11 @@ class FTHReconstructionTool(QMainWindow):
         self._t4_gauss_sigma    = QDoubleSpinBox()
         self._t4_gauss_sigma.setRange(0.1, 20.0); self._t4_gauss_sigma.setValue(1.0)
         self._t4_gauss_sigma.setSuffix(" px")
-        self._chk_phase_fit = QCheckBox("Auto phase fit (ROI)")
-        self._t4_phase_fit_win = QSpinBox()
-        self._t4_phase_fit_win.setRange(8, 512); self._t4_phase_fit_win.setValue(70)
-        self._t4_phase_fit_win.setSuffix(" px")
-        self._t4_phase_fit_label = QLineEdit("0.0000 rad")
-        self._t4_phase_fit_label.setReadOnly(True)
         for chk in (self._chk_inv_contrast, self._chk_inv_realimag, self._chk_gauss_filter):
             chk.toggled.connect(self._update_t4_display)
             fl_corr.addRow(chk)
         self._t4_gauss_sigma.valueChanged.connect(self._update_t4_display)
         fl_corr.addRow("Gauss sigma:", self._t4_gauss_sigma)
-        self._chk_phase_fit.toggled.connect(self._on_phase_fit_toggled)
-        fl_corr.addRow(self._chk_phase_fit)
-        self._t4_phase_fit_win.valueChanged.connect(self._update_t4_display)
-        fl_corr.addRow("Fit window:", self._t4_phase_fit_win)
-        fl_corr.addRow("Estimated phase:", self._t4_phase_fit_label)
         lay.addWidget(g_corr)
 
         # Export
@@ -2660,13 +2648,6 @@ class FTHReconstructionTool(QMainWindow):
             self._t4_ph_entry.setText(f"{self._t4_phase:.4g}")
         self._update_t4_display()
 
-    def _on_phase_fit_toggled(self, checked: bool) -> None:
-        if checked and hasattr(self, "_t4_phase_fit_win"):
-            target = int(round(float(self._roi_size) * 0.9))
-            target = max(self._t4_phase_fit_win.minimum(), min(self._t4_phase_fit_win.maximum(), target))
-            self._t4_phase_fit_win.setValue(target)
-        self._update_t4_display()
-
     def _on_roi_size_changed(self, v: int) -> None:
         self._roi_size = v
         self._roi_size_entry.setText(str(v))
@@ -2975,51 +2956,7 @@ class FTHReconstructionTool(QMainWindow):
             sigma = self._t4_gauss_sigma.value()
             roi = (gaussian_filter(np.real(roi), sigma)
                    + 1j * gaussian_filter(np.imag(roi), sigma))
-        # Optional ROI phase-fit correction:
-        # estimate a single phase that minimizes imaginary energy in a center window,
-        # then rotate the whole ROI by that phase.
-        phi_fit = 0.0
-        if self._chk_phase_fit.isChecked():
-            phi_fit = self._estimate_roi_phase_rotation(roi)
-            if np.isfinite(phi_fit):
-                roi = roi * np.exp(-1j * phi_fit)
-            else:
-                phi_fit = 0.0
-        self._last_roi_phase_fit = float(phi_fit)
-        self._t4_phase_fit_label.setText(f"{self._last_roi_phase_fit:.4f} rad")
         return roi
-
-    def _estimate_roi_phase_rotation(self, roi: np.ndarray) -> float:
-        """Estimate global phase rotation (rad) from a central ROI window.
-
-        Uses a least-squares criterion that minimizes imaginary-part energy after
-        rotation z' = z * exp(-1j*phi). Closed-form solution:
-            phi = 0.5 * atan2(2*sum(Re*Im), sum(Re^2 - Im^2))
-        """
-        if roi is None or roi.size == 0:
-            return 0.0
-        h, w = roi.shape[:2]
-        win = int(self._t4_phase_fit_win.value()) if hasattr(self, "_t4_phase_fit_win") else 70
-        win = max(4, min(win, h, w))
-        half = win // 2
-        cy, cx = h // 2, w // 2
-        r0, r1 = max(0, cy - half), min(h, cy + half)
-        c0, c1 = max(0, cx - half), min(w, cx + half)
-        patch = roi[r0:r1, c0:c1]
-        if patch.size == 0:
-            return 0.0
-
-        re = np.real(patch).astype(np.float64, copy=False).ravel()
-        im = np.imag(patch).astype(np.float64, copy=False).ravel()
-        m = np.isfinite(re) & np.isfinite(im)
-        if not np.any(m):
-            return 0.0
-        re = re[m]
-        im = im[m]
-        s_rr = float(np.sum(re * re))
-        s_ii = float(np.sum(im * im))
-        s_ri = float(np.sum(re * im))
-        return 0.5 * float(np.arctan2(2.0 * s_ri, s_rr - s_ii))
 
     def _update_t4_display(self, *_) -> None:
         slit = self._active_recon_slit()

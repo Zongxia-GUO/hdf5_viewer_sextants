@@ -260,3 +260,73 @@ def test_gray_colormap_is_available_for_fth(qapp):
     assert "gray" in FTH_COLORMAPS
     cmap = _get_colormap("gray")
     assert cmap is not None
+
+
+# ---------------------------------------------------------------------------
+# The auto phase fit was removed
+# ---------------------------------------------------------------------------
+#
+# It minimised the imaginary energy of a window at the ROI centre, and it did
+# that correctly — the residual came out at 0.000000. But rotating by pi flips
+# the sign and leaves imaginary energy unchanged, so the criterion cannot tell
+# phi from phi + pi and 0.5*atan2 could only ever return a value in
+# (-pi/2, pi/2]. Measured over eight known phases, three came back with the
+# contrast inverted and nothing on screen said so. For magnetic domains, where
+# the plus and minus areas are about equal, no data-driven rule breaks that tie
+# — so it could not be fixed, only removed. The manual phase rotation control
+# does the same job with the result visible.
+
+def test_the_auto_phase_fit_is_gone(qapp):
+    tool = _prepare_tool_with_arrays(qapp)
+    try:
+        for name in ("_chk_phase_fit", "_t4_phase_fit_win", "_t4_phase_fit_label",
+                     "_last_roi_phase_fit", "_estimate_roi_phase_rotation",
+                     "_on_phase_fit_toggled"):
+            assert not hasattr(tool, name), f"{name} came back"
+    finally:
+        tool.deleteLater()
+
+
+def test_the_manual_phase_control_still_covers_a_whole_turn(qapp):
+    """It is what the auto fit was standing in for, so it has to reach every
+    phase — the removal is only defensible while this does."""
+    tool = _prepare_tool_with_arrays(qapp)
+    try:
+        lo = np.pi * tool._t4_ph_slider.minimum() / 100.0
+        hi = np.pi * tool._t4_ph_slider.maximum() / 100.0
+
+        assert hi - lo >= 2 * np.pi
+        assert lo < 0 < hi
+    finally:
+        tool.deleteLater()
+
+
+def test_the_other_page_four_corrections_survived(qapp):
+    """The fit was removed from the middle of the Corrections group."""
+    tool = _prepare_tool_with_arrays(qapp)
+    try:
+        for name in ("_chk_inv_contrast", "_chk_inv_realimag",
+                     "_chk_gauss_filter", "_t4_gauss_sigma"):
+            assert hasattr(tool, name), f"{name} was removed by accident"
+    finally:
+        tool.deleteLater()
+
+
+def test_page_four_still_builds_a_roi_and_displays_it(qapp):
+    """_compute_roi held the fit call; the rest of it has to still run."""
+    tool = _prepare_tool_with_arrays(qapp)
+    try:
+        yy, xx = np.mgrid[0:200, 0:200]
+        obj = np.sign(np.sin(xx / 5.0) * np.cos(yy / 7.0)).astype(float)
+        tool._FTH_S1 = obj * np.exp(1j * 0.9)
+        tool._Holo_S1 = np.abs(tool._FTH_S1)
+        tool._roi_centers[1][1] = (100, 100)
+
+        roi = tool._compute_roi(1, 1)
+        tool._update_t4_display()
+
+        assert roi is not None
+        assert roi.dtype.kind == "c"
+        assert np.all(np.isfinite(roi))
+    finally:
+        tool.deleteLater()
