@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import h5py
 import numpy as np
+
 import pyqtgraph as pg
 import pytest
 
+from src.gui._shared import AXIS_ANGLE_DEG, AXIS_RADIUS_PX
 from src.gui.plot_context_menu import EXPORT_TEXT, PLOT_TEXT, attach_plot_menu
 
 
@@ -249,12 +251,14 @@ def test_the_xrms_profile_follows_its_own_mode(qapp):
         tool._add_roi("ring")
         tool._update_profile_plots()
 
-        assert tool._profile_columns()[0][0] == "Radius (pixels)"
+        # The exported header is the axis label, spelled as every other tool
+        # spells it; see tests/test_axis_and_roi_style.py.
+        assert tool._profile_columns()[0][0] == AXIS_RADIUS_PX
 
         tool._selected_roi()["mode"] = "angular"
         tool._update_profile_plots()
 
-        assert tool._profile_columns()[0][0] == "Angle (deg)"
+        assert tool._profile_columns()[0][0] == AXIS_ANGLE_DEG
     finally:
         tool.deleteLater()
 

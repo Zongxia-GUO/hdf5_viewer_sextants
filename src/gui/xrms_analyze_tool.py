@@ -69,6 +69,7 @@ from src.gui.export_naming import (
     suggested_save_path,
 )
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+from src.gui._shared import AXIS_ANGLE_DEG, AXIS_RADIUS_PX, set_axis_label
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.file_validator import is_hdf5_file
 from src.lib_h5.table_format import (
@@ -672,7 +673,7 @@ class XRMSAnalyzeTool(QDialog):
         self._img.graphics_layout.scene().sigMouseMoved.connect(self._on_brush_move)
         right_v.addWidget(self._img)
 
-        self._plot_profile = self._make_plot("Radius (pixels)", "Intensity", "Profile")
+        self._plot_profile = self._make_plot(AXIS_RADIUS_PX, "Intensity", "Profile")
         # The only way this curve leaves the tool: it has no buttons of its own,
         # and pyqtgraph's own Export bypasses the naming and dialect rules every
         # other export in the application follows.
@@ -711,8 +712,8 @@ class XRMSAnalyzeTool(QDialog):
         for axis in ("left", "bottom"):
             p.getAxis(axis).setPen(pg.mkPen("w"))
             p.getAxis(axis).setTextPen(pg.mkPen("w"))
-        p.setLabel("bottom", x_label)
-        p.setLabel("left", y_label)
+        set_axis_label(p, "bottom", x_label)
+        set_axis_label(p, "left", y_label)
         p.setTitle(title, color="w")
         p.setMinimumHeight(150)
         return p
@@ -822,10 +823,10 @@ class XRMSAnalyzeTool(QDialog):
 
         # Right: one plot normally; a second appears below for the subtracted signal.
         self._fit_split = QSplitter(Qt.Orientation.Vertical)
-        self._fit_top = self._make_plot("Radius (pixels)", "Intensity", "")
+        self._fit_top = self._make_plot(AXIS_RADIUS_PX, "Intensity", "")
         self._fit_top.setMinimumHeight(200)
         self._fit_split.addWidget(self._fit_top)
-        self._fit_bottom = self._make_plot("Radius (pixels)", "Background-subtracted", "")
+        self._fit_bottom = self._make_plot(AXIS_RADIUS_PX, "Background-subtracted", "")
         self._fit_bottom.setMinimumHeight(180)
         self._fit_split.addWidget(self._fit_bottom)
         self._fit_bottom.setVisible(False)
@@ -879,9 +880,9 @@ class XRMSAnalyzeTool(QDialog):
         self._b3_img_item = pg.ImageItem()
         self._b3_img_plot.addItem(self._b3_img_item)
         self._b3_cols.addWidget(self._b3_img_plot)
-        self._b3_profile_plot = self._make_plot("Radius (pixels)", "Intensity", "Profile")
+        self._b3_profile_plot = self._make_plot(AXIS_RADIUS_PX, "Intensity", "Profile")
         self._b3_cols.addWidget(self._b3_profile_plot)
-        self._b3_sub_plot = self._make_plot("Radius (pixels)", "Intensity", "Background-subtracted + peak")
+        self._b3_sub_plot = self._make_plot(AXIS_RADIUS_PX, "Intensity", "Background-subtracted + peak")
         self._b3_cols.addWidget(self._b3_sub_plot)
         self._b3_cols.setSizes([400, 400, 400])
         v.addWidget(self._b3_cols, stretch=3)
@@ -1070,9 +1071,9 @@ class XRMSAnalyzeTool(QDialog):
         is_az = self._b3_profile_mode() == "angular"
         self._b3_sub_plot.setVisible(not is_az)
         self._g_b3_bg.setVisible(not is_az)
-        x_label = "Angle (°)" if is_az else "Radius (pixels)"
-        self._b3_profile_plot.setLabel("bottom", x_label)
-        self._b3_sub_plot.setLabel("bottom", x_label)
+        x_label = AXIS_ANGLE_DEG if is_az else AXIS_RADIUS_PX
+        set_axis_label(self._b3_profile_plot, "bottom", x_label)
+        set_axis_label(self._b3_sub_plot, "bottom", x_label)
         self._b3_rebuild_models()
         # Inherit correction/beamstop/ROI are already shared via self._data /
         # _analysis_frame / _selected_roi; here we also adopt page 2's fit settings.
@@ -1351,7 +1352,7 @@ class XRMSAnalyzeTool(QDialog):
                        for row in self._b3_results], dtype=np.float64)
         p.plot(frames, ys, pen=pg.mkPen("c", width=1.5), symbol="o", symbolSize=5,
                symbolBrush=pg.mkBrush((100, 200, 255)), connect="finite")
-        p.setLabel("left", self._b4_label(key))
+        set_axis_label(p, "left", self._b4_label(key))
         p.setTitle(self._b4_label(key), color="w")
 
     def _b4_default_export_name(self) -> str:
@@ -2544,11 +2545,11 @@ class XRMSAnalyzeTool(QDialog):
             valid = np.isfinite(self._angular_y)
             self._plot_profile.plot(self._angular_x[valid], self._angular_y[valid],
                                     pen=pg.mkPen((255, 160, 0), width=1.5))
-            self._plot_profile.setLabel("bottom", "Angle (°)")
+            set_axis_label(self._plot_profile, "bottom", "θ (deg)")
             self._plot_profile.setTitle(f"I(θ)  |  {roi['name']}", color="w")
         elif self._radial_x is not None:
             self._plot_profile.plot(self._radial_x, self._radial_y, pen=pg.mkPen("c", width=1.5))
-            self._plot_profile.setLabel("bottom", "Radius (pixels)")
+            set_axis_label(self._plot_profile, "bottom", "r (px)")
             self._plot_profile.setTitle(f"I(r)  |  {roi['name']}", color="w")
         else:
             self._plot_profile.setTitle(f"{roi['name']} — empty region", color="w")
@@ -2567,10 +2568,10 @@ class XRMSAnalyzeTool(QDialog):
             return None
         name = str(roi.get("name", "profile"))
         if roi.get("mode") == "angular" and self._angular_x is not None:
-            return (["Angle (deg)", f"{name} (intensity)"],
+            return ([AXIS_ANGLE_DEG, f"{name} (intensity)"],
                     [self._angular_x, self._angular_y])
         if self._radial_x is not None:
-            return (["Radius (pixels)", f"{name} (intensity)"],
+            return ([AXIS_RADIUS_PX, f"{name} (intensity)"],
                     [self._radial_x, self._radial_y])
         return None
 
@@ -2684,9 +2685,9 @@ class XRMSAnalyzeTool(QDialog):
 
     def _on_fit_profile_changed(self, _idx: int = 0) -> None:
         mode = self._fit_profile_mode()
-        x_label = {"angular": "Angle (°)", "time": "Frame"}.get(mode, "Radius (pixels)")
-        self._fit_top.setLabel("bottom", x_label)
-        self._fit_bottom.setLabel("bottom", x_label)
+        x_label = {"angular": AXIS_ANGLE_DEG, "time": "Frame"}.get(mode, AXIS_RADIUS_PX)
+        set_axis_label(self._fit_top, "bottom", x_label)
+        set_axis_label(self._fit_bottom, "bottom", x_label)
         # Angular has no slope-background subtraction.
         is_angular = mode == "angular"
         self._g_bg.setVisible(not is_angular)

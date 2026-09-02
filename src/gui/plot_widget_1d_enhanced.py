@@ -41,9 +41,11 @@ from PyQt6.QtWidgets import (
 )
 
 from src.gui._shared import (
+    AXIS_Q,
     TOOLBAR_ITEM_GAP,
     labelled,
     quick_icon_button,
+    set_axis_label,
     toolbar_group_gap,
 )
 from src.gui.plot_context_menu import attach_plot_menu
@@ -432,13 +434,13 @@ class PlotWidget1DEnhanced(QWidget):
             x = self.x_data
             # Set X-axis label based on q conversion state
             if self.btn_convert_to_q.isChecked():
-                self.plot_widget.setLabel("bottom", "q (1/A)")
+                set_axis_label(self.plot_widget, "bottom", AXIS_Q)
             else:
                 short_x = self._short_key_label(self.x_dataset_path)
-                self.plot_widget.setLabel("bottom", short_x or "Custom X")
+                set_axis_label(self.plot_widget, "bottom", short_x or "Custom X")
         else:
             x = np.arange(len(self.y_data))
-            self.plot_widget.setLabel("bottom", "Index")
+            set_axis_label(self.plot_widget, "bottom", "Index")
 
         # Plot - handle both 1D and 2D (multi-column) data
         line_width = self.spinbox_linewidth.value()

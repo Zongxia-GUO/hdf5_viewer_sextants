@@ -88,6 +88,68 @@ def quick_icon_button(icon_name: str, tooltip: str) -> QPushButton:
 
 
 # ---------------------------------------------------------------------------
+# Axis labels
+# ---------------------------------------------------------------------------
+
+# The two axes a radial/azimuthal profile can be plotted against, spelled once.
+# The scattering tool said "Radius (pixels)" and "Angle (°)" where the Q tool
+# said "r (px)" and "θ (deg)", so the same profile was named two ways depending
+# on which window it was opened from.
+AXIS_RADIUS_PX = "r (px)"
+AXIS_ANGLE_DEG = "θ (deg)"
+
+# The scattering vector, spelled one way. The comparison window wrote "q (A^-1)"
+# and the 1-D viewer "q (1/A)" for the same conversion.
+AXIS_Q = "q (1/A)"
+
+
+def set_axis_label(plot_widget: object, axis: str, text: str, unit: str = "") -> None:
+    """Label one axis, with its unit written out and the tick values left alone.
+
+    pyqtgraph offers two ways to say the same thing and they read differently.
+    Passing ``units="1/A"`` lets it prepend an SI prefix, so a q axis comes out
+    as ``qx (m1/A)``; putting the unit in the text instead leaves the prefix
+    machinery on with nothing to attach to, and it appends ``(x0.001)``. The
+    2-D image, the line profile and the ring profile each picked one, so the
+    same quantity was written three ways in one window.
+
+    Here the unit goes in the text and the automatic prefix is switched off, so
+    the label says ``qx (1/A)`` and the ticks read ``0.0005``, ``0.0010`` —
+    the numbers as they are, which is what the axis is being read for.
+    """
+    item = getattr(plot_widget, "plotItem", plot_widget)
+    try:
+        axis_item = item.getAxis(axis)
+        axis_item.enableAutoSIPrefix(False)
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.debug("Could not configure the %s axis: %s", axis, exc)
+        return
+    label = f"{text} ({unit})" if unit else text
+    item.setLabel(axis, label)
+
+
+# ---------------------------------------------------------------------------
+# ROI overlay colours
+# ---------------------------------------------------------------------------
+
+# One palette for every region drawn over an image, whichever tool drew it.
+# The scattering tool already used these; the line and rectangle in the 2-D
+# viewer were red, so two tools marked up the same picture in two colours.
+ROI_SELECTED_RGB = (0, 255, 255)
+ROI_IDLE_RGB = (90, 160, 200)
+
+
+def roi_pen(selected: bool = True, width: float | None = None):
+    """The pen for a region drawn over an image."""
+    import pyqtgraph as pg_local
+
+    return pg_local.mkPen(
+        ROI_SELECTED_RGB if selected else ROI_IDLE_RGB,
+        width=width if width is not None else (2.0 if selected else 1.5),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Colormap helpers
 # ---------------------------------------------------------------------------
 

@@ -39,6 +39,7 @@ from src.gui.export_naming import (
     suggested_save_path,
 )
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
+from src.gui._shared import roi_pen, set_axis_label
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
 from src.lib_h5.table_format import (
@@ -300,8 +301,8 @@ class QCalibrationTool(QDialog):
         for axis in ("left", "bottom"):
             self._profile_plot.getAxis(axis).setPen(pg.mkPen("w"))
             self._profile_plot.getAxis(axis).setTextPen(pg.mkPen("w"))
-        self._profile_plot.setLabel("bottom", "r (px)")
-        self._profile_plot.setLabel("left", "Mean intensity")
+        set_axis_label(self._profile_plot, "bottom", "r (px)")
+        set_axis_label(self._profile_plot, "left", "Mean intensity")
         self._profile_curve = self._profile_plot.plot([], [], pen=pg.mkPen((0, 200, 255), width=2))
         # The only way to get this curve out of the tool; it has no buttons of
         # its own, and pyqtgraph's own Export bypasses the naming and dialect
@@ -958,7 +959,7 @@ class QCalibrationTool(QDialog):
     def _create_circle_item(self, roi: dict) -> None:
         cx, cy, rx, ry = roi["cx"], roi["cy"], roi["rx"], roi["ry"]
         item = pg.EllipseROI([cx - rx, cy - ry], [2 * rx, 2 * ry],
-                             pen=pg.mkPen((90, 160, 200), width=1.5), movable=True)
+                             pen=roi_pen(selected=False), movable=True)
         item.setZValue(16)
         item.sigRegionChanged.connect(lambda _it, ro=roi: self._on_circle_roi_changed(ro))
         self._img.view_box.addItem(item)
@@ -1044,14 +1045,12 @@ class QCalibrationTool(QDialog):
                 self._sync_circle_item(roi)
                 item = roi.get("item")
                 if item is not None:
-                    item.setPen(pg.mkPen((0, 255, 255) if selected else (90, 160, 200),
-                                         width=2.0 if selected else 1.5))
+                    item.setPen(roi_pen(selected))
             else:
                 self._draw_one_roi(roi, cx, cy, selected)
 
     def _draw_one_roi(self, roi: dict, cx: float, cy: float, selected: bool) -> None:
-        pen = pg.mkPen((0, 255, 255) if selected else (90, 160, 200),
-                       width=2.0 if selected else 1.2)
+        pen = roi_pen(selected, width=2.0 if selected else 1.2)
         ri, ro = float(roi["r_inner"]), float(roi["r_outer"])
         if roi["type"] == "ring":
             for r in (ri, ro):
@@ -1234,7 +1233,7 @@ class QCalibrationTool(QDialog):
             x, xlabel = self._radial_axis(roi, np.asarray(rx, dtype=np.float64))
             y = ry
         finite = np.isfinite(np.asarray(y)) & np.isfinite(np.asarray(x))
-        self._profile_plot.setLabel("bottom", xlabel)
+        set_axis_label(self._profile_plot, "bottom", xlabel)
         self._profile_curve.setData(np.asarray(x)[finite], np.asarray(y)[finite])
 
     def _radial_axis(self, roi: dict, radii_px: np.ndarray) -> tuple[np.ndarray, str]:

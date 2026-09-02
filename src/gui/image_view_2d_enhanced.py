@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.gui._shared import quick_icon_button
+from src.gui._shared import quick_icon_button, roi_pen, set_axis_label
 from src.gui.plot_context_menu import attach_plot_menu
 from src.gui.export_naming import (
     export_stem,
@@ -1214,10 +1214,11 @@ class ImageView2DEnhanced(QWidget):
             axis.setPen(axis_pen)
             axis.setTextPen(axis_pen)
             axis.setStyle(showValues=True)
-        self.plot_widget.setLabel("bottom", x_label)
-        self.plot_widget.setLabel("left", y_label)
-        self.plot_widget.setLabel("top", x_label)
-        self.plot_widget.setLabel("right", y_label)
+        # The unit is already inside x_label / y_label ("qx (1/A)"); this keeps
+        # pyqtgraph from appending its own "(x0.001)" on top of it.
+        for name, text in (("bottom", x_label), ("top", x_label),
+                           ("left", y_label), ("right", y_label)):
+            set_axis_label(self.plot_widget, name, text)
         self._apply_show_axes_state()
         self.view_box.setDefaultPadding(0.0)
         self.view_box.autoRange(padding=0.0)
@@ -1563,10 +1564,11 @@ class ImageView2DEnhanced(QWidget):
                 axis.setTextPen(axis_pen)
                 axis.setStyle(showValues=True)
 
-            self.plot_widget.setLabel('left', self._axis_label_y)
-            self.plot_widget.setLabel('bottom', self._axis_label_x)
-            self.plot_widget.setLabel('right', self._axis_label_y)
-            self.plot_widget.setLabel('top', self._axis_label_x)
+            for name, text in (('left', self._axis_label_y),
+                               ('bottom', self._axis_label_x),
+                               ('right', self._axis_label_y),
+                               ('top', self._axis_label_x)):
+                set_axis_label(self.plot_widget, name, text)
             self._apply_show_axes_state()
 
             # Tightly fit axes to image - disable auto-padding
@@ -1737,7 +1739,7 @@ class ImageView2DEnhanced(QWidget):
                 self.current_roi = pg.RectROI(
                     [center_x - roi_size // 2, center_y - roi_size // 2],
                     [roi_size, roi_size],
-                    pen=pg.mkPen('r', width=2)
+                    pen=roi_pen(selected=True)
                 )
                 # Add rotation handle (at top-right corner)
                 self.current_roi.addRotateHandle([1, 0], [0.5, 0.5])
@@ -1749,7 +1751,7 @@ class ImageView2DEnhanced(QWidget):
                 self.current_roi = pg.LineSegmentROI(
                     [[center_x - line_length // 2, center_y],
                      [center_x + line_length // 2, center_y]],
-                    pen=pg.mkPen('r', width=2)
+                    pen=roi_pen(selected=True)
                 )
                 self.roi_type = "Line"
 
@@ -1826,8 +1828,8 @@ class ImageView2DEnhanced(QWidget):
                         )
 
                         # Set labels
-                        self.roi_plot_widget.setLabel('left', 'Pixel Intensity', units='')
-                        self.roi_plot_widget.setLabel('bottom', 'Distance', units=self._roi_distance_unit())
+                        set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')
+                        set_axis_label(self.roi_plot_widget, 'bottom', 'Distance', self._roi_distance_unit())
 
                         # Set title with statistics
                         title = (
@@ -1942,8 +1944,8 @@ class ImageView2DEnhanced(QWidget):
                 self.roi_plot_widget.plot(x_values, profile, pen=pen, symbol='o', symbolSize=4, symbolBrush='c')
 
                 # Set labels
-                self.roi_plot_widget.setLabel('left', 'Pixel Intensity', units='')
-                self.roi_plot_widget.setLabel('bottom', x_label_text, units=x_label_unit)
+                set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')
+                set_axis_label(self.roi_plot_widget, 'bottom', x_label_text, x_label_unit)
 
                 # Calculate line length with same ruler-consistent basis.
                 if pts_view is not None:
@@ -2004,8 +2006,8 @@ class ImageView2DEnhanced(QWidget):
                 self.roi_plot_widget.plot(x_values, profile, pen=pen, symbol='o', symbolSize=4, symbolBrush='c')
 
                 # Set labels
-                self.roi_plot_widget.setLabel('left', 'Pixel Intensity', units='')
-                self.roi_plot_widget.setLabel('bottom', 'Distance', units=self._roi_distance_unit())
+                set_axis_label(self.roi_plot_widget, 'left', 'Pixel Intensity')
+                set_axis_label(self.roi_plot_widget, 'bottom', 'Distance', self._roi_distance_unit())
 
                 # Set title with statistics
                 title = (
@@ -2802,8 +2804,8 @@ class ImageView2DEnhanced(QWidget):
         outline_x = np.concatenate([outer_x, inner_x, [outer_x[0]]])
         outline_y = np.concatenate([outer_y, inner_y, [outer_y[0]]])
 
-        # Create plot item for sector outline (red thin solid line, 1.5 pixels)
-        pen = pg.mkPen('r', width=1.5)
+        # One palette for every region drawn over an image; see _shared.roi_pen.
+        pen = roi_pen(selected=False)
         self.sector_plot_item = pg.PlotDataItem(
             outline_x, outline_y,
             pen=pen

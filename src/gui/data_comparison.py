@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.gui._shared import quick_icon_button
+from src.gui._shared import AXIS_Q, quick_icon_button, set_axis_label
 from src.gui.export_naming import (
     pair_label,
     remember_save_directory,
@@ -1325,13 +1325,14 @@ class DataComparisonTool(QDialog):
 
         # Set X-axis label: q if conversion on, else first row with x_path, else Index
         if self.chk_convert_to_q.isChecked():
-            self.plot_widget.setLabel("bottom", "q (A^-1)")
+            set_axis_label(self.plot_widget, "bottom", AXIS_Q)
         else:
             first_x_path = next((e.x_path for e in self.datasets if e.x_path is not None), None)
             if first_x_path:
-                self.plot_widget.setLabel("bottom", self._short_key_label(first_x_path) or "Custom X")
+                set_axis_label(self.plot_widget, "bottom",
+                               self._short_key_label(first_x_path) or "Custom X")
             else:
-                self.plot_widget.setLabel("bottom", "Index")
+                set_axis_label(self.plot_widget, "bottom", "Index")
 
         import pyqtgraph as pg
         # The legend names the curves exactly as the export headers do.
