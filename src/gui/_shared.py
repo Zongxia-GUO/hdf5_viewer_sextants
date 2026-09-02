@@ -102,6 +102,11 @@ AXIS_ANGLE_DEG = "θ (deg)"
 # and the 1-D viewer "q (1/A)" for the same conversion.
 AXIS_Q = "q (1/A)"
 
+# A spot profile is measured from the spot, not from the beam, so its axis is a
+# distance in reciprocal space rather than an absolute |q|. Named differently
+# because it IS a different quantity: 0 means "at the spot centre".
+AXIS_DELTA_Q = "Δq (1/A)"
+
 
 def set_axis_label(plot_widget: object, axis: str, text: str, unit: str = "") -> None:
     """Label one axis, with its unit written out and the tick values left alone.

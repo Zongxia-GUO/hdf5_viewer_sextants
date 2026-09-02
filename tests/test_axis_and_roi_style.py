@@ -120,8 +120,11 @@ def test_the_radial_and_azimuthal_axes_are_spelled_once():
     assert "Radius (pixels)" not in xrms
     assert "Angle (°)" not in xrms
     assert "Angle (deg)" not in xrms
-    assert AXIS_RADIUS_PX in _read("q_calibration_tool.py")
-    assert AXIS_ANGLE_DEG in _read("q_calibration_tool.py")
+    # The Q tool went one better and stopped spelling them at all: it names the
+    # shared constants, so there is one definition rather than one agreement.
+    q_tool = _read("q_calibration_tool.py")
+    assert "AXIS_RADIUS_PX" in q_tool and AXIS_RADIUS_PX not in q_tool
+    assert "AXIS_ANGLE_DEG" in q_tool and AXIS_ANGLE_DEG not in q_tool
 
 
 def test_q_is_spelled_once():

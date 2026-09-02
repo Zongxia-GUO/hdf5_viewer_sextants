@@ -39,7 +39,15 @@ from src.gui.export_naming import (
     suggested_save_path,
 )
 from src.gui.image_view_2d_enhanced import ImageView2DEnhanced
-from src.gui._shared import profile_pen, roi_pen, set_axis_label
+from src.gui._shared import (
+    AXIS_ANGLE_DEG,
+    AXIS_DELTA_Q,
+    AXIS_Q,
+    AXIS_RADIUS_PX,
+    profile_pen,
+    roi_pen,
+    set_axis_label,
+)
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
 from src.lib_h5.table_format import (
@@ -301,7 +309,7 @@ class QCalibrationTool(QDialog):
         for axis in ("left", "bottom"):
             self._profile_plot.getAxis(axis).setPen(pg.mkPen("w"))
             self._profile_plot.getAxis(axis).setTextPen(pg.mkPen("w"))
-        set_axis_label(self._profile_plot, "bottom", "r (px)")
+        set_axis_label(self._profile_plot, "bottom", AXIS_RADIUS_PX)
         set_axis_label(self._profile_plot, "left", "Mean intensity")
         self._profile_curve = self._profile_plot.plot([], [], pen=profile_pen())
         # The only way to get this curve out of the tool; it has no buttons of
@@ -1234,7 +1242,14 @@ class QCalibrationTool(QDialog):
         if roi["type"] == "circle":
             cx, cy = roi["cx"], roi["cy"]
             rx_a, ry_a = self._circle_semi_axes(roi)
-            ro = int(np.ceil(max(rx_a, ry_a)))
+            # The SHORT semi-axis, not the long one. The profile is an azimuthal
+            # average, so a bin is only comparable to its neighbours if the same
+            # directions went into it. Running out to the long axis meant every
+            # radius past the short one averaged over fewer and fewer directions
+            # — a tail that gets noisier and biased the more the ellipse is
+            # stretched, with nothing on screen to say so. Inside this radius the
+            # disc lies wholly within the ellipse, so every bin is complete.
+            ro = max(1, int(np.floor(min(rx_a, ry_a))))
             frame = np.where(self._circle_mask(roi, h, w), frame, np.nan)
             r, angles = self._polar(h, w, cx, cy)
             rx, ry = pr.radial_profile(frame, cx, cy, 0, ro, 0, 180, symmetric=True, r=r, angles=angles)
@@ -1268,7 +1283,7 @@ class QCalibrationTool(QDialog):
             ay = self._apply_phase_shift(np.asarray(ay), int(roi.get("phase", 0)))
             # An azimuthal profile is already an angle; there is nothing for a
             # q calibration to convert it to.
-            x, y, xlabel = ax, ay, "θ (deg)"
+            x, y, xlabel = ax, ay, AXIS_ANGLE_DEG
         else:
             x, xlabel = self._radial_axis(roi, np.asarray(rx, dtype=np.float64))
             y = ry
@@ -1290,13 +1305,12 @@ class QCalibrationTool(QDialog):
         """
         params = getattr(self._img, "_q_calibration", None)
         if not getattr(self._img, "_axis_linear_map_active", False) or not params:
-            return radii_px, "r (px)"
+            return radii_px, AXIS_RADIUS_PX
 
         cx, cy = self._center_pixel()
         if roi.get("type") == "circle":
-            angle = 0.0
-        else:
-            angle = np.deg2rad((float(roi.get("a_min", 0)) + float(roi.get("a_max", 0))) / 2.0)
+            return self._circle_radial_axis(roi, radii_px, cx, cy, params)
+        angle = np.deg2rad((float(roi.get("a_min", 0)) + float(roi.get("a_max", 0))) / 2.0)
         dx, dy = float(np.cos(angle)), float(np.sin(angle))
 
         q_values = []
@@ -1309,8 +1323,63 @@ class QCalibrationTool(QDialog):
         q_axis = np.asarray(q_values, dtype=np.float64)
         if not np.any(np.isfinite(q_axis)):
             # An incomplete calibration is not a reason to show nothing.
-            return radii_px, "r (px)"
-        return q_axis, "q (1/A)"
+            return radii_px, AXIS_RADIUS_PX
+        return q_axis, AXIS_Q
+
+    def _circle_radial_axis(
+        self,
+        roi: dict,
+        radii_px: np.ndarray,
+        beam_col: float,
+        beam_row: float,
+        params: dict,
+    ) -> tuple[np.ndarray, str]:
+        """A spot profile's x axis: distance in q from the spot's own centre.
+
+        A circle ROI is a spot tool — its profile is measured outward from the
+        ellipse the user dragged over a spot, not from the beam. Converting that
+        radius the way a ring's is converted answered a different question
+        entirely: it returned |q| along a ray out of the *beam* centre, so the
+        axis started at zero wherever the spot happened to sit. Measured on a
+        spot at |q| = 0.00102 spanning 0.00080..0.00129, the curve was drawn
+        against an axis running 0..0.00032.
+
+        So the origin moves to the spot and the axis becomes a separation,
+        |q(P) - q(spot)|, taken as a vector difference in the (qx, qy) plane the
+        image axes use. Direction is beam-centre-to-spot: the one |q| varies
+        fastest along, and the same single-direction approximation a ring
+        already makes with its mid-angle. Absolute |q| is not an option here —
+        the profile folds both sides of the spot onto r >= 0, so it would be
+        double-valued.
+        """
+        spot_col, spot_row = float(roi["cx"]), float(roi["cy"])
+        dx, dy = spot_col - beam_col, spot_row - beam_row
+        span = float(np.hypot(dx, dy))
+        if span > 0:
+            dx, dy = dx / span, dy / span
+        else:
+            # The spot is on the beam centre; every direction is equivalent.
+            dx, dy = 1.0, 0.0
+
+        origin = self._img._q_components_at_pixel_float(spot_col, spot_row, params)
+        if origin is None:
+            return radii_px, AXIS_RADIUS_PX
+
+        separations = []
+        for radius in radii_px:
+            comp = self._img._q_components_at_pixel_float(
+                spot_col + radius * dx, spot_row + radius * dy, params
+            )
+            separations.append(
+                float(np.hypot(comp[0] - origin[0], comp[1] - origin[1]))
+                if comp else np.nan
+            )
+
+        axis = np.asarray(separations, dtype=np.float64)
+        if not np.any(np.isfinite(axis)):
+            # An incomplete calibration is not a reason to show nothing.
+            return radii_px, AXIS_RADIUS_PX
+        return axis, AXIS_DELTA_Q
 
     # ── Getting the profile out ───────────────────────────────────────── #
 
