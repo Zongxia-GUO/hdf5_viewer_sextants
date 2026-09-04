@@ -1,11 +1,14 @@
 """The pattern tool says what it did to a stack of frames.
 
-Averaging a stack is a reasonable default for a scattering pattern — more
-frames, better statistics — but it is a large thing to do to someone's data,
-and it happened in silence: a 400-frame stack went in, the status line read
-"Loaded (200x46)", and nothing said that the pattern on screen was the mean of
-all 400. The two ways into the tool also disagreed, one averaging and the other
-taking frame zero, so the same stack gave two different patterns.
+Reducing a stack used to happen in silence: a 400-frame stack went in, the
+status line read "Loaded (200x46)", and nothing said what the pattern on screen
+was made of. The two ways into the tool also disagreed, one averaging and the
+other taking frame zero, so the same stack gave two different patterns.
+
+Both are now the same one control, and the default is a single frame rather
+than the mean — computing something out of 400 frames is a large thing to do
+to someone's data, and it should be asked for. The tests that exercise the mean
+therefore select it, the way a user would.
 """
 
 from __future__ import annotations
@@ -42,7 +45,24 @@ def tool(qapp, scan):
 # Reducing a stack
 # ---------------------------------------------------------------------------
 
+def _choose(tool, text):
+    """Pick a combination method by its name in the frame box."""
+    index = tool._frames.combo_method.findText(text)
+    assert index >= 0, text
+    tool._frames.combo_method.setCurrentIndex(index)
+
+
+def test_a_stack_loaded_from_a_file_uses_the_first_frame_by_default(tool, scan):
+    """The default computes nothing: frame 0, exactly as recorded."""
+    tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
+
+    assert tool._data.shape == (20, 12)
+    assert float(tool._data[0, 0]) == pytest.approx(0.0)
+    assert "frame 0 of 400" in tool._status.toolTip()
+
+
 def test_a_stack_loaded_from_a_file_is_averaged(tool, scan):
+    _choose(tool, "Mean")
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
     assert tool._data.shape == (20, 12)
@@ -51,6 +71,7 @@ def test_a_stack_loaded_from_a_file_is_averaged(tool, scan):
 
 def test_the_status_line_says_the_frames_were_averaged(tool, scan):
     """Otherwise the only clue is a shape that no longer matches the dataset."""
+    _choose(tool, "Mean")
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
     assert "mean of 400 frames" in tool._status.toolTip()
@@ -59,6 +80,7 @@ def test_the_status_line_says_the_frames_were_averaged(tool, scan):
 def test_an_array_handed_over_is_reduced_the_same_way(tool):
     """It used to take frame zero here and the mean from a file, so the same
     stack gave two different patterns depending on how it arrived."""
+    _choose(tool, "Mean")
     tool.load_array_data(STACK, source_label="from viewer")
 
     assert float(tool._data[0, 0]) == pytest.approx(199.5)
@@ -77,6 +99,8 @@ def test_frames_are_counted_along_the_first_axis(tool):
     stored as (H, W, N) — a layout the 2-D viewer supports — into nonsense."""
     stack = np.zeros((4, 6, 10), dtype=np.float32)
     stack[2] = 1.0
+    tool._frames.set_shape(stack.shape)
+    _choose(tool, "Mean")
 
     reduced = tool._flatten_stack(stack, "CL")
 
@@ -86,6 +110,7 @@ def test_frames_are_counted_along_the_first_axis(tool):
 
 def test_the_note_is_cleared_between_loads(tool, scan):
     """A note left over from a stack would claim a plain image was averaged."""
+    _choose(tool, "Mean")
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
     assert "mean of" in tool._status.toolTip()
 
@@ -180,6 +205,8 @@ def test_loading_a_stack_does_not_widen_the_settings_panel(qapp, scan):
 
         tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
         tool._cr_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
+        index = tool._frames.combo_method.findText("Mean")
+        tool._frames.combo_method.setCurrentIndex(index)
         tool._load_data()
         QApplication.processEvents()
 
@@ -247,65 +274,156 @@ def test_a_short_message_is_left_alone(qapp, scan):
 # Choosing the frame instead of taking whatever it gives you
 # ---------------------------------------------------------------------------
 
+def _settle(tool, timeout_ms=2000):
+    """Wait for the selector's coalescing timer to fire.
+
+    Editing the frame or k schedules a reload rather than doing one per click,
+    because a clipped mean of a big stack takes about a second and the spin box
+    arrows fire once per press.
+    """
+    from PyQt6.QtCore import QDeadlineTimer
+    from PyQt6.QtWidgets import QApplication
+
+    deadline = QDeadlineTimer(timeout_ms)
+    while tool._frames._settle.isActive() and not deadline.hasExpired():
+        QApplication.processEvents()
+    QApplication.processEvents()
+
+
 def test_a_plain_image_offers_no_frame_controls(tool, scan):
     tool.load_dataset_full_key(f"{scan}::entry/signal/flat", auto_load=True, slot="CL")
 
-    assert tool._combo_frame.isVisibleTo(tool) is False
+    assert tool._frames.isVisibleTo(tool) is False
 
 
 def test_a_stack_brings_up_the_frame_controls(tool, scan):
     """Before loading: the choice has to be there while choosing what to load."""
     tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
 
-    assert tool._combo_frame.isVisibleTo(tool) is True
+    assert tool._frames.isVisibleTo(tool) is True
     # Each axis carries its length: the number is what the code slices by, and
     # the length is what tells the axes apart. Same naming as the batch export
     # and the 2-D viewer, which is why this moved to a shared widget.
-    assert [tool._combo_frame_axis.itemText(i)
-            for i in range(tool._combo_frame_axis.count())] == ["0 (400)", "1 (20)", "2 (12)"]
-    assert tool._combo_frame.itemText(0) == "Mean"
-    assert tool._combo_frame.count() == 1 + 400
+    assert [tool._frames.combo_axis.itemText(i)
+            for i in range(tool._frames.combo_axis.count())] == ["0 (400)", "1 (20)", "2 (12)"]
 
 
-def test_the_mean_is_the_default(tool, scan):
-    """More frames, better statistics — and it is what the tool always did."""
+def test_the_methods_offered_are_the_same_everywhere(tool, scan):
+    """A list of every frame would be 401 entries on this scan, which is no way
+    to reach frame 287. The box names a method; the box beside it takes the
+    frame number, or k, or nothing."""
+    tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
+
+    offered = [tool._frames.combo_method.itemText(i)
+               for i in range(tool._frames.combo_method.count())]
+
+    assert offered == ["Single frame", "Mean", "Sum", "Median", "Clipped mean"]
+
+
+def test_the_first_frame_is_the_default(tool, scan):
+    """Computing something out of 400 frames should be asked for, not assumed."""
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
-    assert float(tool._data[0, 0]) == pytest.approx(199.5)
+    assert float(tool._data[0, 0]) == pytest.approx(0.0)
+    assert "frame 0 of 400" in tool._status.toolTip()
 
 
 def test_one_frame_can_be_picked(tool, scan):
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
-    tool._combo_frame.setCurrentIndex(1 + 3)
+    tool._frames.spin_frame.setValue(3)
+    _settle(tool)
 
     assert float(tool._data[0, 0]) == pytest.approx(3.0)
     assert "frame 3 of 400" in tool._status.toolTip()
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("Mean", 199.5),
+    ("Sum", 199.5 * 400),
+    ("Median", 199.5),
+    ("Clipped mean", 199.5),
+])
+def test_each_combination_method_reaches_the_data(tool, scan, method, expected):
+    """Every frame here is constant and equal to its index, so each method has
+    a value that only it (or an equal one) can produce."""
+    tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
+
+    _choose(tool, method)
+    _settle(tool)
+
+    assert float(tool._data[0, 0]) == pytest.approx(expected, rel=1e-6)
+    assert method.lower() in tool._status.toolTip()
+
+
+def test_the_rejection_threshold_only_shows_for_the_clipped_mean(tool, scan):
+    tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
+
+    _choose(tool, "Single frame")
+    assert tool._frames.spin_frame.isVisibleTo(tool) is True
+    assert tool._frames.spin_kappa.isVisibleTo(tool) is False
+
+    _choose(tool, "Clipped mean")
+    assert tool._frames.spin_frame.isVisibleTo(tool) is False
+    assert tool._frames.spin_kappa.isVisibleTo(tool) is True
+
+    _choose(tool, "Mean")
+    assert tool._frames.spin_frame.isVisibleTo(tool) is False
+    assert tool._frames.spin_kappa.isVisibleTo(tool) is False
+
+
+def test_the_threshold_is_reported_with_the_clipped_mean(tool, scan):
+    """k changes the answer, so a note that leaves it out is incomplete."""
+    tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
+
+    _choose(tool, "Clipped mean")
+    tool._frames.spin_kappa.setValue(3.0)
+    _settle(tool)
+
+    assert "k=3" in tool._status.toolTip()
 
 
 def test_changing_the_frame_reloads_without_pressing_load(tool, scan):
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
     before = float(tool._data[0, 0])
 
-    tool._combo_frame.setCurrentIndex(1 + 7)
+    tool._frames.spin_frame.setValue(7)
+    _settle(tool)
 
     assert float(tool._data[0, 0]) != before
+
+
+def test_a_burst_of_edits_reloads_once(tool, scan):
+    """The arrows fire once per press and a clipped mean of a real stack takes
+    about a second; reloading on each would make the control feel stuck."""
+    tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
+    reloads = []
+    tool._frames.changed.connect(lambda: reloads.append(True))
+
+    for value in (1, 2, 3, 4, 5):
+        tool._frames.spin_frame.setValue(value)
+    _settle(tool)
+
+    assert reloads == [True]
+    assert float(tool._data[0, 0]) == pytest.approx(5.0)
 
 
 def test_choosing_an_axis_relists_the_frames(tool, scan):
     """A different axis, a different number of frames, and a different shape."""
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
-    tool._combo_frame_axis.setCurrentIndex(2)
+    tool._frames.combo_axis.setCurrentIndex(2)
+    _settle(tool)
 
-    assert tool._combo_frame.count() == 1 + 12
+    assert tool._frames.spin_frame.maximum() == 11
     assert tool._data.shape == (400, 20)
 
 
 def test_the_axis_used_is_reported(tool, scan):
     tool.load_dataset_full_key(f"{scan}::entry/signal/img", auto_load=True, slot="CL")
 
-    tool._combo_frame_axis.setCurrentIndex(1)
+    tool._frames.combo_axis.setCurrentIndex(1)
+    _settle(tool)
 
     assert "axis 1" in tool._status.toolTip()
 

@@ -43,7 +43,7 @@ def fth(qapp, scan):
 # ── The reader ────────────────────────────────────────────────────────── #
 
 def test_the_reader_averages_a_stack_and_says_it_did(scan):
-    arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, 0, MEAN_OF_FRAMES, "CL")
+    arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, 0, MEAN_OF_FRAMES, label="CL")
 
     np.testing.assert_allclose(arr, STACK.mean(axis=0))
     assert note == "CL: mean of 7 frames (axis 0)"
@@ -51,7 +51,7 @@ def test_the_reader_averages_a_stack_and_says_it_did(scan):
 
 @pytest.mark.parametrize("axis,index", [(0, 3), (1, 5), (2, 9)])
 def test_the_reader_takes_the_frame_it_was_asked_for(scan, axis, index):
-    arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, axis, index, "CL")
+    arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, axis, index, label="CL")
 
     np.testing.assert_allclose(arr, np.take(STACK, index, axis=axis))
     assert f"frame {index}" in note and f"axis {axis}" in note
@@ -60,7 +60,7 @@ def test_the_reader_takes_the_frame_it_was_asked_for(scan, axis, index):
 def test_a_2d_dataset_is_read_exactly_as_before(scan):
     """The whole point of the reduction being a no-op below 3-D: nothing that
     worked before may change."""
-    arr, note = _FTHWorker._read_one(str(scan), FLAT_KEY, 0, MEAN_OF_FRAMES, "CL")
+    arr, note = _FTHWorker._read_one(str(scan), FLAT_KEY, 0, MEAN_OF_FRAMES, label="CL")
 
     np.testing.assert_array_equal(arr, FLAT.astype(np.float64))
     assert note == ""
@@ -123,7 +123,7 @@ def test_the_choice_is_offered_before_loading(fth, scan):
 
     assert fth._CL is None                      # nothing loaded yet
     assert fth._stack_shape() == STACK.shape
-    assert fth._frames.combo_frame.count() == 1 + 7
+    assert fth._frames.spin_frame.maximum() == 6
 
 
 def test_the_axes_are_named_the_way_every_other_selector_names_them(fth, scan):
@@ -133,10 +133,50 @@ def test_the_axes_are_named_the_way_every_other_selector_names_them(fth, scan):
             for i in range(fth._frames.combo_axis.count())] == ["0 (7)", "1 (32)", "2 (32)"]
 
 
-def test_the_mean_is_the_default(fth, scan):
+def test_the_first_frame_is_the_default(fth, scan):
+    """Not the mean. Computing something out of every frame changes the data in
+    a way the user has to be able to see they asked for."""
     fth._cl_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
 
-    assert fth._frames.selection() == (0, MEAN_OF_FRAMES)
+    assert fth._frames.combo_method.currentText() == "Single frame"
+    assert fth._frames.selection() == (0, 0)
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("Mean", lambda: STACK.mean(axis=0)),
+    ("Sum", lambda: STACK.sum(axis=0)),
+    ("Median", lambda: np.median(STACK, axis=0)),
+])
+def test_each_combination_reaches_the_reader(scan, method, expected):
+    """The method travels to the worker as the frame index, so it has to come
+    out the other end as the arithmetic it names."""
+    from src.gui.frame_select import METHOD_CHOICES
+
+    sentinel = dict((name, value) for name, value in METHOD_CHOICES)[method]
+    arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, 0, sentinel, label="CL")
+
+    np.testing.assert_allclose(arr, expected(), rtol=1e-6)
+    assert method.lower() in note
+
+
+def test_the_clipped_mean_rejects_what_a_mean_would_average_in(scan, tmp_path):
+    """The reason this method exists: one cosmic ray ruins a mean."""
+    from src.lib_h5.stacks import CLIPPED_MEAN_OF_FRAMES
+
+    clean = np.random.RandomState(2).poisson(50.0, (40, 16, 16)).astype(np.float32)
+    dirty = clean.copy()
+    dirty[7, 8, 8] += 50000.0
+    path = tmp_path / "rays.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("stack", data=dirty)
+
+    mean, _ = _FTHWorker._read_one(str(path), "stack", 0, MEAN_OF_FRAMES)
+    clipped, note = _FTHWorker._read_one(str(path), "stack", 0, CLIPPED_MEAN_OF_FRAMES)
+    truth = clean.mean(axis=0)[8, 8]
+
+    assert mean[8, 8] > truth + 1000, "the mean should be wrecked"
+    assert abs(clipped[8, 8] - truth) < 1.0, "the clipped mean should not be"
+    assert "k=5" in note
 
 
 def test_the_dark_slot_can_bring_up_the_controls_on_its_own(fth, scan):
@@ -161,7 +201,7 @@ def test_the_cdi_window_gets_the_same_frame_controls(qapp, scan):
         inner._cl_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
 
         assert inner._frames_group.isVisibleTo(cdi) is True
-        assert inner._frames.combo_frame.count() == 1 + 7
+        assert inner._frames.spin_frame.maximum() == 6
     finally:
         cdi.deleteLater()
 
@@ -194,7 +234,7 @@ def test_a_singleton_axis_is_not_a_stack(qapp, tmp_path):
         f.create_dataset("trail1", data=base[:, :, None])
 
     for key in ("flat", "lead1", "trail1"):
-        arr, note = _FTHWorker._read_one(str(path), key, 0, MEAN_OF_FRAMES, "CL")
+        arr, note = _FTHWorker._read_one(str(path), key, 0, MEAN_OF_FRAMES, label="CL")
 
         np.testing.assert_allclose(arr, base, err_msg=key)
         assert note == "", key

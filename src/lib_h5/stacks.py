@@ -30,8 +30,48 @@ from typing import Any
 
 import numpy as np
 
-#: The frame selector's value for "average them all".
+from src.recon.stack_combine import (
+    DEFAULT_KAPPA,
+    combine_clipped_mean,
+    combine_mean,
+    combine_median,
+    combine_sum,
+)
+
+# How to turn many frames into one, encoded in the frame index so that the
+# selection stays a plain (axis, index) pair everywhere it travels — into a
+# background worker, into a note, into a test. Negative because a real frame
+# index never is.
+#
+#: Average them all. Best statistics, no defence against outliers.
 MEAN_OF_FRAMES = -1
+#: Add them all. The mean times the frame count, so only the scale changes.
+SUM_OF_FRAMES = -2
+#: Per-pixel median. Immune to outliers, noisier than a mean.
+MEDIAN_OF_FRAMES = -3
+#: Reject outliers, then average the rest. See :mod:`src.recon.stack_combine`.
+CLIPPED_MEAN_OF_FRAMES = -4
+
+#: Every way of combining frames, in the order the selector offers them.
+COMBINE_METHODS = (
+    MEAN_OF_FRAMES,
+    SUM_OF_FRAMES,
+    MEDIAN_OF_FRAMES,
+    CLIPPED_MEAN_OF_FRAMES,
+)
+
+#: What each one is called, on screen and in the note the status line shows.
+METHOD_NAMES = {
+    MEAN_OF_FRAMES: "mean",
+    SUM_OF_FRAMES: "sum",
+    MEDIAN_OF_FRAMES: "median",
+    CLIPPED_MEAN_OF_FRAMES: "clipped mean",
+}
+
+
+def is_combination(index: int) -> bool:
+    """True when the index names a way of combining frames, not one frame."""
+    return int(index) in METHOD_NAMES
 
 
 def axis_label(axis: int, length: int) -> str:
@@ -87,6 +127,7 @@ def describe_reduction(
     axis: int,
     index: int,
     label: str = "",
+    kappa: float = DEFAULT_KAPPA,
 ) -> str:
     """The note :func:`reduce_stack` would produce, from a shape alone.
 
@@ -100,8 +141,10 @@ def describe_reduction(
     axis = int(axis) % len(shape)
     frames = shape[axis]
     prefix = f"{label}: " if label else ""
-    if int(index) == MEAN_OF_FRAMES:
-        return f"{prefix}mean of {frames} frames (axis {axis})"
+    if is_combination(index):
+        name = METHOD_NAMES[int(index)]
+        extra = f", k={float(kappa):g}" if int(index) == CLIPPED_MEAN_OF_FRAMES else ""
+        return f"{prefix}{name} of {frames} frames{extra} (axis {axis})"
     index = max(0, min(int(index), frames - 1))
     return f"{prefix}frame {index} of {frames} (axis {axis})"
 
@@ -111,6 +154,7 @@ def reduce_stack(
     axis: int,
     index: int,
     label: str = "",
+    kappa: float = DEFAULT_KAPPA,
 ) -> tuple[np.ndarray, str]:
     """Reduce a stack to one 2-D frame, and say in words what was done.
 
@@ -128,16 +172,33 @@ def reduce_stack(
         return arr, ""
 
     axis = int(axis) % arr.ndim
-    note = describe_reduction(arr.shape, axis, index, label)
+    note = describe_reduction(arr.shape, axis, index, label, kappa)
 
-    if int(index) == MEAN_OF_FRAMES:
-        return np.asarray(arr.mean(axis=axis)), note
+    if is_combination(index):
+        return combine_frames(arr, axis, index, kappa), note
 
     index = max(0, min(int(index), int(arr.shape[axis]) - 1))
     return np.asarray(np.take(arr, index, axis=axis)), note
 
 
-def read_frame(dataset, axis: int, index: int) -> np.ndarray:
+def combine_frames(
+    stack: np.ndarray,
+    axis: int,
+    index: int,
+    kappa: float = DEFAULT_KAPPA,
+) -> np.ndarray:
+    """Apply one of the combination methods named by ``index``."""
+    if int(index) == SUM_OF_FRAMES:
+        return combine_sum(stack, axis)
+    if int(index) == MEDIAN_OF_FRAMES:
+        return combine_median(stack, axis)
+    if int(index) == CLIPPED_MEAN_OF_FRAMES:
+        return combine_clipped_mean(stack, axis, kappa)
+    return combine_mean(stack, axis)
+
+
+def read_frame(dataset, axis: int, index: int,
+               kappa: float = DEFAULT_KAPPA) -> np.ndarray:
     """Read one frame straight out of an open h5py dataset.
 
     Reading the whole stack and then slicing costs the whole stack: measured on
@@ -152,8 +213,10 @@ def read_frame(dataset, axis: int, index: int) -> np.ndarray:
         return np.asarray(dataset[()])
 
     axis = int(axis) % len(shape)
-    if int(index) == MEAN_OF_FRAMES:
-        return np.asarray(dataset[()]).mean(axis=axis)
+    if is_combination(index):
+        # Every combination looks at all the frames, so there is nothing to
+        # save here; the whole stack has to come in.
+        return combine_frames(np.asarray(dataset[()]), axis, index, kappa)
 
     index = max(0, min(int(index), shape[axis] - 1))
     selector: list = [slice(None)] * len(shape)

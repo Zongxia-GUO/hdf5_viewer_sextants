@@ -15,15 +15,20 @@ import pathlib
 import h5py
 import numpy as np
 import pytest
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from src.gui.frame_select import FrameSelector
 from src.lib_h5.stacks import (
+    CLIPPED_MEAN_OF_FRAMES,
     MEAN_OF_FRAMES,
+    MEDIAN_OF_FRAMES,
+    SUM_OF_FRAMES,
     axis_label,
     describe_reduction,
     read_frame,
     reduce_stack,
 )
+from src.recon.stack_combine import DEFAULT_KAPPA
 
 STACK = np.arange(7 * 5 * 4, dtype=np.float64).reshape(7, 5, 4)
 FLAT = np.arange(5 * 4, dtype=np.float64).reshape(5, 4)
@@ -128,6 +133,17 @@ def test_the_lazy_read_does_not_pull_the_whole_stack(h5, monkeypatch):
 
 # ── The widget ────────────────────────────────────────────────────────── #
 
+def _flush(sel, timeout_ms=2000):
+    """Wait for the coalescing timer that paces reloads."""
+    from PyQt6.QtCore import QDeadlineTimer
+    from PyQt6.QtWidgets import QApplication
+
+    deadline = QDeadlineTimer(timeout_ms)
+    while sel._settle.isActive() and not deadline.hasExpired():
+        QApplication.processEvents()
+    QApplication.processEvents()
+
+
 def test_the_selector_hides_itself_for_2d_data(qapp):
     sel = FrameSelector()
     try:
@@ -135,48 +151,126 @@ def test_the_selector_hides_itself_for_2d_data(qapp):
 
         assert sel.isHidden()
         # And still answers, so a caller never has to ask whether it is showing.
-        assert sel.selection() == (0, MEAN_OF_FRAMES)
+        assert sel.selection() == (0, 0)
     finally:
         sel.deleteLater()
 
 
-def test_the_selector_offers_every_axis_and_every_frame(qapp):
+def test_the_default_is_one_frame_not_a_computed_one(qapp):
+    """Computing something out of every frame is a large thing to do to
+    someone's data; it should be chosen, not assumed."""
     sel = FrameSelector()
     try:
         sel.set_shape(STACK.shape)
 
-        assert [sel.combo_axis.itemText(i) for i in range(sel.combo_axis.count())] == \
-            ["0 (7)", "1 (5)", "2 (4)"]
-        assert sel.combo_frame.itemText(0) == "Mean"
-        assert sel.combo_frame.count() == 1 + 7
-        assert sel.selection() == (0, MEAN_OF_FRAMES)
+        assert sel.combo_method.currentText() == "Single frame"
+        assert sel.selection() == (0, 0)
     finally:
         sel.deleteLater()
 
 
-def test_changing_the_axis_rebuilds_the_frame_list(qapp):
+def test_the_methods_are_named_and_ordered(qapp):
+    sel = FrameSelector()
+    try:
+        offered = [sel.combo_method.itemText(i) for i in range(sel.combo_method.count())]
+
+        assert offered == ["Single frame", "Mean", "Sum", "Median", "Clipped mean"]
+    finally:
+        sel.deleteLater()
+
+
+def test_the_axes_carry_their_lengths(qapp):
     sel = FrameSelector()
     try:
         sel.set_shape(STACK.shape)
+
+        offered = [sel.combo_axis.itemText(i) for i in range(sel.combo_axis.count())]
+
+        assert offered == ["0 (7)", "1 (5)", "2 (4)"]
+    finally:
+        sel.deleteLater()
+
+
+@pytest.mark.parametrize("method,sentinel", [
+    ("Mean", MEAN_OF_FRAMES),
+    ("Sum", SUM_OF_FRAMES),
+    ("Median", MEDIAN_OF_FRAMES),
+    ("Clipped mean", CLIPPED_MEAN_OF_FRAMES),
+])
+def test_each_method_reports_its_own_sentinel(qapp, method, sentinel):
+    sel = FrameSelector()
+    try:
+        sel.set_shape(STACK.shape)
+        sel.combo_method.setCurrentIndex(sel.combo_method.findText(method))
+
+        assert sel.selection() == (0, sentinel)
+    finally:
+        sel.deleteLater()
+
+
+def test_only_the_box_the_method_uses_is_shown(qapp):
+    """A frame number beside "Median" would be a control that does nothing."""
+    host = QWidget()
+    sel = FrameSelector(host)
+    QVBoxLayout(host).addWidget(sel)
+    try:
+        sel.set_shape(STACK.shape)
+
+        for method, frame_box, kappa_box in (
+            ("Single frame", True, False),
+            ("Mean", False, False),
+            ("Sum", False, False),
+            ("Median", False, False),
+            ("Clipped mean", False, True),
+        ):
+            sel.combo_method.setCurrentIndex(sel.combo_method.findText(method))
+
+            assert sel.spin_frame.isVisibleTo(host) is frame_box, method
+            assert sel.spin_kappa.isVisibleTo(host) is kappa_box, method
+    finally:
+        host.close()
+        host.deleteLater()
+
+
+def test_the_frame_box_covers_the_chosen_axis(qapp):
+    sel = FrameSelector()
+    try:
+        sel.set_shape(STACK.shape)
+        assert sel.spin_frame.maximum() == 6
+
         sel.combo_axis.setCurrentIndex(2)
 
-        assert sel.combo_frame.count() == 1 + 4
+        assert sel.spin_frame.maximum() == 3
         assert sel.selection()[0] == 2
     finally:
         sel.deleteLater()
 
 
-def test_the_selector_reports_a_change_so_the_tool_can_reload(qapp):
+def test_the_default_threshold_is_five(qapp):
+    """Measured, not conventional: k=3 rejects 1.576% of the samples where only
+    0.006% are real cosmic rays, and the collateral shows in the result."""
+    sel = FrameSelector()
+    try:
+        assert sel.kappa() == DEFAULT_KAPPA == 5.0
+    finally:
+        sel.deleteLater()
+
+
+def test_a_burst_of_edits_reports_one_change(qapp):
+    """The spin box arrows fire once per press and a clipped mean of a real
+    stack takes about a second."""
     sel = FrameSelector()
     try:
         sel.set_shape(STACK.shape)
         seen = []
         sel.changed.connect(lambda: seen.append(True))
 
-        sel.combo_frame.setCurrentIndex(3)
-        sel.combo_axis.setCurrentIndex(1)
+        for value in (1, 2, 3, 4, 5):
+            sel.spin_frame.setValue(value)
+        _flush(sel)
 
-        assert len(seen) == 2
+        assert seen == [True]
+        assert sel.selection() == (0, 5)
     finally:
         sel.deleteLater()
 
@@ -185,12 +279,26 @@ def test_the_selector_reduces_with_its_own_selection(qapp):
     sel = FrameSelector()
     try:
         sel.set_shape(STACK.shape)
-        sel.combo_frame.setCurrentIndex(1 + 4)
+        sel.spin_frame.setValue(4)
 
         frame, note = sel.reduce(STACK, "CL")
 
         np.testing.assert_array_equal(frame, STACK[4])
         assert note == "CL: frame 4 of 7 (axis 0)"
+    finally:
+        sel.deleteLater()
+
+
+def test_the_threshold_travels_into_the_reduction(qapp):
+    sel = FrameSelector()
+    try:
+        sel.set_shape(STACK.shape)
+        sel.combo_method.setCurrentIndex(sel.combo_method.findText("Clipped mean"))
+        sel.spin_kappa.setValue(2.5)
+
+        _, note = sel.reduce(STACK, "CL")
+
+        assert note == "CL: clipped mean of 7 frames, k=2.5 (axis 0)"
     finally:
         sel.deleteLater()
 

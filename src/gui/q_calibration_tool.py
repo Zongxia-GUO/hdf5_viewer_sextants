@@ -51,7 +51,6 @@ from src.gui._shared import (
 )
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
-from src.lib_h5.stacks import MEAN_OF_FRAMES
 from src.lib_h5.table_format import (
     DEFAULT_TABLE_FORMAT_KEY,
     format_from_filter,
@@ -158,12 +157,9 @@ class QCalibrationTool(QDialog):
         # Which frame of a stack to calibrate. One control for all three slots:
         # they are required to have the same shape anyway, and three copies of
         # the same question would be three chances to answer it inconsistently.
-        # The widget is shared with the FTH and CDI tools; the two aliases below
-        # keep this window's own code (and its tests) reading as before.
+        # The widget is shared with the FTH and CDI tools.
         self._frames = FrameSelector(self)
         self._frames.changed.connect(self._reload_if_loaded)
-        self._combo_frame_axis = self._frames.combo_axis
-        self._combo_frame = self._frames.combo_frame
         self._frames_label = QLabel("Frames:")
         fl_ds.addRow(self._frames_label, self._frames)
         self._show_frame_controls(False)
@@ -430,8 +426,6 @@ class QCalibrationTool(QDialog):
     # ── Frame selection for a stack ───────────────────────────────────── #
 
     #: The frame selector's value for "average them all".
-    MEAN_OF_FRAMES = MEAN_OF_FRAMES
-
     def _show_frame_controls(self, visible: bool) -> None:
         self._frames_label.setVisible(visible)
         self._frames.setVisible(visible)
@@ -464,7 +458,7 @@ class QCalibrationTool(QDialog):
             self._load_data()
 
     def _frame_selection(self) -> tuple[int, int]:
-        """``(axis, index)``; index :data:`MEAN_OF_FRAMES` means average them."""
+        """``(axis, index)``; a negative index names a combination method."""
         return self._frames.selection()
 
     def _read_slot_2d(self, slot: str) -> np.ndarray | None:
@@ -566,6 +560,10 @@ class QCalibrationTool(QDialog):
                 # The same reduction the file path uses. It used to take frame
                 # zero here and the mean there, so the identical stack gave two
                 # different patterns depending on how it had been handed over.
+                # The selector is pointed at this array so the controls come up
+                # and read correctly for it, exactly as they do for a file.
+                self._frames.set_shape(data.shape)
+                self._show_frame_controls(True)
                 data = self._flatten_stack(data, "Array")
             if data.ndim != 2:
                 QMessageBox.warning(

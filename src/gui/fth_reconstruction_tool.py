@@ -62,12 +62,8 @@ from src.gui.export_naming import remember_save_directory, suggested_save_path
 from src.gui.dataset_path_combo import DatasetPathCombo
 from src.gui.frame_select import FrameSelector
 from src.lib_h5.data_exporter import DataExporter
-from src.lib_h5.stacks import (
-    MEAN_OF_FRAMES,
-    describe_reduction,
-    read_frame,
-    reduce_stack,
-)
+from src.lib_h5.stacks import describe_reduction, read_frame, reduce_stack
+from src.recon.stack_combine import DEFAULT_KAPPA
 from src.recon.fth import (
     binary_filter as _binary_filter_kernel,
     bs_step as _bs_step,
@@ -124,7 +120,8 @@ class _FTHWorker(QThread):
         cr_entries: list,
         dark_entry: Optional[tuple],
         frame_axis: int = 0,
-        frame_index: int = MEAN_OF_FRAMES,
+        frame_index: int = 0,
+        kappa: float = DEFAULT_KAPPA,
     ) -> None:
         super().__init__()
         self._cl   = cl_entries
@@ -132,6 +129,7 @@ class _FTHWorker(QThread):
         self._dark = dark_entry
         self._frame_axis = int(frame_axis)
         self._frame_index = int(frame_index)
+        self._kappa = float(kappa)
         self.notes: list[str] = []
 
     @staticmethod
@@ -139,7 +137,8 @@ class _FTHWorker(QThread):
         filename: str,
         ds_path: str,
         frame_axis: int = 0,
-        frame_index: int = MEAN_OF_FRAMES,
+        frame_index: int = 0,
+        kappa: float = DEFAULT_KAPPA,
         label: str = "",
     ) -> tuple[np.ndarray, str]:
         """Read one dataset, already reduced to 2-D. Returns ``(array, note)``.
@@ -153,17 +152,17 @@ class _FTHWorker(QThread):
 
         if not is_hdf5_file(filename):
             arr = np.squeeze(np.asarray(load_regular_data_file(filename))).astype(np.float64)
-            return reduce_stack(arr, frame_axis, frame_index, label)
+            return reduce_stack(arr, frame_axis, frame_index, label, kappa)
 
         with h5py.File(filename, "r") as f:
             dataset = f[ds_path]
             shape = tuple(dataset.shape)
             if len([n for n in shape if n > 1]) > 2:
-                frame = read_frame(dataset, frame_axis, frame_index)
-                note = describe_reduction(shape, frame_axis, frame_index, label)
+                frame = read_frame(dataset, frame_axis, frame_index, kappa)
+                note = describe_reduction(shape, frame_axis, frame_index, label, kappa)
                 return np.squeeze(np.asarray(frame)).astype(np.float64), note
             arr = np.squeeze(np.array(dataset)).astype(np.float64)
-        return reduce_stack(arr, frame_axis, frame_index, label)
+        return reduce_stack(arr, frame_axis, frame_index, label, kappa)
 
     def run(self) -> None:
         try:
@@ -183,7 +182,7 @@ class _FTHWorker(QThread):
                         return None
                     tag = label if len(entries) == 1 else f"{label}[{i}]"
                     arr, note = self._read_one(
-                        fn, dp, self._frame_axis, self._frame_index, tag
+                        fn, dp, self._frame_axis, self._frame_index, self._kappa, tag
                     )
                     if note:
                         self.notes.append(note)
@@ -212,7 +211,7 @@ class _FTHWorker(QThread):
             dark = None
             if self._dark:
                 dark, note = self._read_one(
-                    *self._dark, self._frame_axis, self._frame_index, "Dark"
+                    *self._dark, self._frame_axis, self._frame_index, self._kappa, "Dark"
                 )
                 if note:
                     self.notes.append(note)
@@ -1268,6 +1267,7 @@ class FTHReconstructionTool(QMainWindow):
             dark_entry,
             frame_axis,
             frame_index,
+            self._frames.kappa(),
         )
         self._worker.finished.connect(self._on_load_finished)
         self._worker.error.connect(self._on_load_error)
