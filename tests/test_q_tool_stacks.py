@@ -258,8 +258,11 @@ def test_a_stack_brings_up_the_frame_controls(tool, scan):
     tool._cl_combo.add_full_key(f"{scan}::entry/signal/img", select=True)
 
     assert tool._combo_frame.isVisibleTo(tool) is True
+    # Each axis carries its length: the number is what the code slices by, and
+    # the length is what tells the axes apart. Same naming as the batch export
+    # and the 2-D viewer, which is why this moved to a shared widget.
     assert [tool._combo_frame_axis.itemText(i)
-            for i in range(tool._combo_frame_axis.count())] == ["0", "1", "2"]
+            for i in range(tool._combo_frame_axis.count())] == ["0 (400)", "1 (20)", "2 (12)"]
     assert tool._combo_frame.itemText(0) == "Mean"
     assert tool._combo_frame.count() == 1 + 400
 

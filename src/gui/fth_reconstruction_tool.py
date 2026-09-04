@@ -60,7 +60,14 @@ from src.gui._shared import (
 )
 from src.gui.export_naming import remember_save_directory, suggested_save_path
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.gui.frame_select import FrameSelector
 from src.lib_h5.data_exporter import DataExporter
+from src.lib_h5.stacks import (
+    MEAN_OF_FRAMES,
+    describe_reduction,
+    read_frame,
+    reduce_stack,
+)
 from src.recon.fth import (
     binary_filter as _binary_filter_kernel,
     bs_step as _bs_step,
@@ -116,21 +123,47 @@ class _FTHWorker(QThread):
         cl_entries: list,   # [(filename, ds_path), ...]
         cr_entries: list,
         dark_entry: Optional[tuple],
+        frame_axis: int = 0,
+        frame_index: int = MEAN_OF_FRAMES,
     ) -> None:
         super().__init__()
         self._cl   = cl_entries
         self._cr   = cr_entries
         self._dark = dark_entry
+        self._frame_axis = int(frame_axis)
+        self._frame_index = int(frame_index)
+        self.notes: list[str] = []
 
     @staticmethod
-    def _read_one(filename: str, ds_path: str) -> np.ndarray:
+    def _read_one(
+        filename: str,
+        ds_path: str,
+        frame_axis: int = 0,
+        frame_index: int = MEAN_OF_FRAMES,
+        label: str = "",
+    ) -> tuple[np.ndarray, str]:
+        """Read one dataset, already reduced to 2-D. Returns ``(array, note)``.
+
+        A stack is sliced in the file rather than read whole and then cut:
+        measured on 120x512x512 float32, taking one frame that way costs 0.7 ms
+        and 1 MB against 36.9 ms and 126 MB. Only a mean has to read it all.
+        """
         from src.lib_h5.file_validator import is_hdf5_file
         from src.gui.main_window import load_regular_data_file
 
         if not is_hdf5_file(filename):
-            return np.squeeze(np.asarray(load_regular_data_file(filename))).astype(np.float64)
+            arr = np.squeeze(np.asarray(load_regular_data_file(filename))).astype(np.float64)
+            return reduce_stack(arr, frame_axis, frame_index, label)
+
         with h5py.File(filename, "r") as f:
-            return np.squeeze(np.array(f[ds_path])).astype(np.float64)
+            dataset = f[ds_path]
+            shape = tuple(dataset.shape)
+            if len([n for n in shape if n > 1]) > 2:
+                frame = read_frame(dataset, frame_axis, frame_index)
+                note = describe_reduction(shape, frame_axis, frame_index, label)
+                return np.squeeze(np.asarray(frame)).astype(np.float64), note
+            arr = np.squeeze(np.array(dataset)).astype(np.float64)
+        return reduce_stack(arr, frame_axis, frame_index, label)
 
     def run(self) -> None:
         try:
@@ -138,19 +171,31 @@ class _FTHWorker(QThread):
                 return
 
             single_source = None
-            cl = None
-            for fn, dp in self._cl:
-                if self.isInterruptionRequested():
-                    return
-                arr = self._read_one(fn, dp)
-                cl = arr if cl is None else (cl + arr)
+            self.notes = []
 
-            cr = None
-            for fn, dp in self._cr:
-                if self.isInterruptionRequested():
-                    return
-                arr = self._read_one(fn, dp)
-                cr = arr if cr is None else (cr + arr)
+            # Reduce each dataset to one frame BEFORE summing across datasets.
+            # The other order would add stacks together and only then pick a
+            # frame out of the sum, which is a different quantity.
+            def _accumulate(entries, label):
+                total = None
+                for i, (fn, dp) in enumerate(entries):
+                    if self.isInterruptionRequested():
+                        return None
+                    tag = label if len(entries) == 1 else f"{label}[{i}]"
+                    arr, note = self._read_one(
+                        fn, dp, self._frame_axis, self._frame_index, tag
+                    )
+                    if note:
+                        self.notes.append(note)
+                    total = arr if total is None else (total + arr)
+                return total
+
+            cl = _accumulate(self._cl, "CL")
+            if self.isInterruptionRequested():
+                return
+            cr = _accumulate(self._cr, "CR")
+            if self.isInterruptionRequested():
+                return
 
             if cl is None and cr is None:
                 raise RuntimeError("No CL/CR datasets provided.")
@@ -164,7 +209,13 @@ class _FTHWorker(QThread):
 
             if self.isInterruptionRequested():
                 return
-            dark = self._read_one(*self._dark) if self._dark else None
+            dark = None
+            if self._dark:
+                dark, note = self._read_one(
+                    *self._dark, self._frame_axis, self._frame_index, "Dark"
+                )
+                if note:
+                    self.notes.append(note)
             if self.isInterruptionRequested():
                 return
             if single_source is not None:
@@ -250,6 +301,7 @@ class FTHReconstructionTool(QMainWindow):
         self._rs_scale_base:   float = 1.0   # auto-detected from FTH amplitude
         self._phase_scale:     float = 0.0  # phase rotation (rad) applied to complex FTH data
         self._cmap_name:       str   = "Jet"
+        self._load_notes: list[str] = []   # how each stack was reduced, for the status
         self._t4_autoleveled_key: tuple | None = None  # (slit, roi_idx) last auto-leveled
         self._t4_rs_base:         float = 1.0          # auto-detected FT amplitude base
         # False while the Reconstruction page's phase / FT amplitude still
@@ -487,6 +539,21 @@ class FTHReconstructionTool(QMainWindow):
         self._dark_combo.lineEdit().returnPressed.connect(self._on_dataset_entry_entered)
         fl_dk.addRow("Dataset:", self._dark_combo)
         lay.addWidget(g_dark)
+
+        # Which frame of a stack to reconstruct. One control for CL, CR and the
+        # dark together: they have to be the same shape to combine anyway, and
+        # three copies of the question would be three chances to answer it
+        # differently. Hidden unless something selected is a stack.
+        g_frames = QGroupBox("Frames")
+        fl_fr = QFormLayout(g_frames)
+        self._frames = FrameSelector(self)
+        self._frames.changed.connect(self._on_frame_selection_changed)
+        fl_fr.addRow(self._frames)
+        self._frames_group = g_frames
+        g_frames.setVisible(False)
+        lay.addWidget(g_frames)
+        for combo in (self._cl_combo, self._cr_combo, self._dark_combo):
+            combo.currentTextChanged.connect(self._refresh_frame_controls)
 
         # Load / Lock / Run buttons
         self._load_btn = QPushButton("Load Data")
@@ -1137,6 +1204,42 @@ class FTHReconstructionTool(QMainWindow):
     # TAB 1 -Data loading & display
     # ==================================================================
 
+    def _stack_shape(self) -> tuple[int, ...] | None:
+        """The shape of the first selected slot that holds a stack."""
+        for combo in (self._cl_combo, self._cr_combo, self._dark_combo):
+            entry = combo.get_entry(opened_files=self._opened_files)
+            if entry is None:
+                continue
+            file_path, ds_path = entry
+            try:
+                with h5py.File(file_path, "r") as f:
+                    node = f.get(ds_path)
+                    if not isinstance(node, h5py.Dataset):
+                        continue
+                    shape = tuple(int(n) for n in node.shape)
+            except Exception as exc:
+                logging.debug("Could not read the shape of %s: %s", ds_path, exc)
+                continue
+            if len([n for n in shape if n > 1]) > 2:
+                return shape
+        return None
+
+    def _refresh_frame_controls(self, *_args) -> None:
+        """Offer the frame choice as soon as a stack is selected.
+
+        Before loading, not after: the choice is part of deciding what to load,
+        and a control that only appears once the data is in has already let the
+        tool reduce the stack one way without being asked.
+        """
+        shape = self._stack_shape()
+        self._frames.set_shape(shape)
+        self._frames_group.setVisible(shape is not None)
+
+    def _on_frame_selection_changed(self) -> None:
+        """Re-read with the new frame, so the change is visible without Load."""
+        if self._CL is not None or self._CR is not None:
+            self._load_data()
+
     def _load_data(self) -> None:
         cl_entry   = self._cl_combo.get_entry(opened_files=self._opened_files)
         cr_entry   = self._cr_combo.get_entry(opened_files=self._opened_files)
@@ -1158,10 +1261,13 @@ class FTHReconstructionTool(QMainWindow):
             else "Loading datasets in background..."
         )
 
+        frame_axis, frame_index = self._frames.selection()
         self._worker = _FTHWorker(
             [cl_entry] if cl_entry else [],
             [cr_entry] if cr_entry else [],
             dark_entry,
+            frame_axis,
+            frame_index,
         )
         self._worker.finished.connect(self._on_load_finished)
         self._worker.error.connect(self._on_load_error)
@@ -1202,6 +1308,7 @@ class FTHReconstructionTool(QMainWindow):
         sender = self.sender()
         if sender is not self._worker:
             return
+        self._load_notes = list(getattr(sender, "notes", []) or [])
         self._load_btn.setEnabled(True)
         if dark is not None:
             cl = np.clip(cl - dark, 0, None)
@@ -1243,9 +1350,12 @@ class FTHReconstructionTool(QMainWindow):
             self._update_t4_display()
             return
         mode_label = "single dataset" if self._single_dataset_mode else "CL/CR pair"
+        # Say which frame this is. Reducing a stack in silence is how a mean of
+        # 400 frames gets read as one measurement.
+        frames = f"  |  {'; '.join(self._load_notes)}" if self._load_notes else ""
         self._set_status(
             f"Loaded OK ({mode_label}) - shape {cl.shape}, "
-            f"centered to ({self._Nx}x{self._Ny}), X0={self._X0} Y0={self._Y0}"
+            f"centered to ({self._Nx}x{self._Ny}), X0={self._X0} Y0={self._Y0}{frames}"
         )
 
     def _initialize_center_controls_for_loaded_shape(self, shape: tuple[int, int]) -> None:

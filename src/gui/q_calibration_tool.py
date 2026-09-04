@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.gui.dataset_path_combo import DatasetPathCombo
+from src.gui.frame_select import FrameSelector
 from src.gui.export_naming import (
     remember_save_directory,
     short_series_label,
@@ -50,6 +51,7 @@ from src.gui._shared import (
 )
 from src.gui.plot_context_menu import attach_plot_menu
 from src.lib_h5.data_exporter import DataExporter
+from src.lib_h5.stacks import MEAN_OF_FRAMES
 from src.lib_h5.table_format import (
     DEFAULT_TABLE_FORMAT_KEY,
     format_from_filter,
@@ -156,26 +158,14 @@ class QCalibrationTool(QDialog):
         # Which frame of a stack to calibrate. One control for all three slots:
         # they are required to have the same shape anyway, and three copies of
         # the same question would be three chances to answer it inconsistently.
-        self._row_frames = QHBoxLayout()
-        self._lbl_frames = QLabel("Axis:")
-        self._combo_frame_axis = QComboBox()
-        self._combo_frame_axis.setToolTip("Which array axis the frames are counted along")
-        self._combo_frame_axis.setMinimumWidth(55)
-        self._combo_frame_axis.currentIndexChanged.connect(self._on_frame_axis_changed)
-        self._combo_frame = QComboBox()
-        self._combo_frame.setMinimumWidth(90)
-        self._combo_frame.setToolTip(
-            "Which frame to calibrate, or the mean of them all.\n"
-            "The mean is the default: more frames, better statistics."
-        )
-        self._combo_frame.currentIndexChanged.connect(self._on_frame_changed)
-        self._row_frames.addWidget(self._lbl_frames)
-        self._row_frames.addWidget(self._combo_frame_axis)
-        self._row_frames.addWidget(QLabel("Frame:"))
-        self._row_frames.addWidget(self._combo_frame)
-        self._row_frames.addStretch()
+        # The widget is shared with the FTH and CDI tools; the two aliases below
+        # keep this window's own code (and its tests) reading as before.
+        self._frames = FrameSelector(self)
+        self._frames.changed.connect(self._reload_if_loaded)
+        self._combo_frame_axis = self._frames.combo_axis
+        self._combo_frame = self._frames.combo_frame
         self._frames_label = QLabel("Frames:")
-        fl_ds.addRow(self._frames_label, self._row_frames)
+        fl_ds.addRow(self._frames_label, self._frames)
         self._show_frame_controls(False)
 
         self._btn_load = QPushButton("Load Data")
@@ -440,18 +430,11 @@ class QCalibrationTool(QDialog):
     # ── Frame selection for a stack ───────────────────────────────────── #
 
     #: The frame selector's value for "average them all".
-    MEAN_OF_FRAMES = -1
+    MEAN_OF_FRAMES = MEAN_OF_FRAMES
 
     def _show_frame_controls(self, visible: bool) -> None:
         self._frames_label.setVisible(visible)
-        self._lbl_frames.setVisible(visible)
-        self._combo_frame_axis.setVisible(visible)
-        self._combo_frame.setVisible(visible)
-        for index in range(self._row_frames.count()):
-            item = self._row_frames.itemAt(index)
-            widget = item.widget() if item is not None else None
-            if isinstance(widget, QLabel):
-                widget.setVisible(visible)
+        self._frames.setVisible(visible)
 
     def _stack_shape(self) -> tuple[int, ...] | None:
         """The shape of the first selected slot, if it is a stack of frames."""
@@ -472,41 +455,8 @@ class QCalibrationTool(QDialog):
     def _refresh_frame_controls(self, *_args) -> None:
         """Show the axis and frame selectors when a slot holds a stack."""
         shape = self._stack_shape()
+        self._frames.set_shape(shape)
         self._show_frame_controls(shape is not None)
-        if shape is None:
-            return
-
-        previous_axis = self._combo_frame_axis.currentData()
-        self._combo_frame_axis.blockSignals(True)
-        self._combo_frame_axis.clear()
-        for axis in range(len(shape)):
-            self._combo_frame_axis.addItem(str(axis), axis)
-        if previous_axis is not None and 0 <= int(previous_axis) < len(shape):
-            self._combo_frame_axis.setCurrentIndex(int(previous_axis))
-        self._combo_frame_axis.blockSignals(False)
-        self._rebuild_frame_combo(shape)
-
-    def _rebuild_frame_combo(self, shape: tuple[int, ...]) -> None:
-        axis = int(self._combo_frame_axis.currentData() or 0)
-        previous = self._combo_frame.currentData()
-        self._combo_frame.blockSignals(True)
-        self._combo_frame.clear()
-        self._combo_frame.addItem("Mean", self.MEAN_OF_FRAMES)
-        for index in range(shape[axis % len(shape)]):
-            self._combo_frame.addItem(str(index), index)
-        if previous is not None:
-            found = self._combo_frame.findData(previous)
-            self._combo_frame.setCurrentIndex(max(0, found))
-        self._combo_frame.blockSignals(False)
-
-    def _on_frame_axis_changed(self, _index: int) -> None:
-        shape = self._stack_shape()
-        if shape is not None:
-            self._rebuild_frame_combo(shape)
-            self._reload_if_loaded()
-
-    def _on_frame_changed(self, _index: int) -> None:
-        self._reload_if_loaded()
 
     def _reload_if_loaded(self) -> None:
         """Re-read the slots so the change is visible without pressing Load."""
@@ -515,12 +465,7 @@ class QCalibrationTool(QDialog):
 
     def _frame_selection(self) -> tuple[int, int]:
         """``(axis, index)``; index :data:`MEAN_OF_FRAMES` means average them."""
-        if not self._combo_frame.isVisibleTo(self):
-            return 0, self.MEAN_OF_FRAMES
-        axis = self._combo_frame_axis.currentData()
-        index = self._combo_frame.currentData()
-        return (int(axis) if axis is not None else 0,
-                int(index) if index is not None else self.MEAN_OF_FRAMES)
+        return self._frames.selection()
 
     def _read_slot_2d(self, slot: str) -> np.ndarray | None:
         """Read a slot's dataset as a 2-D image, averaging a stack of frames."""
@@ -558,19 +503,10 @@ class QCalibrationTool(QDialog):
         nonsense for a stack stored as ``(H, W, N)`` — a layout the 2-D viewer
         explicitly supports.
         """
-        if arr.ndim <= 2:
-            return arr
-
-        axis, index = self._frame_selection()
-        axis %= arr.ndim
-        frames = int(arr.shape[axis])
-        if index >= 0:
-            index = min(index, frames - 1)
-            self._stack_notes.append(f"{slot}: frame {index} of {frames} (axis {axis})")
-            return np.asarray(np.take(arr, index, axis=axis))
-
-        self._stack_notes.append(f"{slot}: mean of {frames} frames (axis {axis})")
-        return np.asarray(arr.mean(axis=axis))
+        frame, note = self._frames.reduce(arr, slot)
+        if note:
+            self._stack_notes.append(note)
+        return frame
 
     # Operation spec: (required slots, slots used in formula).
     _OP_REQUIRED = {

@@ -58,6 +58,15 @@ from src.gui.table_model import CopyableTableView, DataTable, TableModel
 from src.gui.x_target import register_x_target
 from src.img.img_path import img_path
 from src.lib_h5.data_exporter import DataExporter
+# Re-exported: these moved to src.lib_h5.stacks so the reconstruction tools can
+# slice a stack the same way without importing the batch export to do it. Call
+# sites here and in the viewer are unchanged.
+from src.lib_h5.stacks import (          # noqa: F401
+    axis_label,
+    slice_axis_from,
+    slice_count,
+    take_slice,
+)
 from src.lib_h5.table_format import (
     DEFAULT_TABLE_FORMAT_KEY,
     TableFormat,
@@ -158,54 +167,6 @@ def rotate_frame(frame: np.ndarray, degrees: int) -> np.ndarray:
         return frame
     # np.rot90 turns counter-clockwise, so negate to read as the label does.
     return np.rot90(frame, k=-quarter_turns)
-
-
-def axis_label(axis: int, length: int) -> str:
-    """Name one array axis for a selector: ``0 (128)``.
-
-    Numbered, not X/Y/Z. In a stack of frames shaped ``(100, 512, 512)`` axis 0
-    is the frame — time, energy, whatever was scanned — and calling it "X"
-    says it is a spatial direction, which it is not; the image's own X is the
-    *last* axis, which the same scheme called "Z". The number is what the code
-    slices by, and the length in brackets is what tells the axes apart in
-    practice.
-
-    The word "Axis" is not repeated here: every one of these selectors sits
-    beside a label that already says it, and carrying it in each entry made the
-    box twice as wide as the value it holds.
-    """
-    return f"{int(axis)} ({int(length)})"
-
-
-def take_slice(stack: np.ndarray, axis: int, index: int) -> np.ndarray:
-    """One frame out of a stack, counted along ``axis``.
-
-    The viewer lets the axis be chosen, so everything downstream has to slice
-    the same way. Taking ``stack[index]`` regardless — which is what the export
-    did — silently ignores that choice and writes frames cut the wrong way.
-    """
-    arr = np.asarray(stack)
-    if arr.ndim < 3:
-        return arr
-    axis = int(axis) % arr.ndim
-    index = max(0, min(int(index), arr.shape[axis] - 1))
-    return np.asarray(np.take(arr, index, axis=axis))
-
-
-def slice_count(stack: np.ndarray, axis: int) -> int:
-    """How many frames a stack holds along ``axis``."""
-    arr = np.asarray(stack)
-    if arr.ndim < 3:
-        return 1
-    return int(arr.shape[int(axis) % arr.ndim])
-
-
-def slice_axis_from(export_settings: dict[str, Any]) -> int:
-    """The axis the frames are counted along, defaulting to the first."""
-    try:
-        return int(export_settings.get("slice_axis", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def image_format_from(export_settings: dict[str, Any]) -> ImageFormat:
