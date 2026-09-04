@@ -104,6 +104,7 @@ from src.gui.export_naming import (
     remember_save_directory,
     short_series_label,
 )
+from src.gui.session_guard import SessionGuard, describe_age
 from src.gui.table_model import CopyableTableView, TableModel
 from src.gui.x_target import (
     DEFAULT_X_SCOPE,
@@ -1060,8 +1061,17 @@ class MainWindow(QMainWindow):
         if len(sys.argv) > 1:
             self._open_file(pathlib.Path(sys.argv[1]))
 
+        # Was the last run cut short? Ask before reading the session, because
+        # the answer decides whether the session is worth reading.
+        self._session_guard = SessionGuard(self)
+        crashed = self._session_guard.previous_run_crashed
+        crash_age = self._session_guard.age_of_last_stamp
+        self._session_guard.start()
+
         # Restore previous session *after* the window is visible so startup is instant.
         _files = settings.value("settings/last_opened_files", ())
+        if crashed:
+            _files = self._discard_session_after_crash(_files, crash_age)
         if _files:
             QTimer.singleShot(0, lambda: self._restore_session(_files, ""))
 
@@ -1316,10 +1326,22 @@ class MainWindow(QMainWindow):
                 "fast_paths": list(self._fast_group_paths),
                 "files": files_payload,
             }
-            with p.open("w", encoding="utf-8") as fh:
+            # Written beside the target and moved into place, because this runs
+            # on the way out: opening the real file truncates it first, so a
+            # process that dies mid-write leaves half a JSON document behind.
+            # The loader survives that — it throws the cache away — but then
+            # the next start rescans every file for nothing. os.replace is
+            # atomic, so the file on disk is either the old one or the new one.
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=True, separators=(",", ":"))
+            os.replace(tmp, p)
         except Exception as exc:
             logging.warning("Failed to save disk index cache: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except (OSError, UnboundLocalError, NameError):
+                pass
 
     def _set_index_scope(self, scope: str) -> None:
         """Set index scope ('fast' or 'full') and trigger rebuild."""
@@ -1645,6 +1667,37 @@ class MainWindow(QMainWindow):
         if hasattr(self, "cdi_tool") and self.cdi_tool is not None and self.cdi_tool.isVisible():
             keys_2d = self._peek_dataset_full_keys(min_ndim=2)
             self.cdi_tool.update_opened_files(self.opened_files, keys_2d)
+
+    def _discard_session_after_crash(self, files, age_s: float):
+        """Start empty after a crash, and say so. Returns the files to restore.
+
+        Reopening them is the wrong move twice over. It is slow — the files
+        have to be added and then indexed again, which on network storage is
+        the difference between a moment and a long wait. And if one of them is
+        what brought the process down, restoring it means the application
+        cannot be started at all: it would crash, restore, and crash again with
+        no way in.
+
+        The list is cleared rather than kept for later. Files are opened a
+        folder at a time here and the last folder is remembered, so getting
+        back to where you were is one dialog with the path already filled in —
+        not worth a recovery command of its own.
+        """
+        count = len(files or ())
+        QSettings().setValue("settings/last_opened_files", ())
+        when = describe_age(age_s)
+        if count:
+            self._set_status_text(
+                f"Last session ended unexpectedly {when}  |  "
+                f"{count} file(s) were not reopened"
+            )
+        else:
+            self._set_status_text(f"Last session ended unexpectedly {when}")
+        logging.warning(
+            "Previous session did not close cleanly (%s); skipped restoring %d file(s).",
+            when, count,
+        )
+        return ()
 
     def _restore_session(self, files, monitor_folder_str: str) -> None:
         """Restore the previous session after the main window is visible.
@@ -4195,6 +4248,8 @@ class MainWindow(QMainWindow):
         settings = QSettings()
         settings.setValue("main_window/size", self.size())
         settings.setValue("main_window/position", self.pos())
+        # No heartbeat means the close was orderly; the next start reads that.
+        self._session_guard.mark_clean_exit()
 
         # Monitor folder is not persisted; user must re-enable it manually each session.
         settings.setValue("settings/monitor_folder", "")
