@@ -18,6 +18,7 @@
 import logging
 import pathlib
 import re
+from collections.abc import Callable
 from typing import Optional
 
 import h5py
@@ -62,7 +63,7 @@ from src.gui.export_naming import remember_save_directory, suggested_save_path
 from src.gui.dataset_path_combo import DatasetPathCombo
 from src.gui.frame_select import FrameSelector
 from src.lib_h5.data_exporter import DataExporter
-from src.lib_h5.stacks import describe_reduction, read_frame, reduce_stack
+from src.lib_h5.stacks import describe_reduction, is_combination, reduce_stack
 from src.recon.stack_combine import DEFAULT_KAPPA
 from src.recon.fth import (
     binary_filter as _binary_filter_kernel,
@@ -117,6 +118,9 @@ class _FTHWorker(QThread):
 
     finished = pyqtSignal(object, object, object)   # cl_array, cr_array, dark (may be None)
     error    = pyqtSignal(str)
+    progress = pyqtSignal(int, str)                 # percent, current stage
+
+    _READ_CHUNK_BYTES = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -143,6 +147,132 @@ class _FTHWorker(QThread):
         self.notes: list[str] = []
 
     @staticmethod
+    def _is_stack_shape(shape: tuple[int, ...]) -> bool:
+        return len([size for size in shape if int(size) > 1]) > 2
+
+    @staticmethod
+    def _check_interrupted(interrupted: Callable[[], bool] | None) -> None:
+        if interrupted is not None and interrupted():
+            raise InterruptedError("FTH data loading was interrupted")
+
+    @classmethod
+    def _read_dataset_chunked(
+        cls,
+        dataset,
+        chunk_axis: int,
+        progress_callback: Callable[[float], None] | None,
+        interrupted: Callable[[], bool] | None,
+    ) -> np.ndarray:
+        """Read a complete HDF5 dataset in bounded slabs.
+
+        The destination has the dataset's original dtype and shape, so all
+        existing reduction kernels receive exactly the same array as before.
+        """
+        shape = tuple(int(size) for size in dataset.shape)
+        if not shape:
+            cls._check_interrupted(interrupted)
+            result = np.asarray(dataset[()])
+            if progress_callback is not None:
+                progress_callback(1.0)
+            return result
+
+        axis = int(chunk_axis) % len(shape)
+        if shape[axis] <= 1:
+            axis = next((i for i, size in enumerate(shape) if size > 1), axis)
+        length = max(1, shape[axis])
+        other_elements = max(1, int(np.prod(shape, dtype=np.int64)) // length)
+        bytes_per_index = max(1, other_elements * max(1, int(dataset.dtype.itemsize)))
+        step = max(1, cls._READ_CHUNK_BYTES // bytes_per_index)
+        result = np.empty(shape, dtype=dataset.dtype)
+
+        for start in range(0, length, step):
+            cls._check_interrupted(interrupted)
+            stop = min(length, start + step)
+            selection = [slice(None)] * len(shape)
+            selection[axis] = slice(start, stop)
+            selection = tuple(selection)
+            result[selection] = dataset[selection]
+            if progress_callback is not None:
+                progress_callback(stop / length)
+        return result
+
+    @classmethod
+    def _read_selected_frame_chunked(
+        cls,
+        dataset,
+        frame_axis: int,
+        frame_index: int,
+        progress_callback: Callable[[float], None] | None,
+        interrupted: Callable[[], bool] | None,
+    ) -> np.ndarray:
+        """Read one frame in spatial slabs instead of one large blocking call."""
+        shape = tuple(int(size) for size in dataset.shape)
+        axis = int(frame_axis) % len(shape)
+        index = max(0, min(int(frame_index), shape[axis] - 1))
+        output_shape = shape[:axis] + shape[axis + 1:]
+        source_axes = [i for i, size in enumerate(shape) if i != axis and size > 1]
+        if not source_axes:
+            cls._check_interrupted(interrupted)
+            selection = [slice(None)] * len(shape)
+            selection[axis] = index
+            result = np.asarray(dataset[tuple(selection)])
+            if progress_callback is not None:
+                progress_callback(1.0)
+            return result
+
+        source_axis = source_axes[0]
+        output_axis = source_axis if source_axis < axis else source_axis - 1
+        length = shape[source_axis]
+        output_elements = max(1, int(np.prod(output_shape, dtype=np.int64)))
+        other_elements = max(1, output_elements // length)
+        bytes_per_index = max(1, other_elements * max(1, int(dataset.dtype.itemsize)))
+        step = max(1, cls._READ_CHUNK_BYTES // bytes_per_index)
+        result = np.empty(output_shape, dtype=dataset.dtype)
+
+        for start in range(0, length, step):
+            cls._check_interrupted(interrupted)
+            stop = min(length, start + step)
+            source_selection = [slice(None)] * len(shape)
+            source_selection[axis] = index
+            source_selection[source_axis] = slice(start, stop)
+            output_selection = [slice(None)] * len(output_shape)
+            output_selection[output_axis] = slice(start, stop)
+            result[tuple(output_selection)] = dataset[tuple(source_selection)]
+            if progress_callback is not None:
+                progress_callback(stop / length)
+        return result
+
+    @classmethod
+    def _estimate_read_bytes(
+        cls,
+        filename: str,
+        ds_path: str,
+        frame_axis: int,
+        frame_index: int,
+    ) -> int:
+        """Logical bytes that this selection will read, used as progress weight."""
+        from src.lib_h5.file_validator import is_hdf5_file
+
+        if not is_hdf5_file(filename):
+            try:
+                return max(1, pathlib.Path(filename).stat().st_size)
+            except OSError:
+                return 1
+        try:
+            with h5py.File(filename, "r") as handle:
+                dataset = handle[ds_path]
+                shape = tuple(int(size) for size in dataset.shape)
+                elements = max(1, int(np.prod(shape, dtype=np.int64)))
+                if cls._is_stack_shape(shape) and not is_combination(frame_index):
+                    axis = int(frame_axis) % len(shape)
+                    elements //= max(1, shape[axis])
+                return max(1, elements * max(1, int(dataset.dtype.itemsize)))
+        except Exception:
+            # The real read will report the useful error. Keep progress setup
+            # from hiding it behind a metadata-estimation failure.
+            return 1
+
+    @staticmethod
     def _read_one(
         filename: str,
         ds_path: str,
@@ -150,6 +280,9 @@ class _FTHWorker(QThread):
         frame_index: int = 0,
         kappa: float = DEFAULT_KAPPA,
         label: str = "",
+        progress_callback: Callable[[float], None] | None = None,
+        processing_callback: Callable[[], None] | None = None,
+        interrupted: Callable[[], bool] | None = None,
     ) -> tuple[np.ndarray, str]:
         """Read one dataset, already reduced to 2-D. Returns ``(array, note)``.
 
@@ -161,17 +294,37 @@ class _FTHWorker(QThread):
         from src.gui.main_window import load_regular_data_file
 
         if not is_hdf5_file(filename):
+            _FTHWorker._check_interrupted(interrupted)
             arr = np.squeeze(np.asarray(load_regular_data_file(filename))).astype(np.float64)
+            if progress_callback is not None:
+                progress_callback(1.0)
+            if processing_callback is not None and _FTHWorker._is_stack_shape(arr.shape):
+                processing_callback()
             return reduce_stack(arr, frame_axis, frame_index, label, kappa)
 
         with h5py.File(filename, "r") as f:
             dataset = f[ds_path]
-            shape = tuple(dataset.shape)
-            if len([n for n in shape if n > 1]) > 2:
-                frame = read_frame(dataset, frame_axis, frame_index, kappa)
+            shape = tuple(int(size) for size in dataset.shape)
+            if _FTHWorker._is_stack_shape(shape):
+                axis = int(frame_axis) % len(shape)
+                if is_combination(frame_index):
+                    stack = _FTHWorker._read_dataset_chunked(
+                        dataset, axis, progress_callback, interrupted
+                    )
+                    if processing_callback is not None:
+                        processing_callback()
+                    frame, _ = reduce_stack(stack, axis, frame_index, label, kappa)
+                else:
+                    frame = _FTHWorker._read_selected_frame_chunked(
+                        dataset, axis, frame_index, progress_callback, interrupted
+                    )
                 note = describe_reduction(shape, frame_axis, frame_index, label, kappa)
                 return np.squeeze(np.asarray(frame)).astype(np.float64), note
-            arr = np.squeeze(np.array(dataset)).astype(np.float64)
+            chunk_axis = next((i for i, size in enumerate(shape) if size > 1), 0)
+            arr = _FTHWorker._read_dataset_chunked(
+                dataset, chunk_axis, progress_callback, interrupted
+            )
+            arr = np.squeeze(arr).astype(np.float64)
         return reduce_stack(arr, frame_axis, frame_index, label, kappa)
 
     def run(self) -> None:
@@ -182,27 +335,102 @@ class _FTHWorker(QThread):
             single_source = None
             self.notes = []
 
+            def _make_jobs(entries, label, axis, index, kappa):
+                jobs = []
+                for i, (filename, ds_path) in enumerate(entries):
+                    tag = label if len(entries) == 1 else f"{label}[{i}]"
+                    read_bytes = self._estimate_read_bytes(
+                        filename, ds_path, axis, index
+                    )
+                    jobs.append(
+                        (filename, ds_path, axis, index, kappa, tag, read_bytes)
+                    )
+                return jobs
+
+            cl_jobs = _make_jobs(
+                self._cl, "CL", self._frame_axis, self._frame_index, self._kappa
+            )
+            cr_jobs = _make_jobs(
+                self._cr, "CR", self._frame_axis, self._frame_index, self._kappa
+            )
+            dark_jobs = _make_jobs(
+                [self._dark] if self._dark else [],
+                "Dark",
+                self._dark_frame_axis,
+                self._dark_frame_index,
+                self._dark_kappa,
+            )
+            total_bytes = max(
+                1, sum(job[-1] for job in cl_jobs + cr_jobs + dark_jobs)
+            )
+            completed_bytes = 0.0
+            last_percent = -1
+            last_stage = ""
+
+            def _report(stage: str, *, force: bool = False, final: bool = False) -> None:
+                nonlocal last_percent, last_stage
+                percent = (
+                    100
+                    if final
+                    else min(99, int(completed_bytes * 100.0 / total_bytes))
+                )
+                if force or percent != last_percent or stage != last_stage:
+                    self.progress.emit(percent, stage)
+                    last_percent = percent
+                    last_stage = stage
+
+            _report("Preparing load", force=True)
+
+            def _read_job(job):
+                filename, ds_path, axis, index, kappa, tag, read_bytes = job
+                fraction_seen = 0.0
+                _report(f"Loading {tag}", force=True)
+
+                def _on_read_progress(fraction: float) -> None:
+                    nonlocal completed_bytes, fraction_seen
+                    fraction = min(1.0, max(fraction_seen, float(fraction)))
+                    completed_bytes += (fraction - fraction_seen) * read_bytes
+                    fraction_seen = fraction
+                    _report(f"Loading {tag}")
+
+                def _on_processing() -> None:
+                    _report(f"Processing {tag}", force=True)
+
+                result = self._read_one(
+                    filename,
+                    ds_path,
+                    axis,
+                    index,
+                    kappa,
+                    tag,
+                    _on_read_progress,
+                    _on_processing,
+                    self.isInterruptionRequested,
+                )
+                # A third-party regular-file loader may not offer intermediate
+                # callbacks, but completion of the job is still exact.
+                if fraction_seen < 1.0:
+                    _on_read_progress(1.0)
+                return result
+
             # Reduce each dataset to one frame BEFORE summing across datasets.
             # The other order would add stacks together and only then pick a
             # frame out of the sum, which is a different quantity.
-            def _accumulate(entries, label):
+            def _accumulate(jobs):
                 total = None
-                for i, (fn, dp) in enumerate(entries):
+                for job in jobs:
                     if self.isInterruptionRequested():
                         return None
-                    tag = label if len(entries) == 1 else f"{label}[{i}]"
-                    arr, note = self._read_one(
-                        fn, dp, self._frame_axis, self._frame_index, self._kappa, tag
-                    )
+                    arr, note = _read_job(job)
                     if note:
                         self.notes.append(note)
                     total = arr if total is None else (total + arr)
                 return total
 
-            cl = _accumulate(self._cl, "CL")
+            cl = _accumulate(cl_jobs)
             if self.isInterruptionRequested():
                 return
-            cr = _accumulate(self._cr, "CR")
+            cr = _accumulate(cr_jobs)
             if self.isInterruptionRequested():
                 return
 
@@ -219,21 +447,18 @@ class _FTHWorker(QThread):
             if self.isInterruptionRequested():
                 return
             dark = None
-            if self._dark:
-                dark, note = self._read_one(
-                    *self._dark,
-                    self._dark_frame_axis,
-                    self._dark_frame_index,
-                    self._dark_kappa,
-                    "Dark",
-                )
+            if dark_jobs:
+                dark, note = _read_job(dark_jobs[0])
                 if note:
                     self.notes.append(note)
             if self.isInterruptionRequested():
                 return
             if single_source is not None:
                 logging.info("FTH single-dataset load: %s used as CL, CR set to zeros.", single_source)
+            _report("Finalizing load", force=True, final=True)
             self.finished.emit(cl, cr, dark)
+        except InterruptedError:
+            return
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1408,9 +1633,9 @@ class FTHReconstructionTool(QMainWindow):
         self._load_btn.setEnabled(False)
         self._pending_single_dataset_mode = not (cl_entry and cr_entry)
         self._set_status(
-            "Loading single dataset in background..."
+            "Loading single dataset: 0%"
             if self._pending_single_dataset_mode
-            else "Loading datasets in background..."
+            else "Loading datasets: 0%"
         )
 
         frame_axis, frame_index = self._frames.selection()
@@ -1426,6 +1651,7 @@ class FTHReconstructionTool(QMainWindow):
             dark_frame_index,
             self._dark_frames.kappa(),
         )
+        self._worker.progress.connect(self._on_load_progress)
         self._worker.finished.connect(self._on_load_finished)
         self._worker.error.connect(self._on_load_error)
         self._worker.start()
@@ -1517,6 +1743,12 @@ class FTHReconstructionTool(QMainWindow):
             f"Loaded OK ({mode_label}) - shape {cl.shape}, "
             f"centered to ({self._Nx}x{self._Ny}), X0={self._X0} Y0={self._Y0}{frames}"
         )
+
+    def _on_load_progress(self, percent: int, stage: str) -> None:
+        """Show byte-weighted background load progress in FTH and CDI."""
+        if self.sender() is not self._worker:
+            return
+        self._set_status(f"{stage}: {int(percent)}%")
 
     def _initialize_center_controls_for_loaded_shape(self, shape: tuple[int, int]) -> None:
         """Use the loaded image geometry instead of stale detector defaults."""

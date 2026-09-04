@@ -1227,8 +1227,11 @@ class CDIReconstructionTool(QMainWindow):
         main_lay.addWidget(splitter)
 
         scroll, lay = self._make_scroll_ctrl()
-        scroll.setMinimumWidth(480)
-        scroll.setMaximumWidth(620)
+        # Keep the reconstruction controls only slightly wider than the
+        # compact queue cards below. A high-DPI display otherwise lets this
+        # panel consume nearly the complete window and hide the live plots.
+        scroll.setMinimumWidth(400)
+        scroll.setMaximumWidth(410)
 
         # --- Algorithm sequence (multi-target pipeline) ---
         g_algo = QGroupBox("Algorithm Sequence")
@@ -1285,6 +1288,9 @@ class CDIReconstructionTool(QMainWindow):
             "Random phase",
             "Previous CDI reconstruction",
         ])
+        self._initial_guess_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         self._initial_guess_combo.setToolTip(
             "Support FFT: use the phase of fftshift(ifft2(ifftshift(support mask))).\n"
             "Random: independent random initializations (ensemble).\n"
@@ -1317,16 +1323,25 @@ class CDIReconstructionTool(QMainWindow):
         self._sw_sigma_spin.setValue(3.0)
         self._sw_sigma_spin.setSingleStep(0.5)
         self._sw_sigma_spin.setSuffix(" px")
+        self._sw_sigma_spin.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         fl_sw.addRow("Blur sigma:", self._sw_sigma_spin)
         self._sw_thresh_spin = QDoubleSpinBox()
         self._sw_thresh_spin.setRange(0.01, 0.99)
         self._sw_thresh_spin.setValue(0.18)
         self._sw_thresh_spin.setSingleStep(0.01)
         self._sw_thresh_spin.setDecimals(2)
+        self._sw_thresh_spin.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         fl_sw.addRow("Threshold:", self._sw_thresh_spin)
         self._sw_every_spin = QSpinBox()
         self._sw_every_spin.setRange(1, 500)
         self._sw_every_spin.setValue(20)
+        self._sw_every_spin.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         fl_sw.addRow("Update every N iters:", self._sw_every_spin)
         lay.addWidget(self._sw_group)
 
@@ -1375,7 +1390,7 @@ class CDIReconstructionTool(QMainWindow):
 
         splitter.addWidget(scroll)
         splitter.addWidget(right_glw)
-        splitter.setSizes([500, 900])
+        splitter.setSizes([410, 990])
 
         self._add_pipeline_target("CL+CR", "support", [("raar", 300), ("er", 50)])
         return tab
@@ -2883,23 +2898,23 @@ class CDIReconstructionTool(QMainWindow):
         src_combo.addItems(["CL+CR", "CL-CR", "CL", "CR"])
         src_combo.setCurrentText(data_source if data_source in ("CL+CR", "CL-CR", "CL", "CR") else "CL+CR")
         src_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        src_combo.setFixedWidth(82)
+        src_combo.setFixedWidth(76)
         src_combo.setToolTip("Fourier amplitude used for this target")
         _set_combo_light_palette(src_combo)
         mask_combo = QComboBox()
         mask_combo.addItems(["support", "feature", "support+feature"])
         mask_combo.setCurrentText(mask_mode if mask_mode in ("support", "feature", "support+feature") else "support")
         mask_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        mask_combo.setFixedWidth(124)
+        mask_combo.setFixedWidth(112)
         mask_combo.setToolTip(
             "support: exterior=0 constraint using group 0 only.\n"
             "feature: support + lock feature groups to reference values.\n"
             "support+feature: expanded support (all groups) + feature locking."
         )
         _set_combo_light_palette(mask_combo)
-        up_btn = QPushButton("↑"); up_btn.setFixedSize(22, 22)
-        dn_btn = QPushButton("↓"); dn_btn.setFixedSize(22, 22)
-        rm_btn = QPushButton("✕"); rm_btn.setFixedSize(22, 22)
+        up_btn = QPushButton("↑"); up_btn.setFixedSize(20, 22)
+        dn_btn = QPushButton("↓"); dn_btn.setFixedSize(20, 22)
+        rm_btn = QPushButton("✕"); rm_btn.setFixedSize(20, 22)
         hdr_lay.addWidget(lbl)
         hdr_lay.addWidget(src_combo)
         hdr_lay.addWidget(mask_combo)
@@ -2993,18 +3008,19 @@ class CDIReconstructionTool(QMainWindow):
             else "arctan (cold-start only)"
         )
         beta_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        beta_combo.setFixedWidth(186)
+        beta_combo.setFixedWidth(150)
         beta_combo.setToolTip("Beta schedule used by the next target.")
         _set_combo_light_palette(beta_combo)
         bg_chk = QCheckBox("bg-sub")
         bg_chk.setChecked(bool(bg_sub))
         bg_chk.setToolTip("Subtract 5th-percentile background before the next target.")
-        up_btn = QPushButton("↑"); up_btn.setFixedSize(22, 22)
-        dn_btn = QPushButton("↓"); dn_btn.setFixedSize(22, 22)
-        rm_btn = QPushButton("✕"); rm_btn.setFixedSize(22, 22)
+        up_btn = QPushButton("↑"); up_btn.setFixedSize(20, 22)
+        dn_btn = QPushButton("↓"); dn_btn.setFixedSize(20, 22)
+        rm_btn = QPushButton("✕"); rm_btn.setFixedSize(20, 22)
         beta_lbl = QLabel("β:")
         beta_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        # Row 0: label + operation + bg-sub + move/remove buttons
+        # Row 0: interval operation. Keep the action buttons on row 1 so this
+        # card does not force the complete reconstruction sidebar wider.
         row0 = QHBoxLayout()
         row0.setContentsMargins(0, 0, 0, 0)
         row0.setSpacing(3)
@@ -3012,18 +3028,18 @@ class CDIReconstructionTool(QMainWindow):
         row0.addWidget(op_combo)
         row0.addWidget(bg_chk)
         row0.addStretch()
-        row0.addWidget(up_btn)
-        row0.addWidget(dn_btn)
-        row0.addWidget(rm_btn)
         lay.addLayout(row0)
 
-        # Row 1: beta label + beta schedule combo (independent column widths)
+        # Row 1: beta schedule + move/remove buttons.
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(3)
         row1.addWidget(beta_lbl)
         row1.addWidget(beta_combo)
         row1.addStretch()
+        row1.addWidget(up_btn)
+        row1.addWidget(dn_btn)
+        row1.addWidget(rm_btn)
         lay.addLayout(row1)
 
         entry = {
@@ -3084,16 +3100,19 @@ class CDIReconstructionTool(QMainWindow):
                 target_labels.append(t['lbl'])
                 target_idx += 1
 
-        def _fit(labels: list) -> int:
+        def _fit(labels: list, maximum: int) -> int:
             if not labels:
                 return 0
-            w = max(lbl.fontMetrics().horizontalAdvance(lbl.text()) for lbl in labels) + 4
+            natural = max(
+                lbl.fontMetrics().horizontalAdvance(lbl.text()) for lbl in labels
+            ) + 4
+            w = min(natural, maximum)
             for lbl in labels:
                 lbl.setFixedWidth(w)
             return w
 
-        target_label_width = _fit(target_labels)
-        _fit(interval_labels)
+        target_label_width = _fit(target_labels, 82)
+        _fit(interval_labels, 96)
         for t in self._pipeline_targets:
             if t.get('kind') == 'target' and 'steps_lay' in t:
                 t['steps_lay'].setContentsMargins(target_label_width + 3, 0, 0, 0)
@@ -3130,17 +3149,18 @@ class CDIReconstructionTool(QMainWindow):
         cb.addItems(CDI_ALGORITHM_LABELS.values())
         cb.setCurrentText(CDI_ALGORITHM_LABELS.get(algo, CDI_ALGORITHM_LABELS["raar"]))
         cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        cb.setFixedWidth(140)
         _set_combo_light_palette(cb)
 
         sp = QSpinBox()
         sp.setRange(1, 99999)
         sp.setValue(n)
         sp.setSuffix(" iter")
-        sp.setFixedWidth(120)
+        sp.setFixedWidth(94)
         _set_widget_light_palette(sp)
 
         rm_btn = QPushButton("✕")
-        rm_btn.setFixedSize(22, 22)
+        rm_btn.setFixedSize(20, 22)
         rm_btn.clicked.connect(lambda: self._remove_target_step(entry, row_w))
 
         row_lay.addWidget(cb)

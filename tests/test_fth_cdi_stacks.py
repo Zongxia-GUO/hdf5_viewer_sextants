@@ -49,6 +49,26 @@ def test_the_reader_averages_a_stack_and_says_it_did(scan):
     assert note == "CL: mean of 7 frames (axis 0)"
 
 
+def test_chunked_read_progress_does_not_change_the_result(scan, monkeypatch):
+    monkeypatch.setattr(_FTHWorker, "_READ_CHUNK_BYTES", 1024)
+    fractions = []
+
+    arr, note = _FTHWorker._read_one(
+        str(scan),
+        STACK_KEY,
+        0,
+        MEAN_OF_FRAMES,
+        label="CL",
+        progress_callback=fractions.append,
+    )
+
+    np.testing.assert_allclose(arr, STACK.mean(axis=0))
+    assert note == "CL: mean of 7 frames (axis 0)"
+    assert len(fractions) > 1
+    assert fractions == sorted(fractions)
+    assert fractions[-1] == 1.0
+
+
 @pytest.mark.parametrize("axis,index", [(0, 3), (1, 5), (2, 9)])
 def test_the_reader_takes_the_frame_it_was_asked_for(scan, axis, index):
     arr, note = _FTHWorker._read_one(str(scan), STACK_KEY, axis, index, label="CL")
@@ -129,6 +149,24 @@ def test_a_2d_load_reports_no_frame_note(scan):
     worker.run()
 
     assert worker.notes == []
+
+
+def test_worker_reports_monotonic_byte_weighted_progress(scan, monkeypatch):
+    monkeypatch.setattr(_FTHWorker, "_READ_CHUNK_BYTES", 1024)
+    stack_entry = (str(scan), STACK_KEY)
+    flat_entry = (str(scan), FLAT_KEY)
+    worker = _FTHWorker([stack_entry], [flat_entry], None, 0, MEAN_OF_FRAMES)
+    events = []
+    worker.progress.connect(lambda percent, stage: events.append((percent, stage)))
+
+    worker.run()
+
+    percentages = [percent for percent, _stage in events]
+    assert percentages == sorted(percentages)
+    assert events[0] == (0, "Preparing load")
+    assert events[-1] == (100, "Finalizing load")
+    assert any(stage == "Processing CL" for _percent, stage in events)
+    assert any(stage == "Loading CR" for _percent, stage in events)
 
 
 # ── The FTH window ────────────────────────────────────────────────────── #
@@ -279,7 +317,8 @@ def test_the_cdi_window_gets_the_same_frame_controls(qapp, scan):
         first_splitter = cdi._tabs.widget(0).layout().itemAt(0).widget()
         third_splitter = cdi._tabs.widget(2).layout().itemAt(0).widget()
         assert first_splitter.widget(0).minimumWidth() >= 440
-        assert third_splitter.widget(0).minimumWidth() >= 480
+        assert third_splitter.widget(0).minimumWidth() == 400
+        assert third_splitter.widget(0).maximumWidth() == 410
     finally:
         cdi.deleteLater()
 
@@ -316,3 +355,104 @@ def test_a_singleton_axis_is_not_a_stack(qapp, tmp_path):
 
         np.testing.assert_allclose(arr, base, err_msg=key)
         assert note == "", key
+
+
+# ── The chunked reader must be invisible in the result ────────────────── #
+#
+# Reading a dataset in slabs is a change to *how* the bytes arrive, so the one
+# thing it must never do is change what they are. These check that across the
+# dtypes a detector actually writes, every axis, and a chunk budget small
+# enough to force many slabs.
+
+CHUNK_CASES = {
+    "f32": np.random.RandomState(1).rand(9, 40, 30).astype(np.float32),
+    "f64": np.random.RandomState(2).rand(5, 20, 20).astype(np.float64),
+    "u16": (np.random.RandomState(3).rand(7, 16, 24) * 60000).astype(np.uint16),
+    "flat": np.random.RandomState(4).rand(32, 32).astype(np.float32),
+    "lead1": np.random.RandomState(5).rand(1, 24, 24).astype(np.float32),
+}
+
+
+@pytest.fixture
+def chunky(tmp_path):
+    path = tmp_path / "chunky.h5"
+    with h5py.File(path, "w") as f:
+        for key, value in CHUNK_CASES.items():
+            f.create_dataset(key, data=value)
+    return path
+
+
+@pytest.mark.parametrize("key", list(CHUNK_CASES))
+def test_a_chunked_read_returns_the_whole_dataset_unchanged(chunky, key):
+    want = CHUNK_CASES[key]
+    with h5py.File(chunky, "r") as f:
+        for axis in range(want.ndim):
+            got = _FTHWorker._read_dataset_chunked(f[key], axis, None, None)
+
+            np.testing.assert_array_equal(got, want, err_msg=f"{key} axis {axis}")
+            assert got.dtype == want.dtype, f"{key} axis {axis}"
+
+
+@pytest.mark.parametrize("key", ["f32", "f64", "u16"])
+def test_a_chunked_frame_read_matches_taking_that_frame(chunky, key):
+    want = CHUNK_CASES[key]
+    with h5py.File(chunky, "r") as f:
+        for axis in range(want.ndim):
+            for index in (0, want.shape[axis] // 2, want.shape[axis] - 1):
+                got = _FTHWorker._read_selected_frame_chunked(
+                    f[key], axis, index, None, None)
+
+                np.testing.assert_array_equal(
+                    got, np.take(want, index, axis=axis),
+                    err_msg=f"{key} axis {axis} index {index}")
+
+
+def test_a_frame_index_past_the_end_is_clamped(chunky):
+    """Wrapping would hand back a different frame than the one asked for."""
+    with h5py.File(chunky, "r") as f:
+        got = _FTHWorker._read_selected_frame_chunked(f["f32"], 0, 999, None, None)
+
+    np.testing.assert_array_equal(got, CHUNK_CASES["f32"][-1])
+
+
+def test_many_small_slabs_give_the_same_answer_as_one(chunky, monkeypatch):
+    """The slab size is a memory budget, not part of the arithmetic."""
+    monkeypatch.setattr(_FTHWorker, "_READ_CHUNK_BYTES", 64)
+    with h5py.File(chunky, "r") as f:
+        whole = _FTHWorker._read_dataset_chunked(f["f32"], 0, None, None)
+        frame = _FTHWorker._read_selected_frame_chunked(f["f32"], 1, 3, None, None)
+
+    np.testing.assert_array_equal(whole, CHUNK_CASES["f32"])
+    np.testing.assert_array_equal(frame, np.take(CHUNK_CASES["f32"], 3, axis=1))
+
+
+def test_a_read_can_be_interrupted_part_way(chunky, monkeypatch):
+    """Reading in slabs is what makes a long load abandonable; without the
+    check it would only be a memory bound."""
+    monkeypatch.setattr(_FTHWorker, "_READ_CHUNK_BYTES", 64)
+    checks = []
+
+    def stop_after_two():
+        checks.append(True)
+        return len(checks) > 2
+
+    with h5py.File(chunky, "r") as f:
+        with pytest.raises(InterruptedError):
+            _FTHWorker._read_dataset_chunked(f["f32"], 0, None, stop_after_two)
+
+    assert len(checks) == 3, "it should stop at the first check that says so"
+
+
+def test_the_dark_scan_has_its_own_frame_choice(qapp, scan):
+    """A dark is often a single exposure where the data is a stack, so it
+    cannot be forced to share the data's frame selector."""
+    tool = FTHReconstructionTool(opened_files=(scan,), dataset_full_keys_2d=[])
+    try:
+        assert tool._dark_frames is not tool._frames
+        assert tool._dark_frames_group.isVisibleTo(tool) is False
+
+        tool._dark_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
+
+        assert tool._dark_frames_group.isVisibleTo(tool) is True
+    finally:
+        tool.deleteLater()
