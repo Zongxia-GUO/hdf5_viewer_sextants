@@ -204,3 +204,47 @@ def _timed(fn):
     start = time.perf_counter()
     fn()
     return time.perf_counter() - start
+
+
+# ── The Focus controls start at this beamline's geometry ──────────────── #
+
+def test_the_focus_defaults_are_the_beamline_geometry(tool):
+    assert tool._focus_energy.value() == pytest.approx(778.0)
+    assert tool._focus_detector_distance.value() == pytest.approx(400.0)
+    assert tool._focus_pixel_size.value() == pytest.approx(11.0)
+
+
+def test_a_locked_set_without_focus_keys_falls_back_to_the_same_numbers(tool):
+    """The defaults were written out twice — on the widgets and as the
+    fallback here — so they could be changed in one place and not the other,
+    and a locked set from before those keys existed would then quietly
+    reconstruct with the old detector."""
+    from src.gui import fth_reconstruction_tool as mod
+
+    cl, cr = _pair()
+    tool._on_load_finished(cl, cr, None)
+    tool._locked_params = {"center_x": tool._t1_xmid.value(),
+                           "center_y": tool._t1_ymid.value()}
+
+    tool._apply_locked_params_to_current_data()
+
+    assert tool._focus_energy.value() == pytest.approx(mod.FOCUS_DEFAULT_ENERGY_EV)
+    assert tool._focus_detector_distance.value() == pytest.approx(
+        mod.FOCUS_DEFAULT_DETECTOR_DISTANCE_MM)
+    assert tool._focus_pixel_size.value() == pytest.approx(
+        mod.FOCUS_DEFAULT_PIXEL_SIZE_UM)
+
+
+def test_a_locked_set_that_carries_focus_keys_still_wins(tool):
+    """The defaults are a starting point, not an override."""
+    cl, cr = _pair()
+    tool._on_load_finished(cl, cr, None)
+    tool._locked_params = {"focus_energy_ev": 1200.0,
+                           "focus_detector_distance_mm": 250.0,
+                           "focus_pixel_size_um": 6.5}
+
+    tool._apply_locked_params_to_current_data()
+
+    assert tool._focus_energy.value() == pytest.approx(1200.0)
+    assert tool._focus_detector_distance.value() == pytest.approx(250.0)
+    assert tool._focus_pixel_size.value() == pytest.approx(6.5)

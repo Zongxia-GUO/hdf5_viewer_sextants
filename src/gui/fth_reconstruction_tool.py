@@ -79,6 +79,14 @@ from src.recon.fth import (
 )
 
 # Keep colormap options consistent with the main ImageView2DEnhanced toolbar.
+# The beamline's own geometry, which is what the Focus controls start at.
+# Named here because they were written out twice — once on the widgets and
+# once as the fallback for a locked-parameter set that predates a key — and
+# two copies of a default is one chance to change only one of them.
+FOCUS_DEFAULT_ENERGY_EV = 778.0
+FOCUS_DEFAULT_DETECTOR_DISTANCE_MM = 400.0
+FOCUS_DEFAULT_PIXEL_SIZE_UM = 11.0
+
 FTH_COLORMAPS = [
     "gray",
     "viridis",
@@ -1371,21 +1379,21 @@ class FTHReconstructionTool(QMainWindow):
         self._focus_energy = QDoubleSpinBox()
         self._focus_energy.setRange(1.0, 100000.0)
         self._focus_energy.setDecimals(3)
-        self._focus_energy.setValue(779.5)
+        self._focus_energy.setValue(FOCUS_DEFAULT_ENERGY_EV)
         self._focus_energy.setSuffix(' eV')
         focus_form.addRow('Photon energy:', self._focus_energy)
 
         self._focus_detector_distance = QDoubleSpinBox()
         self._focus_detector_distance.setRange(0.001, 1000000.0)
         self._focus_detector_distance.setDecimals(3)
-        self._focus_detector_distance.setValue(180.0)
+        self._focus_detector_distance.setValue(FOCUS_DEFAULT_DETECTOR_DISTANCE_MM)
         self._focus_detector_distance.setSuffix(' mm')
         focus_form.addRow('Detector distance:', self._focus_detector_distance)
 
         self._focus_pixel_size = QDoubleSpinBox()
         self._focus_pixel_size.setRange(0.001, 1000000.0)
         self._focus_pixel_size.setDecimals(3)
-        self._focus_pixel_size.setValue(20.0)
+        self._focus_pixel_size.setValue(FOCUS_DEFAULT_PIXEL_SIZE_UM)
         self._focus_pixel_size.setSuffix(' um')
         focus_form.addRow('Detector pixel size:', self._focus_pixel_size)
 
@@ -1861,11 +1869,11 @@ class FTHReconstructionTool(QMainWindow):
                 min(self._focus_distance_slider.maximum(), slider_value),
             )
             self._focus_distance_slider.setValue(slider_value)
-            self._focus_energy.setValue(float(lp.get('focus_energy_ev', 779.5)))
+            self._focus_energy.setValue(float(lp.get('focus_energy_ev', FOCUS_DEFAULT_ENERGY_EV)))
             self._focus_detector_distance.setValue(
-                float(lp.get('focus_detector_distance_mm', 180.0))
+                float(lp.get('focus_detector_distance_mm', FOCUS_DEFAULT_DETECTOR_DISTANCE_MM))
             )
-            self._focus_pixel_size.setValue(float(lp.get('focus_pixel_size_um', 20.0)))
+            self._focus_pixel_size.setValue(float(lp.get('focus_pixel_size_um', FOCUS_DEFAULT_PIXEL_SIZE_UM)))
             self._focus_quantize.setChecked(bool(lp.get('focus_quantize_wavelength', True)))
         finally:
             for widget, blocked in zip(focus_widgets, blocked_states):
