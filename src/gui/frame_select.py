@@ -68,10 +68,11 @@ METHOD_CHOICES = (
     ("Clipped mean", CLIPPED_MEAN_OF_FRAMES),
 )
 
-#: Widths that hold the longest entry without stretching the panel.
-AXIS_COMBO_WIDTH = 78
-METHOD_COMBO_WIDTH = 108
-PARAM_WIDTH = 66
+#: Widths that keep axis, method, and parameter text fully visible while the
+#: selector remains on one row in the FTH/CDI input sidebar.
+AXIS_COMBO_WIDTH = 88
+METHOD_COMBO_WIDTH = 118
+PARAM_WIDTH = 108
 
 #: How long to wait after the last edit before reloading. A clipped mean of a
 #: 100x512x512 stack takes about a second, and the spin box arrows fire once

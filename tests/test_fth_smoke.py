@@ -330,3 +330,85 @@ def test_page_four_still_builds_a_roi_and_displays_it(qapp):
         assert np.all(np.isfinite(roi))
     finally:
         tool.deleteLater()
+
+
+def test_focus_is_opt_in_and_zero_distance_keeps_the_old_result(qapp):
+    tool = _prepare_tool_with_arrays(qapp, n=64)
+    try:
+        rng = np.random.default_rng(17)
+        holo = rng.normal(size=(tool._Nx, tool._Ny))
+        tool._Holo2_S1 = holo.copy()
+        tool._Holo2_S2 = holo.copy()
+
+        assert tool._focus_group.isChecked() is False
+        assert tool._compute_fth_only()
+        old_result = tool._FTH_S1.copy()
+
+        tool._focus_group.setChecked(True)
+        tool._focus_update_timer.stop()
+        assert tool._compute_fth_only(reset_display_scale=False)
+        assert np.array_equal(tool._FTH_S1, old_result)
+    finally:
+        tool.deleteLater()
+
+
+def test_focus_reconstructs_from_hologram_without_resetting_display(qapp):
+    tool = _prepare_tool_with_arrays(qapp, n=64)
+    try:
+        rng = np.random.default_rng(19)
+        holo = rng.normal(size=(tool._Nx, tool._Ny))
+        tool._Holo2_S1 = holo.copy()
+        tool._Holo2_S2 = (2.0 * holo).copy()
+        assert tool._compute_fth_only()
+        old_result = tool._FTH_S1.copy()
+
+        tool._phase_scale_slider.setValue(73)
+        tool._rs_scale_slider.setValue(165)
+        tool._t4_ph_slider.setValue(-81)
+        tool._t4_rs_slider.setValue(142)
+        tool._t4_sliders_touched = True
+
+        tool._focus_group.setChecked(True)
+        tool._focus_distance.setValue(2.3)
+        tool._focus_update_timer.stop()
+        assert tool._compute_fth_only(reset_display_scale=False)
+
+        assert not np.allclose(tool._FTH_S1, old_result)
+        assert tool._phase_scale_slider.value() == 73
+        assert tool._rs_scale_slider.value() == 165
+        assert tool._t4_ph_slider.value() == -81
+        assert tool._t4_rs_slider.value() == 142
+        assert tool._t4_sliders_touched is True
+    finally:
+        tool.deleteLater()
+
+
+def test_focus_parameters_are_part_of_lock_roundtrip(qapp):
+    tool = _prepare_tool_with_arrays(qapp)
+    try:
+        tool._focus_group.setChecked(True)
+        tool._focus_distance.setValue(-3.25)
+        tool._focus_energy.setValue(852.7)
+        tool._focus_detector_distance.setValue(245.0)
+        tool._focus_pixel_size.setValue(13.5)
+        tool._focus_quantize.setChecked(False)
+        tool._focus_update_timer.stop()
+        tool._lock_current_params()
+
+        tool._focus_group.setChecked(False)
+        tool._focus_distance.setValue(0.0)
+        tool._focus_energy.setValue(500.0)
+        tool._focus_detector_distance.setValue(100.0)
+        tool._focus_pixel_size.setValue(20.0)
+        tool._focus_quantize.setChecked(True)
+        tool._focus_update_timer.stop()
+
+        tool._apply_locked_params_to_current_data()
+        assert tool._focus_group.isChecked() is True
+        assert tool._focus_distance.value() == -3.25
+        assert tool._focus_energy.value() == 852.7
+        assert tool._focus_detector_distance.value() == 245.0
+        assert tool._focus_pixel_size.value() == 13.5
+        assert tool._focus_quantize.isChecked() is False
+    finally:
+        tool.deleteLater()

@@ -10,6 +10,10 @@ from src.recon.fth import (
     estimate_balance_ratio,
     fth_transform,
     line_gaussian_filter,
+    photon_wavelength,
+    propagate_hologram,
+    propagation_kernel,
+    quantize_propagation_distance,
 )
 
 
@@ -105,3 +109,60 @@ def test_estimate_balance_ratio_no_valid_pixels_returns_one():
     a = np.zeros((8, 8))
     b = np.zeros((8, 8))
     assert estimate_balance_ratio(a, b) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# propagation / focus
+# ---------------------------------------------------------------------------
+
+
+def test_photon_wavelength_for_1239_ev_is_one_nanometre():
+    assert photon_wavelength(1239.841984) == pytest.approx(1e-9, rel=2e-7)
+
+
+def test_propagation_zero_distance_is_an_exact_complex_copy():
+    holo = np.arange(24, dtype=float).reshape(4, 6)
+    out = propagate_hologram(holo, 0.0, 0.18, 20e-6, 779.5)
+    assert np.iscomplexobj(out)
+    assert np.array_equal(out, holo)
+    assert out is not holo
+
+
+def test_propagation_changes_phase_not_magnitude_and_is_reversible():
+    rng = np.random.default_rng(5)
+    holo = rng.normal(size=(24, 40)) + 1j * rng.normal(size=(24, 40))
+    forward = propagate_hologram(
+        holo, 2.3e-6, 0.18, 20e-6, 779.5, quantize_wavelength=False
+    )
+    backward = propagate_hologram(
+        forward, -2.3e-6, 0.18, 20e-6, 779.5, quantize_wavelength=False
+    )
+    assert forward.shape == holo.shape
+    assert np.allclose(np.abs(forward), np.abs(holo), atol=1e-12)
+    assert np.allclose(backward, holo, atol=1e-11)
+
+
+def test_propagation_distance_quantization_is_symmetric():
+    wavelength = photon_wavelength(779.5)
+    positive = quantize_propagation_distance(2.3e-6, wavelength)
+    negative = quantize_propagation_distance(-2.3e-6, wavelength)
+    assert positive / wavelength == pytest.approx(round(2.3e-6 / wavelength))
+    assert negative == pytest.approx(-positive)
+
+
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        dict(detector_distance_m=0.0, pixel_size_m=20e-6, energy_ev=779.5),
+        dict(detector_distance_m=0.18, pixel_size_m=0.0, energy_ev=779.5),
+        dict(detector_distance_m=0.18, pixel_size_m=20e-6, energy_ev=0.0),
+    ],
+)
+def test_propagation_rejects_invalid_physical_parameters(kwargs):
+    with pytest.raises(ValueError):
+        propagation_kernel((16, 16), 1e-6, **kwargs)
+
+
+def test_propagation_rejects_non_2d_hologram():
+    with pytest.raises(ValueError, match='two-dimensional'):
+        propagate_hologram(np.zeros((2, 3, 4)), 1e-6, 0.18, 20e-6, 779.5)

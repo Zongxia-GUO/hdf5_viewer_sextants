@@ -50,7 +50,8 @@ and CDI phase retrieval), scattering-data calibration, and multi-dataset compari
    (X → q conversion) with an FTH-style image layout; the `to q` / `to pixel` axis switch sits
    in the *Q Geometry* box next to the energy, pixel size and distance it is computed from
  - **FTH Reconstruction** — Fourier-Transform Holography / HERALDO reconstruction
-   (CL/CR alignment, beamstop, differential & Gaussian line filters)
+   (CL/CR alignment, beamstop, differential & Gaussian line filters, and interactive
+   free-space propagation focus using the photon energy and detector geometry)
  - **CDI Reconstruction** — coherent diffraction imaging phase retrieval
    (ER / HIO / RAAR with optional shrinkwrap; embeds the FTH alignment and filter steps so the
    FTH support can seed the CDI initial guess)

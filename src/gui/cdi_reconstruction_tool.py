@@ -1227,6 +1227,8 @@ class CDIReconstructionTool(QMainWindow):
         main_lay.addWidget(splitter)
 
         scroll, lay = self._make_scroll_ctrl()
+        scroll.setMinimumWidth(480)
+        scroll.setMaximumWidth(620)
 
         # --- Algorithm sequence (multi-target pipeline) ---
         g_algo = QGroupBox("Algorithm Sequence")
@@ -1373,7 +1375,7 @@ class CDIReconstructionTool(QMainWindow):
 
         splitter.addWidget(scroll)
         splitter.addWidget(right_glw)
-        splitter.setSizes([420, 980])
+        splitter.setSizes([500, 900])
 
         self._add_pipeline_target("CL+CR", "support", [("raar", 300), ("er", 50)])
         return tab

@@ -23,7 +23,7 @@ from typing import Optional
 import h5py
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QBuffer, QByteArray, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, QBuffer, QByteArray, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QAction, QCursor, QImage, QPainter, QPixmap, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
@@ -69,8 +69,12 @@ from src.recon.fth import (
     bs_step as _bs_step,
     differential_filter_kernel as _differential_filter_kernel,
     estimate_balance_ratio as _estimate_balance_ratio_impl,
+    fth_phase_correction as _fth_phase_correction,
     fth_transform as _fth_transform,
     line_gaussian_filter as _line_gaussian_filter,
+    photon_wavelength as _photon_wavelength,
+    propagation_kernel as _propagation_kernel,
+    quantize_propagation_distance as _quantize_propagation_distance,
 )
 
 # Keep colormap options consistent with the main ImageView2DEnhanced toolbar.
@@ -122,6 +126,9 @@ class _FTHWorker(QThread):
         frame_axis: int = 0,
         frame_index: int = 0,
         kappa: float = DEFAULT_KAPPA,
+        dark_frame_axis: int | None = None,
+        dark_frame_index: int | None = None,
+        dark_kappa: float | None = None,
     ) -> None:
         super().__init__()
         self._cl   = cl_entries
@@ -130,6 +137,9 @@ class _FTHWorker(QThread):
         self._frame_axis = int(frame_axis)
         self._frame_index = int(frame_index)
         self._kappa = float(kappa)
+        self._dark_frame_axis = int(frame_axis if dark_frame_axis is None else dark_frame_axis)
+        self._dark_frame_index = int(frame_index if dark_frame_index is None else dark_frame_index)
+        self._dark_kappa = float(kappa if dark_kappa is None else dark_kappa)
         self.notes: list[str] = []
 
     @staticmethod
@@ -211,7 +221,11 @@ class _FTHWorker(QThread):
             dark = None
             if self._dark:
                 dark, note = self._read_one(
-                    *self._dark, self._frame_axis, self._frame_index, self._kappa, "Dark"
+                    *self._dark,
+                    self._dark_frame_axis,
+                    self._dark_frame_index,
+                    self._dark_kappa,
+                    "Dark",
                 )
                 if note:
                     self.notes.append(note)
@@ -227,6 +241,39 @@ class _FTHWorker(QThread):
 # ---------------------------------------------------------------------------
 # Main tool window
 # ---------------------------------------------------------------------------
+
+def _clean_non_finite(cl, cr, dark):
+    """Replace NaN and inf with zero, and report how many there were.
+
+    An FFT spreads every input sample across every output sample, so one bad
+    pixel is not one bad pixel in the reconstruction — it is the whole
+    reconstruction. Measured on a 256x256 pair: a single NaN among 65536 left
+    0 of 65536 output pixels finite, and the tool still reported "FTH
+    computed." A blank panel and a success message is the worst way to fail.
+
+    Detectors do write NaN to mark pixels they do not trust, so this is not a
+    hypothetical. Zero is the right filler here because the beamstop mask
+    already puts zeros into the hologram; a bad pixel becomes another masked
+    one rather than a discontinuity.
+
+    The count is returned rather than swallowed: silently repairing someone's
+    data is how a detector fault goes unnoticed for a whole beamtime.
+    """
+    total = 0
+    out = []
+    for arr in (cl, cr, dark):
+        if arr is None:
+            out.append(None)
+            continue
+        arr = np.asarray(arr)
+        bad = ~np.isfinite(arr)
+        count = int(bad.sum())
+        if count:
+            arr = np.where(bad, 0.0, arr)
+            total += count
+        out.append(arr)
+    return out[0], out[1], out[2], total
+
 
 class FTHReconstructionTool(QMainWindow):
     """
@@ -281,6 +328,7 @@ class FTHReconstructionTool(QMainWindow):
         self._Y0:  int = 0    # col center
         self._Nx:  int = 0    # rows
         self._Ny:  int = 0    # cols
+        self._fth_phase: Optional[np.ndarray] = None  # centering ramp, built with the grids
         self._xmat: Optional[np.ndarray] = None   # row index grid (Nx x Ny)
         self._ymat: Optional[np.ndarray] = None   # col index grid
 
@@ -345,6 +393,15 @@ class FTHReconstructionTool(QMainWindow):
         self._worker: Optional[_FTHWorker] = None
         self._locked_params: Optional[dict] = None
         self._apply_locked_on_next_load: bool = False
+
+        # Focus parameters follow the reference FTH workflow. Physical values
+        # are kept in the units shown by the UI and converted to SI only at the
+        # numerical-kernel boundary.
+        self._focus_actual_distance_um: float = 0.0
+        self._focus_update_timer = QTimer(self)
+        self._focus_update_timer.setSingleShot(True)
+        self._focus_update_timer.setInterval(90)
+        self._focus_update_timer.timeout.connect(self._apply_focus_update)
 
         self._build_ui()
 
@@ -514,6 +571,8 @@ class FTHReconstructionTool(QMainWindow):
 
         # -- left controls ----------------------------------------------
         scroll, lay = self._make_scroll_ctrl()
+        scroll.setMinimumWidth(440)
+        scroll.setMaximumWidth(560)
 
         # CL dataset
         g_cl = QGroupBox("CL Dataset  (circular left polarisation)")
@@ -531,7 +590,19 @@ class FTHReconstructionTool(QMainWindow):
         fl_cr.addRow("Dataset:", self._cr_combo)
         lay.addWidget(g_cr)
 
-        # Dark scan (optional)
+        # CL and CR describe the same acquisition and therefore share one frame
+        # selection. Dark may be recorded as a different stack and has its own.
+        g_frames = QGroupBox("CL / CR Frames")
+        fl_fr = QFormLayout(g_frames)
+        self._frames = FrameSelector(self)
+        self._frames.changed.connect(self._on_signal_frame_selection_changed)
+        fl_fr.addRow(self._frames)
+        self._frames_group = g_frames
+        g_frames.setVisible(False)
+        lay.addWidget(g_frames)
+
+        # Dark is a separate acquisition: keep its path next to its own frame
+        # selector instead of splitting the CL/CR controls across the panel.
         g_dark = QGroupBox("Dark Scan  (optional)")
         fl_dk = QFormLayout(g_dark)
         self._dark_combo = FTHDatasetCombo("-- no dark scan --")
@@ -539,18 +610,14 @@ class FTHReconstructionTool(QMainWindow):
         fl_dk.addRow("Dataset:", self._dark_combo)
         lay.addWidget(g_dark)
 
-        # Which frame of a stack to reconstruct. One control for CL, CR and the
-        # dark together: they have to be the same shape to combine anyway, and
-        # three copies of the question would be three chances to answer it
-        # differently. Hidden unless something selected is a stack.
-        g_frames = QGroupBox("Frames")
-        fl_fr = QFormLayout(g_frames)
-        self._frames = FrameSelector(self)
-        self._frames.changed.connect(self._on_frame_selection_changed)
-        fl_fr.addRow(self._frames)
-        self._frames_group = g_frames
-        g_frames.setVisible(False)
-        lay.addWidget(g_frames)
+        g_dark_frames = QGroupBox("Dark Frames")
+        fl_dark_fr = QFormLayout(g_dark_frames)
+        self._dark_frames = FrameSelector(self)
+        self._dark_frames.changed.connect(self._on_dark_frame_selection_changed)
+        fl_dark_fr.addRow(self._dark_frames)
+        self._dark_frames_group = g_dark_frames
+        g_dark_frames.setVisible(False)
+        lay.addWidget(g_dark_frames)
         for combo in (self._cl_combo, self._cr_combo, self._dark_combo):
             combo.currentTextChanged.connect(self._refresh_frame_controls)
 
@@ -780,7 +847,7 @@ class FTHReconstructionTool(QMainWindow):
         right_layout.addWidget(self._t1_glw, stretch=1)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([390, 1010])    # Tab 1 needs a wider left panel than Tab 2/3
+        splitter.setSizes([460, 940])
         splitter.setStretchFactor(0, 0)   # left panel: fixed width on window resize
         splitter.setStretchFactor(1, 1)   # right panel: absorbs all resize
         return tab
@@ -1021,6 +1088,8 @@ class FTHReconstructionTool(QMainWindow):
         tab.layout().setContentsMargins(0, 0, 0, 0)
 
         scroll, lay = self._make_scroll_ctrl()
+        scroll.setMinimumWidth(360)
+        scroll.setMaximumWidth(480)
 
         # ROI selector
         g_sel = QGroupBox("ROI Selection")
@@ -1053,6 +1122,66 @@ class FTHReconstructionTool(QMainWindow):
         self._roi_size_slider.valueChanged.connect(_on_t4_roi_slider)
         self._t4_roi_size.valueChanged.connect(_on_t4_roi_spinbox)
         lay.addWidget(g_sel)
+
+        # Physical propagation focus. The operation is applied to the complete
+        # filtered detector hologram before the FTH transform; the ROI is only
+        # used for viewing the result.
+        self._focus_group = QGroupBox('Focus / Propagation')
+        self._focus_group.setCheckable(True)
+        self._focus_group.setChecked(False)
+        focus_form = QFormLayout(self._focus_group)
+
+        self._focus_distance_slider = QSlider(Qt.Orientation.Horizontal)
+        self._focus_distance_slider.setRange(-1000, 1000)
+        self._focus_distance_slider.setValue(0)
+        self._focus_distance_slider.setToolTip('Propagation distance in 0.01 um steps')
+        self._focus_distance = QDoubleSpinBox()
+        self._focus_distance.setRange(-10000.0, 10000.0)
+        self._focus_distance.setDecimals(3)
+        self._focus_distance.setSingleStep(0.01)
+        self._focus_distance.setSuffix(' um')
+        focus_form.addRow('', self._focus_distance_slider)
+        focus_form.addRow('Distance:', self._focus_distance)
+
+        self._focus_energy = QDoubleSpinBox()
+        self._focus_energy.setRange(1.0, 100000.0)
+        self._focus_energy.setDecimals(3)
+        self._focus_energy.setValue(779.5)
+        self._focus_energy.setSuffix(' eV')
+        focus_form.addRow('Photon energy:', self._focus_energy)
+
+        self._focus_detector_distance = QDoubleSpinBox()
+        self._focus_detector_distance.setRange(0.001, 1000000.0)
+        self._focus_detector_distance.setDecimals(3)
+        self._focus_detector_distance.setValue(180.0)
+        self._focus_detector_distance.setSuffix(' mm')
+        focus_form.addRow('Detector distance:', self._focus_detector_distance)
+
+        self._focus_pixel_size = QDoubleSpinBox()
+        self._focus_pixel_size.setRange(0.001, 1000000.0)
+        self._focus_pixel_size.setDecimals(3)
+        self._focus_pixel_size.setValue(20.0)
+        self._focus_pixel_size.setSuffix(' um')
+        focus_form.addRow('Detector pixel size:', self._focus_pixel_size)
+
+        self._focus_quantize = QCheckBox('Round distance to whole wavelengths')
+        self._focus_quantize.setChecked(True)
+        focus_form.addRow(self._focus_quantize)
+        self._focus_actual_label = QLabel('Applied distance: 0.000 um')
+        focus_form.addRow(self._focus_actual_label)
+        self._focus_reset = QPushButton('Reset Focus')
+        self._focus_reset.clicked.connect(self._reset_focus)
+        focus_form.addRow(self._focus_reset)
+
+        self._focus_group.toggled.connect(self._on_focus_parameters_changed)
+        self._focus_distance_slider.valueChanged.connect(self._on_focus_slider_changed)
+        self._focus_distance_slider.sliderReleased.connect(self._apply_focus_update)
+        self._focus_distance.valueChanged.connect(self._on_focus_distance_changed)
+        self._focus_energy.editingFinished.connect(self._on_focus_parameters_changed)
+        self._focus_detector_distance.editingFinished.connect(self._on_focus_parameters_changed)
+        self._focus_pixel_size.editingFinished.connect(self._on_focus_parameters_changed)
+        self._focus_quantize.toggled.connect(self._on_focus_parameters_changed)
+        lay.addWidget(self._focus_group)
 
         # Amplitude
         g_amp = QGroupBox("Display Amplitude")
@@ -1149,7 +1278,7 @@ class FTHReconstructionTool(QMainWindow):
         self._t4_glw.scene().sigMouseClicked.connect(self._on_t4_scene_clicked)
 
         splitter.addWidget(self._t4_glw)
-        splitter.setSizes([290, 1110])
+        splitter.setSizes([380, 1020])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         return tab
@@ -1203,9 +1332,9 @@ class FTHReconstructionTool(QMainWindow):
     # TAB 1 -Data loading & display
     # ==================================================================
 
-    def _stack_shape(self) -> tuple[int, ...] | None:
-        """The shape of the first selected slot that holds a stack."""
-        for combo in (self._cl_combo, self._cr_combo, self._dark_combo):
+    def _stack_shape_for(self, combos) -> tuple[int, ...] | None:
+        """Return the first stack shape among ``combos``."""
+        for combo in combos:
             entry = combo.get_entry(opened_files=self._opened_files)
             if entry is None:
                 continue
@@ -1223,6 +1352,18 @@ class FTHReconstructionTool(QMainWindow):
                 return shape
         return None
 
+    def _signal_stack_shape(self) -> tuple[int, ...] | None:
+        """Stack shape used by the frame selector shared by CL and CR."""
+        return self._stack_shape_for((self._cl_combo, self._cr_combo))
+
+    def _dark_stack_shape(self) -> tuple[int, ...] | None:
+        """Stack shape used by Dark's independent frame selector."""
+        return self._stack_shape_for((self._dark_combo,))
+
+    def _stack_shape(self) -> tuple[int, ...] | None:
+        """Backward-compatible first stack shape across all input slots."""
+        return self._signal_stack_shape() or self._dark_stack_shape()
+
     def _refresh_frame_controls(self, *_args) -> None:
         """Offer the frame choice as soon as a stack is selected.
 
@@ -1230,14 +1371,26 @@ class FTHReconstructionTool(QMainWindow):
         and a control that only appears once the data is in has already let the
         tool reduce the stack one way without being asked.
         """
-        shape = self._stack_shape()
-        self._frames.set_shape(shape)
-        self._frames_group.setVisible(shape is not None)
+        signal_shape = self._signal_stack_shape()
+        dark_shape = self._dark_stack_shape()
+        self._frames.set_shape(signal_shape)
+        self._frames_group.setVisible(signal_shape is not None)
+        self._dark_frames.set_shape(dark_shape)
+        self._dark_frames_group.setVisible(dark_shape is not None)
 
-    def _on_frame_selection_changed(self) -> None:
-        """Re-read with the new frame, so the change is visible without Load."""
+    def _on_signal_frame_selection_changed(self) -> None:
+        """Re-read CL/CR with the new shared frame selection."""
         if self._CL is not None or self._CR is not None:
             self._load_data()
+
+    def _on_dark_frame_selection_changed(self) -> None:
+        """Re-read the dark input with its independent frame selection."""
+        if self._CL is not None or self._CR is not None:
+            self._load_data()
+
+    def _on_frame_selection_changed(self) -> None:
+        """Compatibility alias for the former single frame selector."""
+        self._on_signal_frame_selection_changed()
 
     def _load_data(self) -> None:
         cl_entry   = self._cl_combo.get_entry(opened_files=self._opened_files)
@@ -1261,6 +1414,7 @@ class FTHReconstructionTool(QMainWindow):
         )
 
         frame_axis, frame_index = self._frames.selection()
+        dark_frame_axis, dark_frame_index = self._dark_frames.selection()
         self._worker = _FTHWorker(
             [cl_entry] if cl_entry else [],
             [cr_entry] if cr_entry else [],
@@ -1268,6 +1422,9 @@ class FTHReconstructionTool(QMainWindow):
             frame_axis,
             frame_index,
             self._frames.kappa(),
+            dark_frame_axis,
+            dark_frame_index,
+            self._dark_frames.kappa(),
         )
         self._worker.finished.connect(self._on_load_finished)
         self._worker.error.connect(self._on_load_error)
@@ -1309,6 +1466,9 @@ class FTHReconstructionTool(QMainWindow):
         if sender is not self._worker:
             return
         self._load_notes = list(getattr(sender, "notes", []) or [])
+        cl, cr, dark, bad = _clean_non_finite(cl, cr, dark)
+        if bad:
+            self._load_notes.append(f"{bad} non-finite pixel(s) set to 0")
         self._load_btn.setEnabled(True)
         if dark is not None:
             cl = np.clip(cl - dark, 0, None)
@@ -1432,6 +1592,14 @@ class FTHReconstructionTool(QMainWindow):
             "roi_size": int(self._roi_size),
             "roi_offsets": roi_offsets,
         }
+        self._locked_params.update({
+            'focus_enabled': bool(self._focus_group.isChecked()),
+            'propagation_um': float(self._focus_distance.value()),
+            'focus_energy_ev': float(self._focus_energy.value()),
+            'focus_detector_distance_mm': float(self._focus_detector_distance.value()),
+            'focus_pixel_size_um': float(self._focus_pixel_size.value()),
+            'focus_quantize_wavelength': bool(self._focus_quantize.isChecked()),
+        })
         self._btn_lock_params.setStyleSheet(
             "QPushButton { background-color: #c9302c; color: white; font-weight: 600; }"
         )
@@ -1441,6 +1609,36 @@ class FTHReconstructionTool(QMainWindow):
         if not self._locked_params or self._CL is None:
             return
         lp = self._locked_params
+        focus_widgets = (
+            self._focus_group,
+            self._focus_distance,
+            self._focus_distance_slider,
+            self._focus_energy,
+            self._focus_detector_distance,
+            self._focus_pixel_size,
+            self._focus_quantize,
+        )
+        blocked_states = [widget.blockSignals(True) for widget in focus_widgets]
+        try:
+            self._focus_group.setChecked(bool(lp.get('focus_enabled', False)))
+            distance_um = float(lp.get('propagation_um', 0.0))
+            self._focus_distance.setValue(distance_um)
+            slider_value = int(round(distance_um * 100.0))
+            slider_value = max(
+                self._focus_distance_slider.minimum(),
+                min(self._focus_distance_slider.maximum(), slider_value),
+            )
+            self._focus_distance_slider.setValue(slider_value)
+            self._focus_energy.setValue(float(lp.get('focus_energy_ev', 779.5)))
+            self._focus_detector_distance.setValue(
+                float(lp.get('focus_detector_distance_mm', 180.0))
+            )
+            self._focus_pixel_size.setValue(float(lp.get('focus_pixel_size_um', 20.0)))
+            self._focus_quantize.setChecked(bool(lp.get('focus_quantize_wavelength', True)))
+        finally:
+            for widget, blocked in zip(focus_widgets, blocked_states):
+                widget.blockSignals(blocked)
+        self._update_focus_actual_label()
         rows, cols = self._CL.shape
         rows = max(1, rows)
         cols = max(1, cols)
@@ -1560,6 +1758,12 @@ class FTHReconstructionTool(QMainWindow):
         rows_idx  = np.arange(self._Nx, dtype=float)
         cols_idx  = np.arange(self._Ny, dtype=float)
         self._xmat, self._ymat = np.meshgrid(rows_idx, cols_idx, indexing="ij")
+        # The centering ramp depends only on this geometry, and rebuilding it
+        # costs 125 ms at 2048x2048 -- which was being paid on every step of the
+        # focus slider, where none of these values move. Built here, where they
+        # are set, so it cannot go stale.
+        self._fth_phase = _fth_phase_correction(
+            self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny)
 
     def _update_t1_main_display(self) -> None:
         """Show the best available centerd hologram (smooth > centerd > raw)."""
@@ -2514,7 +2718,64 @@ class FTHReconstructionTool(QMainWindow):
             logging.exception("FTH filtering")
             return False
 
-    def _compute_fth_only(self) -> bool:
+    def _on_focus_slider_changed(self, value: int) -> None:
+        distance_um = float(value) / 100.0
+        blocked = self._focus_distance.blockSignals(True)
+        self._focus_distance.setValue(distance_um)
+        self._focus_distance.blockSignals(blocked)
+        self._schedule_focus_update()
+
+    def _on_focus_distance_changed(self, value: float) -> None:
+        slider_value = int(round(float(value) * 100.0))
+        if self._focus_distance_slider.minimum() <= slider_value <= self._focus_distance_slider.maximum():
+            blocked = self._focus_distance_slider.blockSignals(True)
+            self._focus_distance_slider.setValue(slider_value)
+            self._focus_distance_slider.blockSignals(blocked)
+        self._schedule_focus_update()
+
+    def _on_focus_parameters_changed(self, *_args) -> None:
+        self._schedule_focus_update()
+
+    def _schedule_focus_update(self) -> None:
+        self._update_focus_actual_label()
+        if self._Holo2_S1 is not None and self._Holo2_S2 is not None:
+            self._focus_update_timer.start()
+
+    def _focus_distance_m(self) -> float:
+        if not self._focus_group.isChecked():
+            return 0.0
+        distance_m = float(self._focus_distance.value()) * 1e-6
+        if self._focus_quantize.isChecked():
+            wavelength = _photon_wavelength(self._focus_energy.value())
+            distance_m = _quantize_propagation_distance(distance_m, wavelength)
+        return distance_m
+
+    def _update_focus_actual_label(self) -> None:
+        try:
+            self._focus_actual_distance_um = self._focus_distance_m() * 1e6
+            self._focus_actual_label.setText(
+                f'Applied distance: {self._focus_actual_distance_um:.6g} um'
+            )
+        except ValueError as exc:
+            self._focus_actual_label.setText(f'Invalid focus parameters: {exc}')
+
+    def _reset_focus(self) -> None:
+        self._focus_distance.setValue(0.0)
+        self._focus_distance_slider.setValue(0)
+        self._apply_focus_update()
+
+    def _apply_focus_update(self) -> None:
+        self._focus_update_timer.stop()
+        if self._Holo2_S1 is None or self._Holo2_S2 is None:
+            self._update_focus_actual_label()
+            return
+        if self._compute_fth_only(reset_display_scale=False):
+            self._update_t4_display()
+            self._set_status(
+                f'Focus applied: {self._focus_actual_distance_um:.6g} um'
+            )
+
+    def _compute_fth_only(self, reset_display_scale: bool = True) -> bool:
         if self._Holo2_S1 is None or self._Holo2_S2 is None:
             self._set_status("Apply filters first.", error=True)
             return False
@@ -2522,22 +2783,44 @@ class FTHReconstructionTool(QMainWindow):
             self._set_status("Centered hologram not computed yet.", error=True)
             return False
         try:
+            holo_s1 = self._Holo2_S1
+            holo_s2 = self._Holo2_S2
+            self._focus_actual_distance_um = 0.0
+            if self._focus_group.isChecked():
+                distance_m = self._focus_distance_m()
+                self._focus_actual_distance_um = distance_m * 1e6
+                if distance_m != 0.0:
+                    kernel = _propagation_kernel(
+                        holo_s1.shape,
+                        distance_m,
+                        self._focus_detector_distance.value() * 1e-3,
+                        self._focus_pixel_size.value() * 1e-6,
+                        self._focus_energy.value(),
+                        quantize_wavelength=False,
+                    )
+                    holo_s1 = holo_s1 * kernel
+                    holo_s2 = holo_s2 * kernel
+            self._update_focus_actual_label()
+
             # FTH = FFT + phase correction to center
             self._FTH_S1 = _fth_transform(
-                self._Holo2_S1, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny)
+                holo_s1, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny,
+                self._fth_phase)
             self._FTH_S2 = _fth_transform(
-                self._Holo2_S2, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny)
+                holo_s2, self._xmat, self._ymat, self._X0, self._Y0, self._Nx, self._Ny,
+                self._fth_phase)
 
             # Auto-scale based on 95th percentile of selected FTH amplitude
-            fth_ref = self._select_slit_data(self._FTH_S1, self._FTH_S2)
-            self._rs_scale_base = float(np.percentile(np.abs(fth_ref), 95))
-            self._rs_scale_base = max(self._rs_scale_base, 1e-9)
-            self._rs_scale_slider.setValue(100)
-            self._rs_scale = self._rs_scale_base
-            self._t4_autoleveled_key = None
-            # A fresh reconstruction: the Reconstruction page follows the
-            # Filter & FTH page again until it is adjusted on its own.
-            self._t4_sliders_touched = False
+            if reset_display_scale:
+                fth_ref = self._select_slit_data(self._FTH_S1, self._FTH_S2)
+                self._rs_scale_base = float(np.percentile(np.abs(fth_ref), 95))
+                self._rs_scale_base = max(self._rs_scale_base, 1e-9)
+                self._rs_scale_slider.setValue(100)
+                self._rs_scale = self._rs_scale_base
+                self._t4_autoleveled_key = None
+                # A fresh reconstruction: the Reconstruction page follows the
+                # Filter & FTH page again until it is adjusted on its own.
+                self._t4_sliders_touched = False
 
             self._update_t3_fth_display()
             self._set_status("FTH computed.")
@@ -3442,6 +3725,7 @@ class FTHReconstructionTool(QMainWindow):
         "_Holo2_S2",
         "_FTH_S1",
         "_FTH_S2",
+        "_fth_phase",
         "_xmat",
         "_ymat",
         "_t1_value_data",

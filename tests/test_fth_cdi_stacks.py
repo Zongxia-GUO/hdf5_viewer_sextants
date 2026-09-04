@@ -6,7 +6,7 @@ somewhere downstream with "too many values to unpack (expected 2, got 3)",
 which says nothing about dimensions to whoever is holding a 400-frame scan.
 
 CDI's data input is the FTH tool's Alignment tab, which it takes over
-wholesale, so both windows are served by the one selector added to FTH.
+wholesale. CL and CR share one selector; Dark has an independent selector.
 """
 
 import h5py
@@ -95,6 +95,33 @@ def test_the_dark_frame_is_reduced_the_same_way(scan):
     assert "Dark: frame 2 of 7 (axis 0)" in worker.notes
 
 
+def test_dark_and_signal_frames_are_selected_independently(scan):
+    stack_entry = (str(scan), STACK_KEY)
+    flat_entry = (str(scan), FLAT_KEY)
+    worker = _FTHWorker(
+        [stack_entry],
+        [flat_entry],
+        stack_entry,
+        0,
+        1,
+        5.0,
+        0,
+        4,
+        5.0,
+    )
+    got = {}
+    worker.finished.connect(
+        lambda cl, cr, dark: got.update(cl=cl, cr=cr, dark=dark)
+    )
+
+    worker.run()
+
+    np.testing.assert_allclose(got["cl"], STACK[1].astype(np.float64))
+    np.testing.assert_allclose(got["dark"], STACK[4].astype(np.float64))
+    assert "CL: frame 1 of 7 (axis 0)" in worker.notes
+    assert "Dark: frame 4 of 7 (axis 0)" in worker.notes
+
+
 def test_a_2d_load_reports_no_frame_note(scan):
     entry = (str(scan), FLAT_KEY)
     worker = _FTHWorker([entry], [entry], None, 0, MEAN_OF_FRAMES)
@@ -108,9 +135,11 @@ def test_a_2d_load_reports_no_frame_note(scan):
 
 def test_the_frame_controls_appear_only_for_a_stack(fth, scan):
     assert fth._frames_group.isVisibleTo(fth) is False
+    assert fth._dark_frames_group.isVisibleTo(fth) is False
 
     fth._cl_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
     assert fth._frames_group.isVisibleTo(fth) is True
+    assert fth._dark_frames_group.isVisibleTo(fth) is False
 
     fth._cl_combo.add_full_key(f"{scan}::{FLAT_KEY}", select=True)
     assert fth._frames_group.isVisibleTo(fth) is False
@@ -183,6 +212,44 @@ def test_the_dark_slot_can_bring_up_the_controls_on_its_own(fth, scan):
     fth._dark_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
 
     assert fth._stack_shape() == STACK.shape
+    assert fth._signal_stack_shape() is None
+    assert fth._dark_stack_shape() == STACK.shape
+    assert fth._frames_group.isVisibleTo(fth) is False
+    assert fth._dark_frames_group.isVisibleTo(fth) is True
+    assert fth._dark_frames.spin_frame.maximum() == 6
+
+
+def test_fth_sidebars_use_page_specific_widths(fth):
+    first_splitter = fth._tabs.widget(0).layout().itemAt(0).widget()
+    third_splitter = fth._tabs.widget(2).layout().itemAt(0).widget()
+
+    assert first_splitter.widget(0).minimumWidth() >= 440
+    assert third_splitter.widget(0).minimumWidth() == 360
+
+    focus_form = fth._focus_group.layout()
+    slider_row, slider_role = focus_form.getWidgetPosition(fth._focus_distance_slider)
+    value_row, value_role = focus_form.getWidgetPosition(fth._focus_distance)
+    assert value_row == slider_row + 1
+    assert slider_role == value_role
+
+
+def test_signal_frames_are_between_signal_and_dark_paths(fth):
+    splitter = fth._tabs.widget(0).layout().itemAt(0).widget()
+    controls_layout = splitter.widget(0).widget().layout()
+    titles = [
+        controls_layout.itemAt(index).widget().title()
+        for index in range(controls_layout.count())
+        if controls_layout.itemAt(index).widget() is not None
+        and hasattr(controls_layout.itemAt(index).widget(), "title")
+    ]
+
+    assert titles[:5] == [
+        "CL Dataset  (circular left polarisation)",
+        "CR Dataset  (optional for single-file mode)",
+        "CL / CR Frames",
+        "Dark Scan  (optional)",
+        "Dark Frames",
+    ]
 
 
 # ── The CDI window, which takes the same tab ──────────────────────────── #
@@ -196,12 +263,23 @@ def test_the_cdi_window_gets_the_same_frame_controls(qapp, scan):
     try:
         inner = cdi._fth_tool
         assert inner._frames_group.window() is cdi
+        assert inner._dark_frames_group.window() is cdi
         assert inner._frames_group.isVisibleTo(cdi) is False
 
         inner._cl_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
 
         assert inner._frames_group.isVisibleTo(cdi) is True
         assert inner._frames.spin_frame.maximum() == 6
+
+        inner._dark_combo.add_full_key(f"{scan}::{STACK_KEY}", select=True)
+
+        assert inner._dark_frames_group.isVisibleTo(cdi) is True
+        assert inner._dark_frames.spin_frame.maximum() == 6
+
+        first_splitter = cdi._tabs.widget(0).layout().itemAt(0).widget()
+        third_splitter = cdi._tabs.widget(2).layout().itemAt(0).widget()
+        assert first_splitter.widget(0).minimumWidth() >= 440
+        assert third_splitter.widget(0).minimumWidth() >= 480
     finally:
         cdi.deleteLater()
 
