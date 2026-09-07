@@ -92,6 +92,37 @@ def has_supported_extension(file_path: Union[str, pathlib.Path]) -> bool:
     return path.suffix.lower() in SUPPORTED_DATA_EXTENSIONS
 
 
+#: What :func:`classify_data_file` reports for a file it can open.
+KIND_HDF5 = "hdf5"
+KIND_REGULAR = "regular"
+
+
+def classify_data_file(file_path: Union[str, pathlib.Path]) -> Union[str, None]:
+    """Say what kind of data file this is, reading at most its first 8 bytes.
+
+    :func:`is_supported_data_file` answers half of this by opening an HDF5 file
+    in full and throwing the handle away, and the caller then had to open it a
+    second time to decide which kind of tree row to build. Two opens per file
+    is invisible on a local disk and is most of the wait on a network share:
+    reopening a session was measured at three filesystem round trips per file,
+    and two of them were that pair.
+
+    A file whose signature is right but whose interior is broken is reported as
+    HDF5 here and fails later, when it is expanded, where the error can name
+    the file — rather than being silently dropped from the tree.
+
+    :return: :data:`KIND_HDF5`, :data:`KIND_REGULAR`, or None when the suffix
+        is not one we read or the file has no HDF5 signature.
+    """
+    path = pathlib.Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix in HDF5_EXTENSIONS:
+        return KIND_HDF5 if looks_like_hdf5(path) else None
+    if suffix in IMAGE_EXTENSIONS or suffix in TEXT_EXTENSIONS:
+        return KIND_REGULAR
+    return None
+
+
 def is_supported_data_file(file_path: Union[str, pathlib.Path]) -> bool:
     """Return True for valid HDF5 files or supported image/text files."""
     path = pathlib.Path(file_path)

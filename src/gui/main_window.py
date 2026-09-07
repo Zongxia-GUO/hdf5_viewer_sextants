@@ -105,6 +105,13 @@ from src.gui.export_naming import (
     short_series_label,
 )
 from src.gui.session_guard import SessionGuard, describe_age
+from src.gui.session_restore import (
+    NEVER_ASK,
+    THRESHOLD_KEY as RESTORE_THRESHOLD_KEY,
+    ask_restore,
+    read_threshold as read_restore_threshold,
+    should_ask as should_ask_restore,
+)
 from src.gui.table_model import CopyableTableView, TableModel
 from src.gui.x_target import (
     DEFAULT_X_SCOPE,
@@ -116,11 +123,12 @@ from src.img.img_path import img_path
 from src.lib_h5.dataset_types import H5DatasetType
 from src.lib_h5.file_size import file_size_to_str
 from src.lib_h5.file_validator import (
+    KIND_HDF5,
+    classify_data_file,
     get_file_filter_string,
     has_supported_extension,
     is_hdf5_file,
     is_supported_data_file,
-    looks_like_hdf5,
 )
 
 FTH_MIN_SECOND_DIM = 100  # FTH candidate requires shape[1] > 100
@@ -1024,6 +1032,9 @@ class MainWindow(QMainWindow):
             act_set_cache_limit = QAction("Set Index Cache Limit...", self)
             act_set_cache_limit.triggered.connect(self._edit_index_cache_limit)
             mbr_setting.addAction(act_set_cache_limit)
+            act_restore_ask = QAction("Set Session Restore Prompt...", self)
+            act_restore_ask.triggered.connect(self._edit_restore_prompt_threshold)
+            mbr_setting.addAction(act_restore_ask)
 
         # Help Menu
         if (mbr_help := menu_bar.addMenu("&Help")) is not None:
@@ -1068,12 +1079,14 @@ class MainWindow(QMainWindow):
         crash_age = self._session_guard.age_of_last_stamp
         self._session_guard.start()
 
-        # Restore previous session *after* the window is visible so startup is instant.
+        # Restore previous session *after* the window is visible so startup is
+        # instant -- and so the question below is asked in front of a window
+        # rather than in front of nothing.
         _files = settings.value("settings/last_opened_files", ())
         if crashed:
             _files = self._discard_session_after_crash(_files, crash_age)
         if _files:
-            QTimer.singleShot(0, lambda: self._restore_session(_files, ""))
+            QTimer.singleShot(0, lambda: self._offer_session_restore(_files))
 
         # Pre-import the heavy reconstruction/tool modules while the app is idle so
         # the first click on a tool doesn't pay the ~150 ms import cost. This only
@@ -1400,6 +1413,29 @@ class MainWindow(QMainWindow):
         self._save_index_scope_settings()
         self._set_index_status(f"Index: Batch size = {self._index_batch_size}")
 
+    def _edit_restore_prompt_threshold(self) -> None:
+        """How many files the last session must hold before reopening is a
+        question rather than a default."""
+        val, ok = QInputDialog.getInt(
+            self,
+            "Set Session Restore Prompt",
+            "Ask before reopening this many files or more\n"
+            "(0 = always ask, -1 = never ask):",
+            read_restore_threshold(QSettings()),
+            NEVER_ASK,
+            100000,
+            1,
+        )
+        if not ok:
+            return
+        QSettings().setValue(RESTORE_THRESHOLD_KEY, int(val))
+        if int(val) == NEVER_ASK:
+            self._set_status_text("Session restore: never ask")
+        elif int(val) <= 0:
+            self._set_status_text("Session restore: always ask")
+        else:
+            self._set_status_text(f"Session restore: ask from {int(val)} file(s)")
+
     def _edit_index_cache_limit(self) -> None:
         """Edit maximum number of files kept in disk index cache."""
         val, ok = QInputDialog.getInt(
@@ -1699,6 +1735,29 @@ class MainWindow(QMainWindow):
         )
         return ()
 
+    def _offer_session_restore(self, files) -> None:
+        """Reopen last time's files, asking first when there are many of them.
+
+        Reopening costs two filesystem round trips per file, which is nothing
+        locally and most of a minute for a thousand files on a share. Below the
+        threshold the question would cost more attention than the wait it
+        saves, so it is not asked.
+
+        Declining does not delete the saved list. The answer is about this
+        launch; what is open at the next clean close is what gets saved, so a
+        decline followed by a close is what actually clears it.
+        """
+        count = len(files or ())
+        if not count:
+            return
+        threshold = read_restore_threshold(QSettings())
+        if should_ask_restore(count, threshold) and not ask_restore(self, count):
+            self._set_status_text(
+                f"Started empty  |  {count} file(s) from the last session were not reopened"
+            )
+            return
+        self._restore_session(files, "")
+
     def _restore_session(self, files, monitor_folder_str: str) -> None:
         """Restore the previous session after the main window is visible.
 
@@ -1725,7 +1784,12 @@ class MainWindow(QMainWindow):
 
         :param str file_path: File Path
         """
-        if not is_supported_data_file(file_path):
+        # One look at the file, not two. Deciding whether to accept it and
+        # deciding which kind of row to build are the same question, and asking
+        # it twice was two of the three filesystem round trips a restored file
+        # costs -- which is most of the wait when the data is on a share.
+        kind = classify_data_file(file_path)
+        if kind is None:
             logging.warning("Skipped unsupported file: '%s'", file_path)
             return
 
@@ -1756,11 +1820,7 @@ class MainWindow(QMainWindow):
         parent_folder.setToolTip(str(file_path))
 
         self.tree_model_file.appendRow([parent_name, parent_text, parent_shape, parent_folder])
-        # The signature, not a full open: this runs on the GUI thread once per
-        # file, and opening every file to decide which icon to draw was a third
-        # of the cost of adding them. _load_tree_children already reports a file
-        # that turns out to be unreadable when it is expanded.
-        if not looks_like_hdf5(file_path):
+        if kind != KIND_HDF5:
             parent_text.setText(_regular_file_kind(file_path))
             parent_name.setData(True, _ROLE_CHILDREN_LOADED)
             child_name = QStandardItem("data")
@@ -2250,7 +2310,9 @@ class MainWindow(QMainWindow):
                 file = file.removeprefix("file:")
             file_path = pathlib.Path(file.strip())
 
-            if file_path.exists() and is_supported_data_file(file_path):
+            if file_path.exists():
+                # _open_file classifies it and logs an unsupported one itself;
+                # checking here as well opened every dropped file twice more.
                 self._open_file(file_path)
             else:
                 logging.warning(f"Skipped unsupported file: '{file_path}'")
