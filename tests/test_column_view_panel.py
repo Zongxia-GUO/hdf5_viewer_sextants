@@ -169,6 +169,26 @@ def test_choosing_an_x_column_redraws_against_it(win, qapp):
     assert plot.plot_widget.getAxis("bottom").labelText == "Col 0"
 
 
+def test_switching_the_x_column_off_returns_the_plot_to_the_row_index(win, qapp):
+    """The X box is live: picking X activates it, unchecking it drops back to
+    the index without un-marking the column."""
+    arr = np.c_[10 + np.arange(6.0), np.arange(6.0) ** 2]
+    win._show_data(arr, "Array1D", source_dataset_key="C:/d/two.txt::data")
+    spin(qapp)
+    x_control = win.column_view_panel._worksheet.header_controls()[0]
+    assert x_control.combo.currentText() == "X" and x_control.show_box.isChecked()
+    assert current(win).plot_widget.getAxis("bottom").labelText == "Col 0"
+
+    x_control.show_box.setChecked(False)
+    spin(qapp)
+    assert current(win).x_data is None
+    assert current(win).plot_widget.getAxis("bottom").labelText == "Index"
+
+    x_control.show_box.setChecked(True)
+    spin(qapp)
+    np.testing.assert_array_equal(current(win).x_data, arr[:, 0])
+
+
 def test_a_rename_reaches_the_legend(win, qapp):
     arr = np.c_[np.arange(5.0), np.arange(5.0) ** 2, np.arange(5.0)]
     win._show_data(arr, "Array1D", source_dataset_key="C:/d/scan.txt::data")

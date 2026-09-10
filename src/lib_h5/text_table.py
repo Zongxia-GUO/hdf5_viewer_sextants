@@ -40,6 +40,7 @@ from __future__ import annotations
 import functools
 import logging
 import pathlib
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -153,6 +154,58 @@ def _looks_like_units(fields: list[str]) -> bool:
     )
 
 
+#: Split a run of two or more spaces. Beamline software often lays a header out
+#: in aligned columns — ``Zone        From        To`` — where a single space
+#: can sit *inside* a name; only the wide gaps separate the columns.
+_ALIGNED_COLUMNS = "  "
+
+
+def _header_split(line: str, delimiter: str | int | None) -> list[str]:
+    """Split one header line, stripping a leading comment marker first."""
+    body = line.lstrip().lstrip(COMMENT).strip()
+    if delimiter == _ALIGNED_COLUMNS:
+        parts = re.split(r"\s{2,}", body)
+    elif delimiter is None:
+        parts = body.split()
+    else:
+        parts = body.split(str(delimiter))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _delimiters_to_try(sniffed: str | None) -> list[str | int | None]:
+    """The sniffed delimiter first, then the other plausible ones.
+
+    The header can be punctuated differently from the data — a
+    comma-separated header above whitespace columns, or column names with
+    spaces above tab-separated numbers — so when the data's delimiter does not
+    carve the header into the right number of fields, the others are tried.
+    """
+    order: list[str | int | None] = [sniffed]
+    for delimiter in (None, "\t", ",", ";", _ALIGNED_COLUMNS):
+        if delimiter != sniffed:
+            order.append(delimiter)
+    return order
+
+
+def _names_from(header: list[str], delimiter: str | int | None, columns: int) -> tuple[str, ...] | None:
+    """The best name row under one delimiter, or ``None`` if it fits nothing."""
+    candidates = []
+    for line in reversed(header):
+        fields = _header_split(line, delimiter)
+        if len(fields) != columns or _all_numeric(fields):
+            continue
+        # A separator still sitting inside a field means this split was wrong.
+        if any(sep in field for field in fields for sep in ",\t;"):
+            continue
+        candidates.append(tuple(fields))
+    if not candidates:
+        return None
+    for fields in candidates:
+        if not _looks_like_units(list(fields)):
+            return fields
+    return candidates[0]
+
+
 def header_names(header: list[str], delimiter: str | None, columns: int) -> tuple[str, ...]:
     """Column names from the header, or empty if it does not supply them.
 
@@ -160,19 +213,15 @@ def header_names(header: list[str], delimiter: str | None, columns: int) -> tupl
     title above the names and it is the line nearest the numbers that describes
     them. A comment marker is not part of a name: ``# energy intensity`` is the
     commonest way of writing a header and means the same as writing it plain.
-    A row of units is passed over while any other candidate remains.
+    A row of units is passed over while any other candidate remains. The
+    delimiter is taken from the data but the header can differ, so the others
+    are tried in turn until one splits it into exactly ``columns`` names.
     """
-    candidates = []
-    for line in reversed(header):
-        fields = _fields(line.lstrip().lstrip(COMMENT), delimiter)
-        if len(fields) == columns and not _all_numeric(fields):
-            candidates.append(tuple(fields))
-    if not candidates:
-        return ()
-    for fields in candidates:
-        if not _looks_like_units(list(fields)):
-            return fields
-    return candidates[0]
+    for candidate in _delimiters_to_try(delimiter):
+        names = _names_from(header, candidate, columns)
+        if names is not None:
+            return names
+    return ()
 
 
 def read_text_table(path: str | pathlib.Path) -> TextTable:

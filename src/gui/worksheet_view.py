@@ -131,9 +131,14 @@ class _ColumnControls(QWidget):
         for widget in (self.show_box, self.combo, self.name_edit):
             widget.blockSignals(True)
         self.combo.setCurrentText(role.value)
-        is_curve = role is Role.Y
-        self.show_box.setEnabled(is_curve)
-        self.show_box.setChecked(is_curve and visible)
+        # The box is live for both roles: on a Y it draws the curve, on the X
+        # it makes that column the abscissa (off ⇒ the row index is).
+        active_role = role is not Role.NONE
+        self.show_box.setEnabled(active_role)
+        self.show_box.setChecked(active_role and visible)
+        self.show_box.setToolTip(
+            "Use as the X axis" if role is Role.X else "Draw this column"
+        )
         if not self.name_edit.hasFocus():
             self.name_edit.setText(name)
         for widget in (self.show_box, self.combo, self.name_edit):

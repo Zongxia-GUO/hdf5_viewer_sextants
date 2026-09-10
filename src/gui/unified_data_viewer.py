@@ -294,6 +294,10 @@ class UnifiedDataViewer(QWidget):
 
         if isinstance(self.current_widget, PlotWidget1DEnhanced):
             self.current_widget.set_source_dataset_key(self.source_dataset_key)
+            if x is None:
+                # set_data(y) with no X preserves the old one; the panel means
+                # for it to be gone.
+                self.current_widget.reset_x()
             self.current_widget.set_axis_names(x_label, y_label)
             self.current_widget.set_data(y, x, curve_labels=multi_labels)
             return

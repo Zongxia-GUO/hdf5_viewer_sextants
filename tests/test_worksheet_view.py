@@ -67,15 +67,27 @@ def test_one_control_stack_per_column(view):
 def test_a_control_reflects_its_column_role(view):
     view.set_data(
         ARRAY[:, :2],
-        make_roles(ColumnRole("t", Role.X, False), ColumnRole("a", Role.Y, True)),
+        make_roles(ColumnRole("t", Role.X, True), ColumnRole("a", Role.Y, True)),
     )
 
     x_cell, y_cell = view.header_controls()
     assert x_cell.combo.currentText() == "X"
     assert x_cell.name_edit.text() == "t"
-    assert not x_cell.show_box.isEnabled(), "show is meaningless for the abscissa"
+    assert x_cell.show_box.isEnabled(), "the box makes this column the abscissa"
+    assert x_cell.show_box.isChecked()
     assert y_cell.combo.currentText() == "Y"
     assert y_cell.show_box.isChecked()
+
+
+def test_switching_the_x_box_off_plots_against_the_row_index(view):
+    roles = make_roles(ColumnRole("t", Role.X, True), ColumnRole("a", Role.Y, True))
+    view.set_data(ARRAY[:, :2], roles)
+    assert roles.display_spec().x_index == 0
+
+    view.header_controls()[0].show_box.setChecked(False)
+
+    assert roles.display_spec().x_index is None
+    assert view.header_controls()[0].combo.currentText() == "X", "still marked X"
 
 
 def test_the_combo_is_visible_and_a_real_dropdown(view):

@@ -161,6 +161,47 @@ def test_header_names_reads_from_the_bottom_up():
     assert header_names(header, None, 2) == NAMES
 
 
+# ── The header can be punctuated unlike the data ─────────────────────── #
+#
+# genfromtxt decides the delimiter from the numbers, but a header is written by
+# hand and often differs: a comma-separated header above whitespace columns, or
+# names with a space in them above tab-separated numbers. Each of these left the
+# file showing "Col 0 / Col 1".
+
+def test_a_comma_header_over_whitespace_data(tmp_path):
+    path = write(tmp_path, "mix.txt", "energy,intensity\n1 10\n2 20\n")
+
+    assert read_text_table(path).names == NAMES
+
+
+def test_names_with_spaces_over_tab_separated_data(tmp_path):
+    path = write(tmp_path, "wide.txt", "Photon Energy\tSample Current\n1\t10\n2\t20\n")
+
+    assert read_text_table(path).names == ("Photon Energy", "Sample Current")
+
+
+def test_a_header_laid_out_in_aligned_columns(tmp_path):
+    """Two or more spaces separate the columns; one space can be inside a name."""
+    path = write(tmp_path, "aligned.txt", "Zone        From        To\n1 5 7\n2 8 9\n")
+
+    assert read_text_table(path).names == ("Zone", "From", "To")
+
+
+def test_aligned_header_below_a_title(tmp_path):
+    path = write(tmp_path, "zones.txt",
+                 "TDC TIME ZONES DEFINITION\nZone     From     To\n1 5 7\n2 8 9\n")
+
+    assert read_text_table(path).names == ("Zone", "From", "To")
+
+
+def test_a_wrong_split_that_leaves_a_separator_in_a_name_is_refused(tmp_path):
+    """``a,b c,d`` over ``1 2`` is genuinely ambiguous — better no names than
+    ``("a,b", "c,d")``."""
+    path = write(tmp_path, "ambiguous.txt", "a,b c,d\n1 2\n3 4\n")
+
+    assert read_text_table(path).names == ()
+
+
 # ── The names cache ───────────────────────────────────────────────────── #
 
 def test_names_are_remembered_and_re_read_when_the_file_changes(tmp_path):

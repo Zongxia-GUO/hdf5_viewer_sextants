@@ -379,6 +379,20 @@ class PlotWidget1DEnhanced(QWidget):
         # the new one set them after this.
         self._column_axis_names = None
 
+    def reset_x(self) -> None:
+        """Forget any custom X so the next draw is against the row index.
+
+        ``set_data(y)`` with no X *preserves* the current one — that is how a
+        chosen X survives a change of dataset. When the caller means "no X",
+        as the Columns panel does when its X column is switched off, it has to
+        say so here first.
+        """
+        self.x_data = None
+        self.x_data_original = None
+        self.x_dataset_path = None
+        self.btn_convert_to_q.setChecked(False)
+        self.btn_convert_to_q.setEnabled(False)
+
     def set_axis_names(self, x_name: str | None, y_name: str | None) -> None:
         """Name the axes after the columns they came from.
 

@@ -23,7 +23,7 @@ NAME, ROLE, SHOW = (
 def model(qapp):
     return ColumnRolesModel(
         [
-            ColumnRole("energy", Role.X, False),
+            ColumnRole("energy", Role.X, True),
             ColumnRole("i0", Role.Y, True),
             ColumnRole("i1", Role.Y, False),
         ]
@@ -82,12 +82,22 @@ def test_setting_none_takes_a_column_out_of_the_plot(model):
 
 # ── the show box ─────────────────────────────────────────────────────── #
 
-def test_show_is_only_checkable_on_a_y_column(model):
-    y_flags = model.flags(model.index(1, SHOW))
-    x_flags = model.flags(model.index(0, SHOW))
+def test_show_is_checkable_on_x_and_y_but_not_an_unassigned_column(model):
+    model.setData(model.index(2, ROLE), "—", Qt.ItemDataRole.EditRole)
 
-    assert y_flags & Qt.ItemFlag.ItemIsUserCheckable
-    assert not (x_flags & Qt.ItemFlag.ItemIsUserCheckable)
+    checkable = Qt.ItemFlag.ItemIsUserCheckable
+    assert model.flags(model.index(0, SHOW)) & checkable   # X: is it the abscissa
+    assert model.flags(model.index(1, SHOW)) & checkable   # Y: draw the curve
+    assert not (model.flags(model.index(2, SHOW)) & checkable)  # NONE: nothing to show
+
+
+def test_switching_the_x_column_off_drops_the_abscissa(model):
+    assert model.display_spec().x_index == 0
+
+    set_show(model, 0, False)
+
+    assert model.display_spec().x_index is None
+    assert model.roles()[0].role is Role.X, "still marked X, just not active"
 
 
 def test_checking_show_adds_the_curve(model):
@@ -99,9 +109,11 @@ def test_checking_show_adds_the_curve(model):
 
 
 def test_the_check_state_reads_back_from_visibility(model):
+    model.setData(model.index(2, ROLE), "—", Qt.ItemDataRole.EditRole)
+
+    assert model.data(model.index(0, SHOW), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
     assert model.data(model.index(1, SHOW), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
-    assert model.data(model.index(2, SHOW), Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Unchecked
-    assert model.data(model.index(0, SHOW), Qt.ItemDataRole.CheckStateRole) is None
+    assert model.data(model.index(2, SHOW), Qt.ItemDataRole.CheckStateRole) is None
 
 
 # ── rename ───────────────────────────────────────────────────────────── #

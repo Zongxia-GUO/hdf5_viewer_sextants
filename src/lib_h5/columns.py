@@ -43,27 +43,30 @@ class ColumnRole:
 
     name: str
     role: Role = Role.NONE
-    #: Only meaningful for a ``Y`` column; an ``X`` or ``NONE`` column never draws.
+    #: For a ``Y`` column, whether the curve is drawn. For an ``X`` column,
+    #: whether that column is the active abscissa (unchecked ⇒ the row index
+    #: is). A ``NONE`` column never uses it.
     visible: bool = False
 
     def with_role(self, role: Role) -> "ColumnRole":
-        """The same column in a new role, with visibility that role allows.
+        """The same column in a new role, activated if the role can be.
 
-        A column promoted to ``Y`` comes on; anything else goes dark, because a
-        checked "show" box over an ``X`` column would claim something the plot
-        cannot honour.
+        Picking ``X`` or ``Y`` for a column turns it on — the abscissa the user
+        just chose should take effect, and so should a curve. ``NONE`` goes
+        dark.
         """
-        return replace(self, role=role, visible=(role is Role.Y))
+        return replace(self, role=role, visible=(role is not Role.NONE))
 
 
 @dataclass(frozen=True)
 class DisplaySpec:
     """The plot a set of column roles asks for.
 
-    ``x_index`` is ``None`` when no column is the abscissa — the row number is
-    it. ``x_name`` is that column's label, carried here so a rename in the
-    panel reaches the axis without a second lookup. ``y`` is the visible
-    curves, in column order, each with the label to put in the legend.
+    ``x_index`` is ``None`` when no column is the *active* abscissa — either
+    none is marked X, or the one that is has been switched off — and then the
+    row number is the abscissa. ``x_name`` is that column's label, carried here
+    so a rename in the panel reaches the axis without a second lookup. ``y`` is
+    the visible curves, in column order, each with the label for the legend.
     """
 
     x_index: int | None
@@ -72,7 +75,10 @@ class DisplaySpec:
 
     @classmethod
     def from_roles(cls, roles: list[ColumnRole]) -> "DisplaySpec":
-        x = next(((i, c.name) for i, c in enumerate(roles) if c.role is Role.X), None)
+        x = next(
+            ((i, c.name) for i, c in enumerate(roles) if c.role is Role.X and c.visible),
+            None,
+        )
         y = tuple(
             (i, c.name) for i, c in enumerate(roles) if c.role is Role.Y and c.visible
         )
@@ -102,10 +108,10 @@ def default_column_roles(
 
     * One column has no abscissa but itself, so it is a curve against the row
       index.
-    * A text file writes ``x  y`` — the first column is the abscissa. With two
-      columns that is a single curve; with more, the extra columns are curves
-      too but start hidden, so a wide file still opens as the table it was and
-      the panel is how you bring a column into the plot.
+    * A text file writes ``x  y`` — the first column is the abscissa, and it is
+      the active one from the start. With two columns that is a single curve;
+      with more, the extra curves start hidden, so a wide file still opens as
+      the table it was and the panel is how you bring a column into the plot.
     * Anything else (an HDF5 dataset a few columns wide) has no such
       convention, so every column is a curve against the row index, which is
       what the multi-curve view already did.
@@ -118,7 +124,7 @@ def default_column_roles(
         return [ColumnRole(labels[0], Role.Y, True)]
 
     if is_text:
-        first = ColumnRole(labels[0], Role.X, False)
+        first = ColumnRole(labels[0], Role.X, True)
         rest_visible = n_cols == 2
         return [first] + [
             ColumnRole(labels[i], Role.Y, rest_visible) for i in range(1, n_cols)

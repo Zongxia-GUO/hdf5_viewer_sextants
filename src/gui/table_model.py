@@ -397,7 +397,7 @@ class ColumnRolesModel(QAbstractTableModel):
         col = index.column()
         if col in (self.COL_NAME, self.COL_ROLE):
             flags |= Qt.ItemFlag.ItemIsEditable
-        elif col == self.COL_SHOW and self._roles[index.row()].role is Role.Y:
+        elif col == self.COL_SHOW and self._roles[index.row()].role is not Role.NONE:
             flags |= Qt.ItemFlag.ItemIsUserCheckable
         return flags
 
@@ -415,7 +415,7 @@ class ColumnRolesModel(QAbstractTableModel):
             return None
 
         if role == Qt.ItemDataRole.CheckStateRole and col == self.COL_SHOW:
-            if entry.role is not Role.Y:
+            if entry.role is Role.NONE:
                 return None
             return (
                 Qt.CheckState.Checked if entry.visible else Qt.CheckState.Unchecked
@@ -454,7 +454,7 @@ class ColumnRolesModel(QAbstractTableModel):
             return True
 
         if col == self.COL_SHOW and role == Qt.ItemDataRole.CheckStateRole:
-            if entry.role is not Role.Y:
+            if entry.role is Role.NONE:
                 return False
             visible = Qt.CheckState(value) == Qt.CheckState.Checked
             if visible == entry.visible:
