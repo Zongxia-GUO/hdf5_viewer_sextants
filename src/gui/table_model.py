@@ -15,13 +15,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import QApplication, QAbstractItemView, QMenu, QTableView
+
+from src.lib_h5.columns import DisplaySpec, Role
 
 
 class CopyableTableView(QTableView):
@@ -259,6 +262,15 @@ class DataTable(QAbstractTableModel):
                 return str(section + 1)
         return None
 
+    def set_column_names(self, names: list[str]) -> None:
+        """Rename the columns in place; the Columns panel edits these labels."""
+        if self._is_structured:
+            return
+        self._column_names = list(names)
+        self.headerDataChanged.emit(
+            Qt.Orientation.Horizontal, 0, max(0, len(names) - 1)
+        )
+
     def _format_value(self, value: Any) -> str:
         """
         Format a value for display in the table.
@@ -317,3 +329,157 @@ class DataTable(QAbstractTableModel):
             return isinstance(value, (int, float, complex, np.number))
         except Exception:
             return isinstance(value, (int, float, complex))
+
+
+class ColumnRolesModel(QAbstractTableModel):
+    """The columns of a 2-D block as editable rows: label, role, whether shown.
+
+    One row per column of the data. The role decides what a column is for when
+    the block is drawn — the abscissa, a curve, or left out — and this model
+    keeps the one rule that a plot cannot express two ways: there is at most one
+    ``X``, so promoting a column to it demotes whoever held it. ``spec_changed``
+    fires after any edit; the panel that owns the model debounces it before
+    redrawing.
+    """
+
+    COL_NAME, COL_ROLE, COL_SHOW = 0, 1, 2
+    _HEADERS = ("Name", "Role", "Show")
+
+    spec_changed = pyqtSignal()
+
+    def __init__(self, roles: list | None = None, parent: Any = None) -> None:
+        super().__init__(parent)
+        self._roles: list = list(roles or [])
+
+    # -- contents ------------------------------------------------------------ #
+
+    def set_roles(self, roles: list) -> None:
+        """Replace every row, e.g. when a new dataset is selected."""
+        self.beginResetModel()
+        self._roles = list(roles)
+        self.endResetModel()
+        self.spec_changed.emit()
+
+    def roles(self) -> list:
+        return list(self._roles)
+
+    def display_spec(self) -> DisplaySpec:
+        return DisplaySpec.from_roles(self._roles)
+
+    # -- Qt model API ------------------------------------------------------- #
+
+    def rowCount(self, parent: None | QModelIndex = None) -> int:
+        if parent is not None and parent.isValid():
+            return 0
+        return len(self._roles)
+
+    def columnCount(self, parent: None | QModelIndex = None) -> int:
+        if parent is not None and parent.isValid():
+            return 0
+        return len(self._HEADERS)
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> None | str | int:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return self._HEADERS[section]
+        return section + 1
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+        col = index.column()
+        if col in (self.COL_NAME, self.COL_ROLE):
+            flags |= Qt.ItemFlag.ItemIsEditable
+        elif col == self.COL_SHOW and self._roles[index.row()].role is Role.Y:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+        entry = self._roles[index.row()]
+        col = index.column()
+
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            if col == self.COL_NAME:
+                return entry.name
+            if col == self.COL_ROLE:
+                return entry.role.value
+            return None
+
+        if role == Qt.ItemDataRole.CheckStateRole and col == self.COL_SHOW:
+            if entry.role is not Role.Y:
+                return None
+            return (
+                Qt.CheckState.Checked if entry.visible else Qt.CheckState.Unchecked
+            )
+
+        if role == Qt.ItemDataRole.TextAlignmentRole and col != self.COL_NAME:
+            return Qt.AlignmentFlag.AlignCenter
+
+        return None
+
+    def setData(
+        self, index: QModelIndex, value: Any, role: int = Qt.ItemDataRole.EditRole
+    ) -> bool:
+        if not index.isValid():
+            return False
+        row, col = index.row(), index.column()
+        entry = self._roles[row]
+
+        if col == self.COL_NAME and role == Qt.ItemDataRole.EditRole:
+            name = str(value).strip()
+            if not name or name == entry.name:
+                return False
+            self._roles[row] = replace(entry, name=name)
+            self.dataChanged.emit(index, index)
+            self.spec_changed.emit()
+            return True
+
+        if col == self.COL_ROLE and role == Qt.ItemDataRole.EditRole:
+            try:
+                new_role = Role(str(value))
+            except ValueError:
+                return False
+            if new_role is entry.role:
+                return False
+            self._apply_role(row, new_role)
+            return True
+
+        if col == self.COL_SHOW and role == Qt.ItemDataRole.CheckStateRole:
+            if entry.role is not Role.Y:
+                return False
+            visible = Qt.CheckState(value) == Qt.CheckState.Checked
+            if visible == entry.visible:
+                return False
+            self._roles[row] = replace(entry, visible=visible)
+            self.dataChanged.emit(index, index, [role])
+            self.spec_changed.emit()
+            return True
+
+        return False
+
+    # -- the single-X rule ------------------------------------------------- #
+
+    def _apply_role(self, row: int, new_role: Role) -> None:
+        touched = {row}
+        if new_role is Role.X:
+            for i, other in enumerate(self._roles):
+                if i != row and other.role is Role.X:
+                    # Demotion is a side effect, not a choice to plot it: the
+                    # old abscissa becomes an available Y, not a live curve.
+                    self._roles[i] = replace(other, role=Role.Y, visible=False)
+                    touched.add(i)
+        self._roles[row] = self._roles[row].with_role(new_role)
+        lo, hi = min(touched), max(touched)
+        self.dataChanged.emit(
+            self.index(lo, 0), self.index(hi, self.columnCount() - 1)
+        )
+        self.spec_changed.emit()

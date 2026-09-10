@@ -98,6 +98,10 @@ class PlotWidget1DEnhanced(QWidget):
         self.x_dataset_path = None  # Full path to custom X dataset
         self.y_source_dataset_key = None  # Full key for Y data source (file::dataset)
         self._column_axis_names: tuple[str | None, str | None] | None = None
+        #: One legend label per Y column when the caller has real names for
+        #: them (the Columns panel does); otherwise curves fall back to
+        #: ``<source>::colN``.
+        self._curve_labels: list[str] | None = None
         self.selected_point = None  # (x, y, curve_idx) of selected point (curve_idx is None for 1D data)
         self.selected_marker = None  # Circle marker for selected point
         # Asked for when "X to q" is switched on, and kept for the next time.
@@ -275,15 +279,22 @@ class PlotWidget1DEnhanced(QWidget):
 
         self.setLayout(layout)
 
-    def set_data(self, y_data: np.ndarray, x_data: Optional[np.ndarray] = None) -> None:
+    def set_data(
+        self,
+        y_data: np.ndarray,
+        x_data: Optional[np.ndarray] = None,
+        curve_labels: Optional[list[str]] = None,
+    ) -> None:
         """
         Set the data to plot.
 
         Args:
             y_data: Y-axis data (1D array or 2D array with multiple columns)
             x_data: Optional X-axis data (1D array). If None, uses indices.
+            curve_labels: Optional legend label per column of a 2-D ``y_data``.
         """
         self.y_data = y_data
+        self._curve_labels = list(curve_labels) if curve_labels else None
         y_len = len(y_data)
 
         # The filter stays on across a change of dataset, the way X to q does,
@@ -479,14 +490,17 @@ class PlotWidget1DEnhanced(QWidget):
                 if num_cols > 1:
                     self.plot_widget.addLegend(offset=(-10, 10))
 
+                labels = self._curve_labels
+                have_labels = labels is not None and len(labels) == num_cols
+                base = self._short_key_label(self.y_source_dataset_key) or "Result"
                 for col_idx in range(num_cols):
                     color = colors[col_idx % len(colors)]
                     pen = pg.mkPen(color=color, width=line_width)
-                    base = self._short_key_label(self.y_source_dataset_key) or "Result"
+                    name = labels[col_idx] if have_labels else f"{base}::col{col_idx}"
                     self.plot_widget.plot(
                         x, y_display[:, col_idx],
                         pen=pen,
-                        name=f"{base}::col{col_idx}"
+                        name=name,
                     )
             self._mark_spikes(x)
         except Exception as e:

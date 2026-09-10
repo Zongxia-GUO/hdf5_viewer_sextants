@@ -67,6 +67,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QInputDialog,
     QPushButton,
+    QTabWidget,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -112,6 +113,7 @@ from src.gui.session_restore import (
     read_threshold as read_restore_threshold,
     should_ask as should_ask_restore,
 )
+from src.gui.column_view_panel import ColumnViewPanel
 from src.gui.table_model import CopyableTableView, TableModel
 from src.gui.x_target import (
     DEFAULT_X_SCOPE,
@@ -690,11 +692,31 @@ class MainWindow(QMainWindow):
         # Disable right-click menu for consistent UI (use menu bar for export)
         self.plot_wgt_dataset.plotItem.vb.setMenuEnabled(False)
 
+        # The right-side dock is two tabs over the same space: the attribute
+        # key/value list it always was, and a Columns tab that turns a
+        # multi-column block into "draw these against that" without leaving the
+        # browser. Populated by _populate_column_panel; its edits come back
+        # through _apply_column_spec.
+        self.column_view_panel = ColumnViewPanel()
+        self.column_view_panel.display_spec_changed.connect(self._apply_column_spec)
+        #: (array, source_key) of whatever the Columns tab is currently about.
+        self._column_source: tuple[Any, str | None] | None = None
+
+        self.side_tabs = QTabWidget()
+        self.side_tabs.addTab(self.table_view_dataset, "Attributes")
+        self.side_tabs.addTab(self.column_view_panel, "Columns")
+        self.side_tabs.setCurrentIndex(
+            int(settings.value("main_window/side_tab", 0) or 0)
+        )
+        self.side_tabs.currentChanged.connect(
+            lambda i: QSettings().setValue("main_window/side_tab", int(i))
+        )
+
         self.dock_table = QDockWidget()
         self.dock_table.setWindowTitle("Attributes")
         # Use Ignored horizontal policy to allow shrinking below minimum size hints
         self.dock_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
-        self.dock_table.setWidget(self.table_view_dataset)
+        self.dock_table.setWidget(self.side_tabs)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_table)
 
         self.dock_plot = QDockWidget()
@@ -2098,6 +2120,38 @@ class MainWindow(QMainWindow):
             logging.error(f"Failed to display data: {err}")
             return
         self._finalize_dock(viewer)
+        self._populate_column_panel(data, source_dataset_key)
+
+    def _populate_column_panel(self, data, source_dataset_key: str | None) -> None:
+        """Hand the Columns tab whatever the Data dock is now showing.
+
+        The panel decides for itself whether the array has columns to assign;
+        anything that is not a 2-D numeric block lands on its placeholder.
+        """
+        from src.gui.unified_data_viewer import _is_text_source, column_names_for
+
+        is_text = _is_text_source(source_dataset_key)
+        names = column_names_for(source_dataset_key) if is_text else ()
+        self._column_source = (data, source_dataset_key)
+        try:
+            self.column_view_panel.set_data(data, names, source_dataset_key, is_text)
+        except Exception as err:  # a side panel is never worth a crash
+            logging.error(f"Columns panel: could not read {source_dataset_key}: {err}")
+
+    def _apply_column_spec(self, spec) -> None:
+        """Redraw the Data dock the way the Columns tab now asks for."""
+        from src.gui.unified_data_viewer import UnifiedDataViewer
+
+        if self._column_source is None:
+            return
+        data, source_key = self._column_source
+        viewer = self.dock_plot.widget()
+        if not isinstance(viewer, UnifiedDataViewer):
+            return
+        try:
+            viewer.set_data(data, source_dataset_key=source_key, display_spec=spec)
+        except Exception as err:
+            logging.error(f"Columns panel: could not apply spec: {err}")
 
     def _quick_export_tree_dataset(self, index: QModelIndex) -> None:
         """Show a right-clicked dataset, then export exactly what is shown."""

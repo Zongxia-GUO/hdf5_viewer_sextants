@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.lib_h5.columns import DisplaySpec, default_column_roles
 from src.lib_h5.text_table import column_names
 
 #: Suffixes whose columns come from a text header rather than an HDF5 dataset.
@@ -121,6 +122,7 @@ class UnifiedDataViewer(QWidget):
         data: np.ndarray,
         data_type: str | None = None,
         source_dataset_key: str | None = None,
+        display_spec: "DisplaySpec | None" = None,
     ) -> None:
         """
         Set data and automatically choose appropriate display widget.
@@ -136,6 +138,9 @@ class UnifiedDataViewer(QWidget):
         Args:
             data: NumPy array to display
             data_type: Optional data type hint ("String", "Table", "Array1D", "Array2D", "ImageRGB")
+            display_spec: Explicit column roles from the Columns panel. When
+                given for a 2-D array it decides X and the visible curves,
+                overriding the shape heuristic below.
         """
         try:
             if source_dataset_key is not None:
@@ -165,23 +170,20 @@ class UnifiedDataViewer(QWidget):
                 return
 
             # A text file's columns are an x-y pair, not a set of curves
-            # against the row number. Two columns are the common case and mean
-            # exactly that; more than two have no such reading, so they are
-            # shown as the table they are.
-            if ndim == 2 and _is_text_source(self.source_dataset_key):
-                if data.shape[1] == 2 and data.shape[0] > 1:
+            # against the row number; and the Columns panel can override that
+            # for any 2-D block. Both routes end at the same place: a
+            # DisplaySpec that says which column is X and which are drawn.
+            if ndim == 2 and (
+                display_spec is not None or _is_text_source(self.source_dataset_key)
+            ):
+                spec = display_spec
+                if spec is None:
                     names = column_names_for(self.source_dataset_key)
-                    axis_names = (names[0], names[1]) if len(names) == 2 else None
-                    self._clear_current_widget()
-                    self._create_plot_widget(data[:, 1], data[:, 0], axis_names)
-                    return
-                if data.shape[1] > 2:
-                    logging.info("UnifiedDataViewer: text file with %d columns as a table",
-                                 data.shape[1])
-                    names = column_names_for(self.source_dataset_key)
-                    self._create_table_widget(
-                        data, list(names) if len(names) == data.shape[1] else None)
-                    return
+                    spec = DisplaySpec.from_roles(
+                        default_column_roles(data.shape[1], names, is_text=True)
+                    )
+                self._apply_display_spec(data, spec)
+                return
 
             # Handle 2D data that should be flattened
             if data_type == "Array1D" and ndim == 2 and min(data.shape) == 1:
@@ -247,7 +249,8 @@ class UnifiedDataViewer(QWidget):
         self,
         data: np.ndarray,
         x_data: np.ndarray | None = None,
-        axis_names: tuple[str, str] | None = None,
+        axis_names: tuple[str | None, str | None] | None = None,
+        curve_labels: list[str] | None = None,
     ) -> None:
         """Create a 1D plot widget, optionally against a given X."""
         from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
@@ -261,8 +264,42 @@ class UnifiedDataViewer(QWidget):
         plot_widget.set_source_dataset_key(self.source_dataset_key)
         if axis_names is not None:
             plot_widget.set_axis_names(*axis_names)
-        plot_widget.set_data(data, x_data)
+        plot_widget.set_data(data, x_data, curve_labels=curve_labels)
         self._swap_widget(plot_widget)
+
+    def _apply_display_spec(self, data: np.ndarray, spec: DisplaySpec) -> None:
+        """Draw a 2-D block the way a set of column roles asks for.
+
+        No visible curve means there is nothing to plot yet, so the block is
+        shown as its grid — that is also how a wide text file opens, before
+        any column is switched on.
+        """
+        from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
+
+        n_cols = int(data.shape[1])
+        names = column_names_for(self.source_dataset_key)
+
+        if not spec.has_curves:
+            col_names = list(names) if len(names) == n_cols else None
+            self._create_table_widget(data, col_names)
+            return
+
+        indices = [i for i, _ in spec.y]
+        labels = [label for _, label in spec.y]
+        x = data[:, spec.x_index] if spec.x_index is not None else None
+        y = data[:, indices[0]] if len(indices) == 1 else data[:, indices]
+        x_label = spec.x_name if spec.x_index is not None else None
+        y_label = labels[0] if len(labels) == 1 else None
+        multi_labels = labels if len(labels) > 1 else None
+
+        if isinstance(self.current_widget, PlotWidget1DEnhanced):
+            self.current_widget.set_source_dataset_key(self.source_dataset_key)
+            self.current_widget.set_axis_names(x_label, y_label)
+            self.current_widget.set_data(y, x, curve_labels=multi_labels)
+            return
+
+        self._clear_current_widget()
+        self._create_plot_widget(y, x, (x_label, y_label), multi_labels)
 
     def refresh_dataset_keys(self, full_keys_1d: list[str], opened_files: tuple | None = None) -> None:
         """Refresh shared 1D dataset index for X-data selection dialogs."""
