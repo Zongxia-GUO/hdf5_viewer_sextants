@@ -30,6 +30,41 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from src.lib_h5.text_table import column_names
+
+#: Suffixes whose columns come from a text header rather than an HDF5 dataset.
+TEXT_SUFFIXES = (".txt", ".csv")
+
+
+def _source_path(source_dataset_key: str | None) -> str | None:
+    """The file path out of a ``"<path>::<dataset>"`` key."""
+    if not source_dataset_key:
+        return None
+    return source_dataset_key.rsplit("::", 1)[0]
+
+
+def _is_text_source(source_dataset_key: str | None) -> bool:
+    """Whether this data was read out of a text or CSV file.
+
+    The column rules below are about what a text file's columns mean, and must
+    not reach an HDF5 dataset that happens to be the same shape: there, N narrow
+    columns really are N curves.
+    """
+    path = _source_path(source_dataset_key)
+    return bool(path) and path.lower().endswith(TEXT_SUFFIXES)
+
+
+def column_names_for(source_dataset_key: str | None) -> tuple:
+    """The header names of the text file this data came from, if it has any."""
+    path = _source_path(source_dataset_key)
+    if not path:
+        return ()
+    try:
+        return column_names(path)
+    except Exception as exc:  # pragma: no cover - a name is never worth a crash
+        logging.debug("Could not read column names from %s: %s", path, exc)
+        return ()
+
 
 class UnifiedDataViewer(QWidget):
     """
@@ -129,6 +164,25 @@ class UnifiedDataViewer(QWidget):
                 self._create_string_widget(data)
                 return
 
+            # A text file's columns are an x-y pair, not a set of curves
+            # against the row number. Two columns are the common case and mean
+            # exactly that; more than two have no such reading, so they are
+            # shown as the table they are.
+            if ndim == 2 and _is_text_source(self.source_dataset_key):
+                if data.shape[1] == 2 and data.shape[0] > 1:
+                    names = column_names_for(self.source_dataset_key)
+                    axis_names = (names[0], names[1]) if len(names) == 2 else None
+                    self._clear_current_widget()
+                    self._create_plot_widget(data[:, 1], data[:, 0], axis_names)
+                    return
+                if data.shape[1] > 2:
+                    logging.info("UnifiedDataViewer: text file with %d columns as a table",
+                                 data.shape[1])
+                    names = column_names_for(self.source_dataset_key)
+                    self._create_table_widget(
+                        data, list(names) if len(names) == data.shape[1] else None)
+                    return
+
             # Handle 2D data that should be flattened
             if data_type == "Array1D" and ndim == 2 and min(data.shape) == 1:
                 data = data.ravel()
@@ -189,8 +243,13 @@ class UnifiedDataViewer(QWidget):
             self.layout.removeWidget(old)
             old.deleteLater()
 
-    def _create_plot_widget(self, data: np.ndarray) -> None:
-        """Create a 1D plot widget."""
+    def _create_plot_widget(
+        self,
+        data: np.ndarray,
+        x_data: np.ndarray | None = None,
+        axis_names: tuple[str, str] | None = None,
+    ) -> None:
+        """Create a 1D plot widget, optionally against a given X."""
         from src.gui.plot_widget_1d_enhanced import PlotWidget1DEnhanced
 
         plot_widget = PlotWidget1DEnhanced(
@@ -200,7 +259,9 @@ class UnifiedDataViewer(QWidget):
         )
         plot_widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         plot_widget.set_source_dataset_key(self.source_dataset_key)
-        plot_widget.set_data(data)
+        if axis_names is not None:
+            plot_widget.set_axis_names(*axis_names)
+        plot_widget.set_data(data, x_data)
         self._swap_widget(plot_widget)
 
     def refresh_dataset_keys(self, full_keys_1d: list[str], opened_files: tuple | None = None) -> None:
@@ -249,8 +310,15 @@ class UnifiedDataViewer(QWidget):
         text_widget.setText(label)
         self._swap_widget(text_widget)
 
-    def _create_table_widget(self, data: np.ndarray) -> None:
-        """Create a table widget for structured data, with a slice slider for 3D+ data."""
+    def _create_table_widget(
+        self, data: np.ndarray, names: list[str] | None = None
+    ) -> None:
+        """Create a table widget for structured data, with a slice slider for 3D+ data.
+
+        ``names`` labels the columns where the source supplies them — a text
+        file's header does, and losing it leaves "Col 0" over data that came
+        with a name.
+        """
         from src.gui.table_model import CopyableTableView, DataTable
 
         # Squeeze out size-1 dimensions so (1, 2048, 2048) ->(2048, 2048)
@@ -292,18 +360,18 @@ class UnifiedDataViewer(QWidget):
             c_layout.addLayout(ctrl)
 
             # Initial model (slice 0)
-            table_view.setModel(DataTable(data[0]))
+            table_view.setModel(DataTable(data[0], names))
 
             def _on_slice(idx: int) -> None:
                 lbl_index.setText(f"{idx + 1} / {n_slices}")
-                table_view.setModel(DataTable(data[idx]))
+                table_view.setModel(DataTable(data[idx], names))
 
             slider.valueChanged.connect(_on_slice)
 
         else:
             # Plain 2D table -no slider needed
             display = data[0] if data.ndim > 2 else data
-            table_view.setModel(DataTable(display))
+            table_view.setModel(DataTable(display, names))
 
         c_layout.addWidget(table_view)
         self._swap_widget(container)

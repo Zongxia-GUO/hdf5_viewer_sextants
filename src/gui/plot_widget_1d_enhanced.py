@@ -97,6 +97,7 @@ class PlotWidget1DEnhanced(QWidget):
         self.x_data_original = None  # Store original X data before q conversion
         self.x_dataset_path = None  # Full path to custom X dataset
         self.y_source_dataset_key = None  # Full key for Y data source (file::dataset)
+        self._column_axis_names: tuple[str | None, str | None] | None = None
         self.selected_point = None  # (x, y, curve_idx) of selected point (curve_idx is None for 1D data)
         self.selected_marker = None  # Circle marker for selected point
         # Asked for when "X to q" is switched on, and kept for the next time.
@@ -362,6 +363,23 @@ class PlotWidget1DEnhanced(QWidget):
     def set_source_dataset_key(self, full_key: str | None) -> None:
         """Set source full key for Y data (used by legend labels and export names)."""
         self.y_source_dataset_key = full_key
+        # Names read from a text file's header describe that file's columns and
+        # nothing else, so a new source drops them. Callers that have names for
+        # the new one set them after this.
+        self._column_axis_names = None
+
+    def set_axis_names(self, x_name: str | None, y_name: str | None) -> None:
+        """Name the axes after the columns they came from.
+
+        A text file's header says what its columns are; keeping "Custom X" and
+        "Value" over them throws that away. Only used while the plot is against
+        its own X — converting to q replaces the abscissa, so the header's name
+        for it no longer describes what is drawn.
+        """
+        self._column_axis_names = (x_name, y_name)
+        if y_name:
+            set_axis_label(self.plot_widget, "left", y_name)
+        self._update_plot()
 
     def quick_export(self) -> None:
         """Quick export: save the X/Y data as currently displayed."""
@@ -436,8 +454,10 @@ class PlotWidget1DEnhanced(QWidget):
             if self.btn_convert_to_q.isChecked():
                 set_axis_label(self.plot_widget, "bottom", AXIS_Q)
             else:
+                names = getattr(self, "_column_axis_names", None)
                 short_x = self._short_key_label(self.x_dataset_path)
-                set_axis_label(self.plot_widget, "bottom", short_x or "Custom X")
+                label = (names[0] if names else None) or short_x or "Custom X"
+                set_axis_label(self.plot_widget, "bottom", label)
         else:
             x = np.arange(len(self.y_data))
             set_axis_label(self.plot_widget, "bottom", "Index")

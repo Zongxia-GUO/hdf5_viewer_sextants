@@ -122,6 +122,7 @@ from src.gui.x_target import (
 from src.img.img_path import img_path
 from src.lib_h5.dataset_types import H5DatasetType
 from src.lib_h5.file_size import file_size_to_str
+from src.lib_h5.text_table import read_text_table
 from src.lib_h5.file_validator import (
     KIND_HDF5,
     classify_data_file,
@@ -334,20 +335,10 @@ def load_regular_data_file(file_path: str | pathlib.Path) -> np.ndarray:
         return np.stack(frames, axis=0)
 
     if suffix in {".csv", ".txt"}:
-        delimiter = "," if suffix == ".csv" else None
-        try:
-            data = np.genfromtxt(path, delimiter=delimiter, comments=None)
-            if np.asarray(data).size > 0:
-                return np.asarray(data)
-        except Exception:
-            if suffix == ".txt":
-                try:
-                    data = np.genfromtxt(path, delimiter=",", comments=None)
-                    if np.asarray(data).size > 0:
-                        return np.asarray(data)
-                except Exception:
-                    pass
-        return np.genfromtxt(path, delimiter=delimiter, dtype=str, comments=None)
+        # Delimiter sniffing, header skipping and the difference between "no
+        # numbers here" and "an array of NaN" all live in read_text_table; see
+        # the three ways this used to go wrong in its module docstring.
+        return read_text_table(path).values
 
     raise ValueError(f"Unsupported non-HDF file type: {suffix}")
 
