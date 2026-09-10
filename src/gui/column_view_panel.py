@@ -1,13 +1,15 @@
 """The Columns tab of the main window's side panel.
 
 The main window is a browser: this panel does not change the numbers, it
-chooses how the block already on screen is drawn. One row per column, each with
-a role — the abscissa, a curve, or left out — and a show box. Editing a row
-emits a :class:`DisplaySpec`; the window hands that to the data view, which
-swaps between the table and a multi-curve plot accordingly.
+chooses how the block already on screen is drawn. It is a
+:class:`~src.gui.worksheet_view.WorksheetView` — an Origin-style worksheet
+whose frozen header carries, per column, a show box and an X/Y combo over an
+editable name. Editing any of those emits a :class:`DisplaySpec`; the window
+hands that to the data view, which swaps between the table and a multi-curve
+plot accordingly.
 
-The richer job — per-column ``f(x)``, a second Y axis, colour, several blocks
-at once — belongs to the Data editor, not here.
+The data stays read only here — copy and export, not edit. The ``f(x)`` row
+and the per-column transform behind it belong to the Data editor.
 """
 
 # Copyright (C) 2023 Dennis Lönard
@@ -28,53 +30,25 @@ at once — belongs to the Data editor, not here.
 from __future__ import annotations
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (
-    QComboBox,
-    QHeaderView,
-    QLabel,
-    QSizePolicy,
-    QSplitter,
-    QStackedWidget,
-    QStyledItemDelegate,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtWidgets import QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 
-from src.gui.table_model import ColumnRolesModel, CopyableTableView, DataTable
-from src.lib_h5.columns import ColumnRole, DisplaySpec, Role, default_column_roles
+from src.gui.table_model import ColumnRolesModel
+from src.gui.worksheet_view import WorksheetView
+from src.lib_h5.columns import ColumnRole, DisplaySpec, default_column_roles
 
-#: A change in the roles table waits this long for the next one before the plot
-#: is asked to redraw, so dragging through the role combo does not repaint on
-#: every step.
+#: A change in the header waits this long for the next one before the plot is
+#: asked to redraw, so working through the combos does not repaint on each step.
 REDRAW_DEBOUNCE_MS = 120
 
-#: Past this many columns a block is a detector frame, not a worksheet — one
-#: row per column would be a scroll of hundreds and every one of them a curve.
-#: Those open as an image and the panel steps aside.
+#: Past this many columns a block is a detector frame, not a worksheet — a
+#: control cell per column would be a scroll of hundreds. Those open as an
+#: image and the panel steps aside.
 MAX_COLUMNS = 64
 
 
-class _RoleDelegate(QStyledItemDelegate):
-    """A combo of the three roles for the Role column."""
-
-    def createEditor(self, parent, option, index):  # noqa: N802 - Qt override
-        combo = QComboBox(parent)
-        combo.addItems([role.value for role in Role])
-        return combo
-
-    def setEditorData(self, editor, index):  # noqa: N802 - Qt override
-        current = index.data(Qt.ItemDataRole.EditRole)
-        pos = editor.findText(str(current))
-        if pos >= 0:
-            editor.setCurrentIndex(pos)
-
-    def setModelData(self, editor, model, index):  # noqa: N802 - Qt override
-        model.setData(index, editor.currentText(), Qt.ItemDataRole.EditRole)
-
-
 class ColumnViewPanel(QWidget):
-    """Roles table over a read-only grid; emits a DisplaySpec on every edit."""
+    """A worksheet over the current block; emits a DisplaySpec on every edit."""
 
     display_spec_changed = pyqtSignal(object)
 
@@ -92,45 +66,16 @@ class ColumnViewPanel(QWidget):
         self._roles_by_key: dict[str, list[ColumnRole]] = {}
 
         self._roles_model = ColumnRolesModel(parent=self)
-        self._roles_view = CopyableTableView()
-        self._roles_view.setModel(self._roles_model)
-        self._roles_view.setItemDelegateForColumn(
-            ColumnRolesModel.COL_ROLE, _RoleDelegate(self._roles_view)
-        )
-        v_header = self._roles_view.verticalHeader()
-        if v_header is not None:
-            v_header.setVisible(False)
-        roles_header = self._roles_view.horizontalHeader()
-        if roles_header is not None:
-            roles_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            roles_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-            roles_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self._roles_view.setColumnWidth(ColumnRolesModel.COL_ROLE, 64)
-        self._roles_view.setColumnWidth(ColumnRolesModel.COL_SHOW, 52)
-        self._roles_view.setEditTriggers(
-            CopyableTableView.EditTrigger.DoubleClicked
-            | CopyableTableView.EditTrigger.SelectedClicked
-            | CopyableTableView.EditTrigger.EditKeyPressed
-        )
+        self._roles_model.spec_changed.connect(self._on_roles_changed)
 
-        self._grid = CopyableTableView()
-        self._grid.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding
-        )
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._roles_view)
-        splitter.addWidget(self._grid)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([160, 400])
+        self._worksheet = WorksheetView(show_fx=False)
 
         self._placeholder = QLabel("Not a column dataset.")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color: palette(mid); padding: 24px;")
 
         self._stack = QStackedWidget()
-        self._stack.addWidget(splitter)          # index 0
+        self._stack.addWidget(self._worksheet)    # index 0
         self._stack.addWidget(self._placeholder)  # index 1
 
         layout = QVBoxLayout(self)
@@ -141,7 +86,6 @@ class ColumnViewPanel(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(REDRAW_DEBOUNCE_MS)
         self._debounce.timeout.connect(self._emit_spec)
-        self._roles_model.spec_changed.connect(self._on_roles_changed)
 
     # -- population -------------------------------------------------------- #
 
@@ -169,7 +113,7 @@ class ColumnViewPanel(QWidget):
             or arr.dtype.kind not in "fiu"
         ):
             self._data = None
-            self._grid.setModel(None)
+            self._worksheet.clear()
             self._roles_model.set_roles([])
             self._stack.setCurrentIndex(1)
             return
@@ -180,9 +124,6 @@ class ColumnViewPanel(QWidget):
         if roles is None or len(roles) != n_cols:
             roles = default_column_roles(n_cols, names, is_text)
 
-        grid_names = [c.name for c in roles]
-        self._grid.setModel(DataTable(arr, grid_names))
-
         # Fill the model without the reset it triggers being taken for an edit
         # and queuing a redraw for a selection the user did not make.
         self._loading = True
@@ -190,6 +131,7 @@ class ColumnViewPanel(QWidget):
             self._roles_model.set_roles(roles)
         finally:
             self._loading = False
+        self._worksheet.set_data(arr, self._roles_model)
         self._stack.setCurrentIndex(0)
         self._store_roles()
 
@@ -204,15 +146,8 @@ class ColumnViewPanel(QWidget):
     def _on_roles_changed(self) -> None:
         if self._loading:
             return
-        self._sync_grid_headers()
         self._store_roles()
         self._debounce.start()
-
-    def _sync_grid_headers(self) -> None:
-        """Keep the grid's column titles in step with a renamed role."""
-        model = self._grid.model()
-        if isinstance(model, DataTable) and self._data is not None:
-            model.set_column_names([c.name for c in self._roles_model.roles()])
 
     def _store_roles(self) -> None:
         if self._source_key is not None:
