@@ -127,6 +127,7 @@ from src.lib_h5.file_size import file_size_to_str
 from src.lib_h5.text_table import read_text_table
 from src.lib_h5.file_validator import (
     KIND_HDF5,
+    TEXT_EXTENSIONS,
     classify_data_file,
     get_file_filter_string,
     has_supported_extension,
@@ -336,7 +337,7 @@ def load_regular_data_file(file_path: str | pathlib.Path) -> np.ndarray:
             raise ValueError("Multi-page image has frames with different shapes.")
         return np.stack(frames, axis=0)
 
-    if suffix in {".csv", ".txt"}:
+    if suffix in TEXT_EXTENSIONS:
         # Delimiter sniffing, header skipping and the difference between "no
         # numbers here" and "an array of NaN" all live in read_text_table; see
         # the three ways this used to go wrong in its module docstring.
@@ -349,8 +350,8 @@ def _regular_file_kind(file_path: str | pathlib.Path) -> str:
     suffix = pathlib.Path(file_path).suffix.lower()
     if suffix in {".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg"}:
         return "Image File"
-    if suffix in {".csv", ".txt"}:
-        return "Text/CSV File"
+    if suffix in TEXT_EXTENSIONS:
+        return "Text data file"
     return "Data File"
 
 

@@ -94,6 +94,27 @@ def test_a_file_with_no_header_has_no_names(tmp_path):
     assert read_text_table(write(tmp_path, "plain.txt", "1 10\n2 20\n")).names == ()
 
 
+# ── .dat is column text like .txt ───────────────────────────────────── #
+
+def test_a_dat_file_reads_like_a_txt(tmp_path):
+    path = write(tmp_path, "scan.dat", "energy intensity\n1 10\n2 20\n3 30\n")
+
+    table = read_text_table(path)
+
+    assert table.values.shape == (3, 2)
+    assert table.names == NAMES
+
+
+def test_a_dat_file_sniffs_its_delimiter_rather_than_assuming_a_comma(tmp_path):
+    """``.csv`` is forced comma; ``.dat``, like ``.txt``, is whatever it is."""
+    path = write(tmp_path, "tab.dat", "energy\tintensity\n1\t10\n2\t20\n")
+
+    table = read_text_table(path)
+
+    assert table.values.shape == (2, 2)
+    assert table.names == NAMES
+
+
 def test_a_units_row_is_passed_over_for_the_names_above_it(tmp_path):
     """``(eV) (counts)`` describes the columns but does not name them."""
     path = write(tmp_path, "units.txt", "energy intensity\n(eV) (counts)\n1 10\n2 20\n")

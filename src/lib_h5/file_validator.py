@@ -34,7 +34,9 @@ HDF5_EXTENSIONS = {
 }
 
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg"}
-TEXT_EXTENSIONS = {".txt", ".csv"}
+#: Plain column data. ``.dat`` is as common as the other two on a beamline and,
+#: like ``.txt``, has no fixed delimiter — it is sniffed, not assumed.
+TEXT_EXTENSIONS = {".txt", ".csv", ".dat"}
 TXT_EXTENSIONS = TEXT_EXTENSIONS  # alias used by the radial/time-resolve tools
 SUPPORTED_DATA_EXTENSIONS = HDF5_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS
 
@@ -146,6 +148,6 @@ def get_file_filter_string() -> str:
         f"Supported Data Files ({all_extensions});;"
         f"HDF5 Files ({hdf5_extensions});;"
         f"Images ({image_extensions});;"
-        f"Text/CSV ({text_extensions});;"
+        f"Text data ({text_extensions});;"
         "All Files (*.*)"
     )

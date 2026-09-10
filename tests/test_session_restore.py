@@ -250,13 +250,16 @@ def test_the_classifier_agrees_with_what_it_replaced(qapp, scans, tmp_path):
 
     text = tmp_path / "curve.txt"
     text.write_text("1 2\n", encoding="utf-8")
+    dat = tmp_path / "curve.dat"
+    dat.write_text("1 2\n", encoding="utf-8")
     junk = tmp_path / "notes.docx"
     junk.write_text("x", encoding="utf-8")
 
     assert classify_data_file(scans[0]) == KIND_HDF5
     assert classify_data_file(text) == KIND_REGULAR
+    assert classify_data_file(dat) == KIND_REGULAR
     assert classify_data_file(junk) is None
-    for path in (scans[0], text, junk):
+    for path in (scans[0], text, dat, junk):
         assert (classify_data_file(path) is not None) == is_supported_data_file(path), path
 
 

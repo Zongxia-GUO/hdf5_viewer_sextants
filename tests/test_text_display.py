@@ -106,6 +106,7 @@ def test_an_hdf5_dataset_of_the_same_shape_is_still_curves(qapp, viewer):
 def test_a_source_is_recognised_by_its_suffix():
     assert _is_text_source("C:/data/curve.txt::data")
     assert _is_text_source("C:/data/CURVE.CSV::data")
+    assert _is_text_source("C:/data/scan.dat::data")
     assert not _is_text_source("C:/data/scan.h5::entry/data")
     assert not _is_text_source(None)
 

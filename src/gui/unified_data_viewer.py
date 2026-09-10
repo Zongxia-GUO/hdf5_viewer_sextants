@@ -31,10 +31,12 @@ from PyQt6.QtWidgets import (
 )
 
 from src.lib_h5.columns import DisplaySpec, default_column_roles
+from src.lib_h5.file_validator import TEXT_EXTENSIONS
 from src.lib_h5.text_table import column_names
 
-#: Suffixes whose columns come from a text header rather than an HDF5 dataset.
-TEXT_SUFFIXES = (".txt", ".csv")
+#: Suffixes whose columns come from a text header rather than an HDF5 dataset —
+#: the block where the "first column is X" convention applies.
+TEXT_SUFFIXES = tuple(sorted(TEXT_EXTENSIONS))
 
 
 def _source_path(source_dataset_key: str | None) -> str | None:
